@@ -16,14 +16,21 @@ from rich.table import Table
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import load_app_config
+from data_agent_baseline.run.databao_demo import (
+    create_databao_local_run_dir,
+    load_databao_environment,
+    run_databao_tasks,
+)
 from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
 from data_agent_baseline.tools.filesystem import list_context_tree
+from data_agent_baseline.tools.public_eval import evaluate_public_run
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIGS_DIR = PROJECT_ROOT / "configs"
 DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 ARTIFACT_RUNS_DIR = ARTIFACTS_DIR / "runs"
+DATABAO_DEMO_RUNS_DIR = ARTIFACTS_DIR / "databao-demo"
 
 app = typer.Typer(add_completion=False, no_args_is_help=False)
 console = Console()
@@ -255,6 +262,116 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+
+@app.command("run-databao-demo")
+def run_databao_demo_command(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+    limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    task_id: str | None = typer.Option(None, help="Run one specific task id, e.g. task_25."),
+    task_timeout_seconds: int | None = typer.Option(
+        None,
+        min=1,
+        help="Override run.task_timeout_seconds for the Databao demo runner.",
+    ),
+    planner_mode: str | None = typer.Option(
+        None,
+        help="Structured planner mode: fallback, first, or off. Default is Databao-first fallback.",
+    ),
+    finalizer_mode: str | None = typer.Option(
+        None,
+        help="LLM finalizer mode: off or always. Default is off.",
+    ),
+) -> None:
+    """Run the Databao-backed demo runner on local public tasks."""
+    app_config = load_app_config(config)
+    try:
+        databao_env = load_databao_environment()
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc), param_hint="environment") from exc
+
+    try:
+        run_id, run_output_dir = create_databao_local_run_dir(
+            DATABAO_DEMO_RUNS_DIR,
+            run_id=app_config.run.run_id,
+        )
+    except (ValueError, FileExistsError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="run.run_id") from exc
+
+    logs_dir = run_output_dir / "logs"
+    effective_task_timeout_seconds = task_timeout_seconds or app_config.run.task_timeout_seconds
+    console.print(f"Databao demo run: {run_id}")
+    console.print(f"Input root: {app_config.dataset.root_path}")
+    console.print(f"Run output: {run_output_dir}")
+    console.print(f"Logs: {logs_dir}")
+    console.print(f"Task timeout: {effective_task_timeout_seconds}s")
+    console.print(f"Planner mode: {planner_mode or 'fallback'}")
+    console.print(f"Finalizer mode: {finalizer_mode or 'off'}")
+
+    artifacts = run_databao_tasks(
+        input_root=app_config.dataset.root_path,
+        output_root=run_output_dir,
+        logs_dir=logs_dir,
+        limit=limit,
+        task_ids=[task_id] if task_id else None,
+        task_timeout_seconds=effective_task_timeout_seconds,
+        databao_env=databao_env,
+        structured_planner_mode=planner_mode,
+        finalizer_mode=finalizer_mode,
+    )
+    succeeded_count = sum(1 for artifact in artifacts if artifact.succeeded)
+    console.print(f"Tasks attempted: {len(artifacts)}")
+    console.print(f"Succeeded tasks: {succeeded_count}")
+    console.print(f"Failed tasks: {len(artifacts) - succeeded_count}")
+
+
+@app.command("evaluate-public-run")
+def evaluate_public_run_command(
+    run_dir: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        help="Run directory containing task outputs.",
+    ),
+    gold_root: Path = typer.Option(
+        DATA_DIR / "public" / "output",
+        exists=True,
+        file_okay=False,
+        help="Gold output root.",
+    ),
+) -> None:
+    """Evaluate a public demo run with a local column-signature approximation."""
+    evaluation = evaluate_public_run(run_dir, gold_root)
+
+    table = Table(title="Public Run Evaluation")
+    table.add_column("Task")
+    table.add_column("Matched")
+    table.add_column("Coverage")
+    table.add_column("Extra")
+    table.add_column("Rows")
+    table.add_column("Cols")
+    table.add_column("Exact")
+    for task in evaluation.tasks:
+        table.add_row(
+            task.task_id,
+            f"{task.matched_columns}/{task.gold_columns}",
+            f"{task.coverage:.3f}",
+            str(task.extra_columns),
+            f"{task.prediction_rows}/{task.gold_rows}",
+            f"{task.prediction_columns}/{task.gold_columns}",
+            "yes" if task.exact_no_extra else "no",
+        )
+    console.print(table)
+    console.print(
+        "OVERALL_COLUMN_COVERAGE="
+        f"{evaluation.matched_columns}/{evaluation.gold_columns}="
+        f"{evaluation.overall_column_coverage:.3f}"
+    )
+    console.print(
+        "EXACT_NO_EXTRA_TASKS="
+        f"{evaluation.exact_no_extra_tasks}/{len(evaluation.tasks)}="
+        f"{evaluation.exact_no_extra_rate:.3f}"
+    )
 
 
 def main() -> None:
