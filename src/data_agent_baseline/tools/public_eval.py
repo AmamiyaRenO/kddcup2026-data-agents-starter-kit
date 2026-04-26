@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -12,6 +13,8 @@ import pandas as pd
 @dataclass(frozen=True, slots=True)
 class PublicTaskEval:
     task_id: str
+    prediction_written: bool
+    artifact_succeeded: bool | None
     matched_columns: int
     gold_columns: int
     extra_columns: int
@@ -19,6 +22,7 @@ class PublicTaskEval:
     gold_rows: int
     prediction_columns: int
     exact_no_extra: bool
+    failure_reason: str | None = None
 
     @property
     def coverage(self) -> float:
@@ -26,17 +30,28 @@ class PublicTaskEval:
             return 0.0
         return self.matched_columns / self.gold_columns
 
+    @property
+    def estimated_score(self) -> float:
+        denominator = self.gold_columns + self.extra_columns
+        if denominator == 0:
+            return 0.0
+        return self.matched_columns / denominator
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
+            "prediction_written": self.prediction_written,
+            "artifact_succeeded": self.artifact_succeeded,
             "matched_columns": self.matched_columns,
             "gold_columns": self.gold_columns,
             "coverage": self.coverage,
+            "estimated_score": self.estimated_score,
             "extra_columns": self.extra_columns,
             "prediction_rows": self.prediction_rows,
             "gold_rows": self.gold_rows,
             "prediction_columns": self.prediction_columns,
             "exact_no_extra": self.exact_no_extra,
+            "failure_reason": self.failure_reason,
         }
 
 
@@ -70,6 +85,20 @@ class PublicRunEval:
             return 0.0
         return self.exact_no_extra_tasks / len(self.tasks)
 
+    @property
+    def per_task_average_score(self) -> float:
+        if not self.tasks:
+            return 0.0
+        return sum(task.estimated_score for task in self.tasks) / len(self.tasks)
+
+    @property
+    def prediction_written_count(self) -> int:
+        return sum(1 for task in self.tasks if task.prediction_written)
+
+    @property
+    def scorable_task_count(self) -> int:
+        return sum(1 for task in self.tasks if task.prediction_written and task.gold_columns > 0)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_dir": str(self.run_dir),
@@ -78,8 +107,12 @@ class PublicRunEval:
             "matched_columns": self.matched_columns,
             "gold_columns": self.gold_columns,
             "overall_column_coverage": self.overall_column_coverage,
+            "per_task_average_score": self.per_task_average_score,
             "exact_no_extra_tasks": self.exact_no_extra_tasks,
             "exact_no_extra_rate": self.exact_no_extra_rate,
+            "prediction_written_count": self.prediction_written_count,
+            "scorable_task_count": self.scorable_task_count,
+            "missing_prediction_count": len(self.tasks) - self.prediction_written_count,
             "tasks": [task.to_dict() for task in self.tasks],
         }
 
@@ -108,9 +141,32 @@ def column_signatures(frame: pd.DataFrame) -> Counter[tuple[str, ...]]:
     )
 
 
-def evaluate_public_task(prediction_path: Path, gold_path: Path, task_id: str) -> PublicTaskEval:
-    prediction = pd.read_csv(prediction_path, dtype=str, keep_default_na=False)
+def evaluate_public_task(
+    prediction_path: Path,
+    gold_path: Path,
+    task_id: str,
+    *,
+    artifact_info: dict[str, Any] | None = None,
+) -> PublicTaskEval:
     gold = pd.read_csv(gold_path, dtype=str, keep_default_na=False)
+    prediction_written = prediction_path.exists()
+    artifact_info = artifact_info or {}
+    if not prediction_written:
+        return PublicTaskEval(
+            task_id=task_id,
+            prediction_written=False,
+            artifact_succeeded=artifact_info.get("succeeded"),
+            matched_columns=0,
+            gold_columns=gold.shape[1],
+            extra_columns=0,
+            prediction_rows=0,
+            gold_rows=len(gold),
+            prediction_columns=0,
+            exact_no_extra=False,
+            failure_reason=artifact_info.get("failure_reason"),
+        )
+
+    prediction = pd.read_csv(prediction_path, dtype=str, keep_default_na=False)
 
     prediction_signatures = column_signatures(prediction)
     gold_signatures = column_signatures(gold)
@@ -119,6 +175,8 @@ def evaluate_public_task(prediction_path: Path, gold_path: Path, task_id: str) -
 
     return PublicTaskEval(
         task_id=task_id,
+        prediction_written=True,
+        artifact_succeeded=artifact_info.get("succeeded"),
         matched_columns=matched_columns,
         gold_columns=gold.shape[1],
         extra_columns=extra_columns,
@@ -126,18 +184,51 @@ def evaluate_public_task(prediction_path: Path, gold_path: Path, task_id: str) -
         gold_rows=len(gold),
         prediction_columns=prediction.shape[1],
         exact_no_extra=matched_columns == gold.shape[1] and extra_columns == 0,
+        failure_reason=artifact_info.get("failure_reason"),
     )
+
+
+def _artifact_index(run_dir: Path) -> dict[str, dict[str, Any]]:
+    summary_path = run_dir / "summary.json"
+    if not summary_path.exists():
+        return {}
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    tasks = payload.get("tasks", [])
+    if not isinstance(tasks, list):
+        return {}
+    return {
+        str(item.get("task_id")): item
+        for item in tasks
+        if isinstance(item, dict) and item.get("task_id")
+    }
 
 
 def evaluate_public_run(run_dir: Path, gold_root: Path) -> PublicRunEval:
     tasks: list[PublicTaskEval] = []
-    for task_dir in sorted(path for path in run_dir.iterdir() if path.is_dir()):
-        if not task_dir.name.startswith("task_"):
+    artifact_by_task = _artifact_index(run_dir)
+    task_ids = {
+        path.name
+        for path in run_dir.iterdir()
+        if path.is_dir() and path.name.startswith("task_")
+    }
+    task_ids.update(artifact_by_task)
+    for task_id in sorted(task_ids):
+        if not task_id.startswith("task_"):
             continue
-        prediction_path = task_dir / "prediction.csv"
-        gold_path = gold_root / task_dir.name / "gold.csv"
-        if not prediction_path.exists() or not gold_path.exists():
+        prediction_path = run_dir / task_id / "prediction.csv"
+        gold_path = gold_root / task_id / "gold.csv"
+        if not gold_path.exists():
             continue
-        tasks.append(evaluate_public_task(prediction_path, gold_path, task_dir.name))
+        tasks.append(
+            evaluate_public_task(
+                prediction_path,
+                gold_path,
+                task_id,
+                artifact_info=artifact_by_task.get(task_id),
+            )
+        )
 
     return PublicRunEval(run_dir=run_dir, gold_root=gold_root, tasks=tasks)

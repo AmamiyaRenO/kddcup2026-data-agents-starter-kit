@@ -6,35 +6,48 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
+from typer.testing import CliRunner
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
+from data_agent_baseline.cli import app
 from data_agent_baseline.run.databao_demo import (
+    AnswerContract,
     AnswerFinalizationReport,
+    Candidate,
     DatabaoEnvironment,
     DATABAO_DEBUG_LOG_RAW_ENV,
+    DATABAO_TASK_TIMEOUT_SECONDS_ENV,
     StructuredPlanError,
     StructuredPlannerReport,
     TaskDiagnostics,
-    apply_aggregate_ratio_verifier,
-    apply_answer_column_verifier,
-    apply_question_column_pruner,
     _candidate_table_payload,
     _timeout_task_artifact,
+    apply_aggregate_ratio_verifier,
     apply_answer_finalizer_decision,
+    apply_answer_column_verifier,
+    apply_question_column_pruner,
     build_schema_graph,
     build_task_context,
     choose_route_policy,
+    document_records_for_reasoning,
     execute_structured_plan,
+    final_answer_shape_guard,
+    generate_verifier_candidate_frames,
+    generic_document_tables,
+    infer_answer_contract,
     infer_task_intent,
     load_databao_environment,
     load_context_tables,
-    plan_structured_candidate,
     postprocess_answer_table,
+    query_context_retriever,
+    rank_candidates,
     register_context_sources,
     run_databao_task,
     run_databao_tasks,
+    validate_answer_contract,
 )
 from data_agent_baseline.tools.public_eval import evaluate_public_task
 
@@ -114,7 +127,12 @@ def no_structured_planner(task, databao_env):
     )
 
 
-def write_task(root: Path, task_id: str = "task_1", question: str = "What is the answer?") -> Path:
+def write_task(
+    root: Path,
+    task_id: str = "task_1",
+    question: str = "What is the answer?",
+    difficulty: str = "easy",
+) -> Path:
     task_dir = root / task_id
     context_dir = task_dir / "context"
     context_dir.mkdir(parents=True)
@@ -122,7 +140,7 @@ def write_task(root: Path, task_id: str = "task_1", question: str = "What is the
         json.dumps(
             {
                 "task_id": task_id,
-                "difficulty": "easy",
+                "difficulty": difficulty,
                 "question": question,
             }
         ),
@@ -445,63 +463,6 @@ class DatabaoDemoTests(unittest.TestCase):
             with self.assertRaises(StructuredPlanError):
                 execute_structured_plan(task, plan)
 
-    def test_structured_planner_uses_schema_heuristic_for_task_11_pattern(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            input_root = root / "input"
-            write_task(
-                input_root,
-                task_id="task_11",
-                question=(
-                    "For patients with severe degree of thrombosis, list their ID, sex and "
-                    "disease the patient is diagnosed with."
-                ),
-            )
-            context_dir = input_root / "task_11" / "context"
-            (context_dir / "knowledge.md").write_text(
-                "Thrombosis is an integer, with 1 being the most severe and 2 indicating severe cases.",
-                encoding="utf-8",
-            )
-            json_dir = context_dir / "json"
-            json_dir.mkdir()
-            (json_dir / "Examination.json").write_text(
-                json.dumps(
-                    {
-                        "table": "Examination",
-                        "records": [
-                            {"ID": 1, "Thrombosis": 1},
-                            {"ID": 2, "Thrombosis": 2},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (json_dir / "Patient.json").write_text(
-                json.dumps(
-                    {
-                        "table": "Patient",
-                        "records": [
-                            {"ID": 1, "SEX": "M", "Diagnosis": "APS"},
-                            {"ID": 2, "SEX": "F", "Diagnosis": "SLE"},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            task = DABenchPublicDataset(input_root).get_task("task_11")
-
-            frame, report = plan_structured_candidate(
-                task,
-                DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
-            )
-
-            self.assertTrue(report.succeeded)
-            self.assertEqual(report.attempt_details[0]["kind"], "schema_heuristic")
-            self.assertEqual(
-                frame.to_dict(orient="list"),
-                {"ID": [2], "SEX": ["F"], "Diagnosis": ["SLE"]},
-            )
-
     def test_structured_plan_rejects_invalid_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -566,7 +527,16 @@ class DatabaoDemoTests(unittest.TestCase):
                 "answer\nA\n",
             )
             log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
-            self.assertEqual(log_payload["candidate_source"], "databao")
+            self.assertEqual(log_payload["candidate_source"], "databao_raw")
+            self.assertEqual(log_payload["selected_candidate_source"], "databao_raw")
+            self.assertEqual(log_payload["heuristic_level"], "generic")
+            self.assertIn("enabled_strategies", log_payload)
+            self.assertIn("applied_strategies", log_payload)
+            self.assertIn("retrieved_context", log_payload)
+            self.assertIn("candidate_scores", log_payload)
+            self.assertIn("final_answer_guard", log_payload)
+            self.assertIn("document_extraction_used", log_payload)
+            self.assertEqual(artifact.heuristic_level, "generic")
             self.assertIn("context_load", log_payload["timings"])
             self.assertIn("databao_ask", log_payload["timings"])
             self.assertEqual(log_payload["llm_calls"], [])
@@ -606,15 +576,15 @@ class DatabaoDemoTests(unittest.TestCase):
 
             log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
             self.assertTrue(artifact.succeeded)
-            self.assertEqual(artifact.candidate_source, "databao")
-            self.assertEqual(log_payload["candidate_source"], "databao")
+            self.assertEqual(artifact.candidate_source, "databao_raw")
+            self.assertEqual(log_payload["candidate_source"], "databao_raw")
             self.assertFalse(log_payload["structured_planner"]["attempted"])
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
                 "answer\ndatabao\n",
             )
 
-    def test_runner_can_use_structured_planner_first_when_requested(self) -> None:
+    def test_planner_first_mode_still_keeps_databao_first_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
@@ -637,16 +607,12 @@ class DatabaoDemoTests(unittest.TestCase):
                     attempt_details=[],
                 )
 
-            def forbidden_agent_builder(task, databao_env):
-                del task, databao_env
-                raise AssertionError("Databao agent should not be built after planner success.")
-
             artifact = run_databao_task(
                 task=task,
                 output_root=output_root,
                 logs_dir=logs_dir,
                 databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
-                agent_builder=forbidden_agent_builder,
+                agent_builder=make_agent_builder(pd.DataFrame({"answer": ["databao"]})),
                 answer_finalizer=no_answer_finalizer,
                 structured_planner=planner,
                 structured_planner_mode="first",
@@ -654,21 +620,32 @@ class DatabaoDemoTests(unittest.TestCase):
 
             log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
             self.assertTrue(artifact.succeeded)
-            self.assertEqual(artifact.candidate_source, "structured_planner")
-            self.assertEqual(log_payload["candidate_source"], "structured_planner")
-            self.assertTrue(log_payload["structured_planner"]["succeeded"])
+            self.assertEqual(artifact.candidate_source, "databao_raw")
+            self.assertEqual(log_payload["candidate_source"], "databao_raw")
+            self.assertFalse(log_payload["structured_planner"]["attempted"])
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
-                "answer\nplanner\n",
+                "answer\ndatabao\n",
             )
 
-    def test_runner_uses_structured_planner_fallback_after_databao_failure(self) -> None:
+    def test_runner_uses_structured_planner_rescue_after_complex_databao_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
             output_root = root / "output"
             logs_dir = root / "logs"
             write_task(input_root)
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            json_dir = context_dir / "json"
+            csv_dir.mkdir()
+            json_dir.mkdir()
+            (csv_dir / "left.csv").write_text("id,value\n1,A\n", encoding="utf-8")
+            (csv_dir / "right.csv").write_text("left_id,amount\n1,10\n", encoding="utf-8")
+            (json_dir / "extra.json").write_text(
+                json.dumps({"table": "extra", "records": [{"id": 1, "status": "ok"}]}),
+                encoding="utf-8",
+            )
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
             def planner(task, databao_env):
@@ -693,12 +670,13 @@ class DatabaoDemoTests(unittest.TestCase):
                 agent_builder=make_agent_builder(None),
                 answer_finalizer=no_answer_finalizer,
                 structured_planner=planner,
+                structured_planner_mode="fallback",
             )
 
             log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
             self.assertTrue(artifact.succeeded)
-            self.assertEqual(artifact.candidate_source, "structured_planner_fallback")
-            self.assertEqual(log_payload["candidate_source"], "structured_planner_fallback")
+            self.assertEqual(artifact.candidate_source, "structured_planner_rescue")
+            self.assertEqual(log_payload["candidate_source"], "structured_planner_rescue")
             self.assertTrue(log_payload["structured_planner"]["succeeded"])
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
@@ -729,6 +707,95 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertEqual([artifact.task_id for artifact in artifacts], ["task_2"])
             self.assertTrue((output_root / "task_2" / "prediction.csv").exists())
             self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
+
+    def test_run_databao_tasks_can_filter_by_difficulty_inline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, task_id="task_330", difficulty="hard")
+            write_task(input_root, task_id="task_344", difficulty="hard")
+            write_task(input_root, task_id="task_418", difficulty="extreme")
+
+            artifacts = run_databao_tasks(
+                input_root=input_root,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                difficulty="hard",
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=make_agent_builder(pd.DataFrame({"answer": ["B"]})),
+                answer_finalizer=no_answer_finalizer,
+                structured_planner=no_structured_planner,
+                task_timeout_seconds=1,
+            )
+
+            self.assertEqual([artifact.task_id for artifact in artifacts], ["task_330", "task_344"])
+            self.assertTrue((output_root / "task_330" / "prediction.csv").exists())
+            self.assertTrue((output_root / "task_344" / "prediction.csv").exists())
+            self.assertFalse((output_root / "task_418" / "prediction.csv").exists())
+
+    def test_run_databao_demo_cli_passes_difficulty_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            run_root = root / "run"
+            input_root.mkdir()
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "dataset:",
+                        f"  root_path: {input_root.as_posix()}",
+                        "agent:",
+                        "  model: unused",
+                        "  api_base: unused",
+                        "  api_key: unused",
+                        "  max_steps: 16",
+                        "  temperature: 0.0",
+                        "run:",
+                        "  output_dir: artifacts/runs",
+                        "  run_id:",
+                        "  max_workers: 4",
+                        "  task_timeout_seconds: 150",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            captured: dict[str, object] = {}
+
+            def fake_run_databao_tasks(**kwargs):
+                captured.update(kwargs)
+                return []
+
+            runner = CliRunner()
+            with (
+                patch(
+                    "data_agent_baseline.cli.load_databao_environment",
+                    return_value=DatabaoEnvironment("https://openrouter.ai/api/v1", "key", "model"),
+                ),
+                patch(
+                    "data_agent_baseline.cli.create_databao_local_run_dir",
+                    return_value=("runid", run_root),
+                ),
+                patch("data_agent_baseline.cli.run_databao_tasks", side_effect=fake_run_databao_tasks),
+            ):
+                result = runner.invoke(
+                    app,
+                    [
+                        "run-databao-demo",
+                        "--config",
+                        str(config_path),
+                        "--difficulty",
+                        "hard",
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(captured["difficulty"], "hard")
+            self.assertIsNone(captured["task_ids"])
+            self.assertEqual(captured["task_timeout_seconds"], 150)
 
     def test_timeout_artifact_writes_failure_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -834,7 +901,7 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertTrue(artifact.succeeded)
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
-                "answer,extra\nA,1\n",
+                "answer\nA\n",
             )
             self.assertFalse(log_payload["finalization"]["applied"])
             self.assertIn("bad finalizer", log_payload["finalization"]["failure_reason"])
@@ -875,7 +942,7 @@ class DatabaoDemoTests(unittest.TestCase):
                 {"event_name": ["September Speaker", "October Speaker"]},
             )
 
-    def test_postprocessor_prunes_superlative_metric_rows(self) -> None:
+    def test_superlative_verifier_generates_candidate_metric_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
@@ -885,7 +952,7 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
-            frame, report = postprocess_answer_table(
+            candidates = generate_verifier_candidate_frames(
                 task,
                 pd.DataFrame(
                     {
@@ -896,10 +963,11 @@ class DatabaoDemoTests(unittest.TestCase):
                 ),
             )
 
-            self.assertTrue(report.applied)
+            self.assertTrue(candidates)
+            frame = candidates[0][0]
             self.assertEqual(frame.to_dict(orient="list"), {"event_name": ["B"]})
 
-    def test_postprocessor_drops_metric_column_when_superlative_rows_are_already_filtered(self) -> None:
+    def test_superlative_verifier_generates_candidate_when_rows_already_filtered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
@@ -909,7 +977,7 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
-            frame, report = postprocess_answer_table(
+            candidates = generate_verifier_candidate_frames(
                 task,
                 pd.DataFrame(
                     {
@@ -919,10 +987,11 @@ class DatabaoDemoTests(unittest.TestCase):
                 ),
             )
 
-            self.assertTrue(report.applied)
+            self.assertTrue(candidates)
+            frame = candidates[0][0]
             self.assertEqual(frame.to_dict(orient="list"), {"event_name": ["A", "B"]})
 
-    def test_postprocessor_uses_context_chain_for_event_cost_superlative(self) -> None:
+    def test_context_chain_superlative_verifier_generates_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
@@ -965,15 +1034,16 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
-            frame, report = postprocess_answer_table(
+            candidates = generate_verifier_candidate_frames(
                 task,
                 pd.DataFrame({"event_name": ["Alpha"], "total_cost": [20.0]}),
             )
 
-            self.assertTrue(report.applied)
+            self.assertTrue(candidates)
+            frame = candidates[0][0]
             self.assertEqual(frame.to_dict(orient="list"), {"event_name": ["Beta"]})
 
-    def test_question_column_pruner_keeps_date_received(self) -> None:
+    def test_question_column_pruner_keeps_requested_date_column(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
@@ -984,46 +1054,46 @@ class DatabaoDemoTests(unittest.TestCase):
                 task,
                 pd.DataFrame(
                     {
-                        "income_id": ["recA"],
-                        "date_received": ["2021-05-20"],
+                        "record_id": ["recA"],
+                        "date": ["2021-05-20"],
                         "amount": [50],
                     }
                 ),
             )
 
-            self.assertEqual(frame.to_dict(orient="list"), {"date_received": ["2021-05-20"]})
+            self.assertEqual(frame.to_dict(orient="list"), {"date": ["2021-05-20"]})
             self.assertEqual(transforms[0]["kind"], "question_column_pruning")
 
-    def test_question_column_pruner_keeps_withdrawal_transaction_id(self) -> None:
+    def test_question_column_pruner_keeps_requested_identifier_column(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(input_root, question="List all cash withdrawals over the threshold.")
+            write_task(input_root, question="List all records by identifier over the threshold.")
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
             frame, _ = apply_question_column_pruner(
                 task,
                 pd.DataFrame(
                     {
-                        "trans_id": [101, 102],
+                        "record_id": [101, 102],
                         "date": ["2020-01-01", "2020-01-02"],
                         "amount": [500, 600],
                     }
                 ),
             )
 
-            self.assertEqual(frame.to_dict(orient="list"), {"trans_id": [101, 102]})
+            self.assertEqual(frame.to_dict(orient="list"), {"record_id": [101, 102]})
 
-    def test_aggregate_ratio_verifier_rewrites_post_vote_ratio(self) -> None:
+    def test_aggregate_ratio_verifier_rewrites_generic_ratio(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(input_root, question="For the user No.24, how many times is the number of posts compared to votes?")
+            write_task(input_root, question="How many times is the selected item count compared to the total count?")
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
             frame, transforms = apply_aggregate_ratio_verifier(
                 task,
-                pd.DataFrame({"post_count": [3], "vote_count": [8]}),
+                pd.DataFrame({"item_count": [3], "total_count": [8]}),
             )
 
             self.assertAlmostEqual(frame.iloc[0, 0], 0.375)
@@ -1033,23 +1103,23 @@ class DatabaoDemoTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(input_root, question="What percentage of European Grand Prix races were hosted in Germany?")
+            write_task(input_root, question="What percentage of matching records are selected?")
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
             frame, transforms = apply_aggregate_ratio_verifier(
                 task,
-                pd.DataFrame({"total_european_gp": [23], "germany_count": [12]}),
+                pd.DataFrame({"total_count": [23], "matching_count": [12]}),
             )
 
             self.assertAlmostEqual(frame.iloc[0, 0], 52.17391304347826)
             self.assertEqual(transforms[0]["mode"], "percentage")
 
-    def test_answer_column_verifier_keeps_phone_post_text_and_view_user_columns(self) -> None:
+    def test_answer_column_verifier_keeps_generic_requested_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
 
-            write_task(input_root, task_id="task_phone", question="What is the telephone number for the school?")
+            write_task(input_root, task_id="task_phone", question="What is the telephone number for the record?")
             phone_task = DABenchPublicDataset(input_root).get_task("task_phone")
             phone_frame, _ = apply_answer_column_verifier(
                 phone_task,
@@ -1057,181 +1127,392 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             self.assertEqual(phone_frame.to_dict(orient="list"), {"Phone": ["(559) 248-5100"]})
 
-            write_task(input_root, task_id="task_post", question="Which post has the most answers count? State the post ID.")
-            post_task = DABenchPublicDataset(input_root).get_task("task_post")
-            post_frame, _ = apply_answer_column_verifier(
-                post_task,
-                pd.DataFrame({"Id": [351], "AnswerCount": [None]}),
+            write_task(input_root, task_id="task_identifier", question="State the identifier for the selected row.")
+            identifier_task = DABenchPublicDataset(input_root).get_task("task_identifier")
+            identifier_frame, _ = apply_answer_column_verifier(
+                identifier_task,
+                pd.DataFrame({"record_id": [351], "metric_value": [None]}),
             )
-            self.assertEqual(post_frame.to_dict(orient="list"), {"Id": [351]})
+            self.assertEqual(identifier_frame.to_dict(orient="list"), {"record_id": [351]})
 
-            write_task(input_root, task_id="task_comment", question="What is the comment with the highest score?")
-            comment_task = DABenchPublicDataset(input_root).get_task("task_comment")
-            comment_frame, _ = apply_answer_column_verifier(
-                comment_task,
+            write_task(input_root, task_id="task_text", question="What is the text for the selected row?")
+            text_task = DABenchPublicDataset(input_root).get_task("task_text")
+            text_frame, _ = apply_answer_column_verifier(
+                text_task,
                 pd.DataFrame({"Id": [1], "Score": [14], "Text": ["hello"]}),
             )
-            self.assertEqual(comment_frame.to_dict(orient="list"), {"Text": ["hello"]})
+            self.assertEqual(text_frame.to_dict(orient="list"), {"Text": ["hello"]})
 
-            write_task(input_root, task_id="task_views", question="Identify the total views. Name the user who posted it last time.")
-            views_task = DABenchPublicDataset(input_root).get_task("task_views")
+            write_task(input_root, task_id="task_display", question="Identify the ViewCount and DisplayName.")
+            views_task = DABenchPublicDataset(input_root).get_task("task_display")
             views_frame, _ = apply_answer_column_verifier(
                 views_task,
                 pd.DataFrame({"Title": ["A"], "ViewCount": [1708], "DisplayName": ["mbq"], "UserId": [88]}),
             )
             self.assertEqual(views_frame.to_dict(orient="list"), {"ViewCount": [1708], "DisplayName": ["mbq"]})
 
-    def test_deterministic_route_solves_superhero_average_weight(self) -> None:
+    def test_root_level_csv_is_loaded_and_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_dir = Path(tmp)
+            (context_dir / "patient_sex.csv").write_text("ID,SEX\n1,M\n", encoding="utf-8")
+            domain = FakeDomain()
+
+            summary = register_context_sources(domain, context_dir)
+            tables = load_context_tables(context_dir)
+
+            self.assertEqual(summary["csv_files"], ["patient_sex.csv"])
+            self.assertEqual([table.name for table in tables], ["patient_sex"])
+            self.assertEqual(domain.dfs[0]["name"], "csv_patient_sex")
+
+    def test_generic_document_materializer_extracts_record_like_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            context_dir = Path(tmp)
+            doc_dir = context_dir / "doc"
+            doc_dir.mkdir()
+            (doc_dir / "records.md").write_text(
+                "Record Alpha (Registry ID: recAlpha) is known as North Sample. "
+                "Its status is active, amount is 42.50, and it is related to recBeta.\n\n"
+                "Reference code 200 is called South Sample. Its category is archived.",
+                encoding="utf-8",
+            )
+
+            tables = generic_document_tables(context_dir)
+            reasoning_tables = document_records_for_reasoning(context_dir)
+
+            self.assertEqual(len(tables), 1)
+            table = tables[0]
+            self.assertEqual(table.name, "document_records")
+            self.assertEqual(table.metadata["strategy_name"], "document_records_for_agent")
+            self.assertGreaterEqual(len(table.frame), 2)
+            self.assertIn("record_id", table.frame.columns)
+            self.assertIn("name", table.frame.columns)
+            self.assertIn("status", table.frame.columns)
+            self.assertIn("amount", table.frame.columns)
+            self.assertNotIn("evidence_span", table.frame.columns)
+            self.assertNotIn("source_doc", table.frame.columns)
+            self.assertEqual(len(reasoning_tables), 1)
+            self.assertIn("evidence_span", reasoning_tables[0].frame.columns)
+
+    def test_src_code_has_no_public_domain_memory_terms(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        banned_terms = [
+            "superhero",
+            "races",
+            "legalities",
+            "molecule",
+            "Commander",
+            "Club T-Shirts",
+            "Australian Grand Prix",
+            "publisher affiliation",
+        ]
+        violations: list[str] = []
+        for path in (repo_root / "src").rglob("*.py"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            lowered = text.lower()
+            for term in banned_terms:
+                if term.lower() in lowered:
+                    violations.append(f"{path.relative_to(repo_root)} contains {term!r}")
+
+        self.assertEqual(violations, [])
+
+    def test_answer_contract_rejects_source_name_singleton(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(input_root, question="What is the average weight of all female superheroes?")
-            context_dir = input_root / "task_1" / "context"
-            csv_dir = context_dir / "csv"
-            json_dir = context_dir / "json"
-            csv_dir.mkdir()
-            json_dir.mkdir()
-            (csv_dir / "superhero.csv").write_text(
-                "id,superhero_name,gender_id,weight_kg\n1,A,2,50\n2,B,2,70\n3,C,1,200\n",
-                encoding="utf-8",
-            )
-            (json_dir / "gender.json").write_text(
-                json.dumps(
-                    {
-                        "table": "gender",
-                        "records": [
-                            {"id": 1, "gender": "Male"},
-                            {"id": 2, "gender": "Female"},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
+            write_task(input_root, question="How many rows are selected?")
             task = DABenchPublicDataset(input_root).get_task("task_1")
             task_context = build_task_context(task)
             intent = infer_task_intent(task_context)
-            decision = choose_route_policy(task_context, intent, structured_planner_mode="fallback")
+            contract = infer_answer_contract(task_context, intent)
 
-            self.assertEqual(decision.route, "deterministic")
-            self.assertIsNotNone(decision.candidate)
-            self.assertEqual(decision.candidate.frame.iloc[0, 0], 60.0)
+            report = validate_answer_contract(
+                contract,
+                pd.DataFrame({"name": ["csv_Laboratory"]}),
+                candidate_source="databao",
+            )
 
-    def test_deterministic_route_solves_racing_finish_time_rank(self) -> None:
+            self.assertFalse(report.valid)
+            self.assertTrue(report.should_repair)
+
+    def test_final_answer_shape_guard_removes_metadata_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(
-                input_root,
-                question="What's the finish time for the driver who ranked second in 2008's Chinese Grand Prix?",
+            write_task(input_root, question="What is the final answer?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="table",
+                expected_columns=(),
+                max_rows=None,
+                max_columns=None,
+                allow_empty=False,
+                reason="test",
             )
-            context_dir = input_root / "task_1" / "context"
-            csv_dir = context_dir / "csv"
-            json_dir = context_dir / "json"
-            csv_dir.mkdir()
-            json_dir.mkdir()
-            (csv_dir / "results.csv").write_text(
-                "raceId,driverId,rank,positionOrder,time\n34,1,1,1,1:31:57.403\n34,8,2,3,+16.445\n",
-                encoding="utf-8",
-            )
-            (json_dir / "races.json").write_text(
-                json.dumps(
+
+            guarded, report = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame(
                     {
-                        "table": "races",
-                        "records": [
-                            {"raceId": 34, "year": 2008, "name": "Chinese Grand Prix"},
-                            {"raceId": 35, "year": 2008, "name": "Brazilian Grand Prix"},
-                        ],
+                        "answer": ["A"],
+                        "source_doc": ["doc.md"],
+                        "evidence_span": ["debug text"],
+                        "confidence": [0.9],
                     }
                 ),
-                encoding="utf-8",
+                contract=contract,
+                candidate_source="databao_raw",
             )
-            task = DABenchPublicDataset(input_root).get_task("task_1")
-            task_context = build_task_context(task)
-            intent = infer_task_intent(task_context)
-            decision = choose_route_policy(task_context, intent, structured_planner_mode="fallback")
 
-            self.assertEqual(decision.route, "deterministic")
-            self.assertEqual(decision.candidate.frame.to_dict(orient="list"), {"time": ["+16.445"]})
+            self.assertEqual(guarded.to_dict(orient="list"), {"answer": ["A"]})
+            self.assertTrue(report.to_dict()["metadata_columns_removed"])
 
-    def test_deterministic_route_solves_qualifying_q3_driver_number(self) -> None:
+    def test_final_answer_shape_guard_enforces_scalar_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(
-                input_root,
-                question="What is his number of the driver who finished 0:01:54 in the Q3 of qualifying race No.903?",
-            )
-            context_dir = input_root / "task_1" / "context"
-            csv_dir = context_dir / "csv"
-            json_dir = context_dir / "json"
-            csv_dir.mkdir()
-            json_dir.mkdir()
-            (csv_dir / "qualifying.csv").write_text(
-                "raceId,driverId,number,q3\n"
-                "903,817,3,1:54.455\n"
-                "903,20,1,1:54.960\n"
-                "903,1,44,1:53.860\n"
-                "903,825,20,\n",
-                encoding="utf-8",
-            )
-            (json_dir / "drivers.json").write_text(
-                json.dumps(
-                    {
-                        "table": "drivers",
-                        "records": [
-                            {"driverId": 817, "number": "3"},
-                            {"driverId": 20, "number": "5"},
-                            {"driverId": 1, "number": "44"},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
+            write_task(input_root, question="How many rows match?")
             task = DABenchPublicDataset(input_root).get_task("task_1")
-            task_context = build_task_context(task)
-            intent = infer_task_intent(task_context)
-            decision = choose_route_policy(task_context, intent, structured_planner_mode="fallback")
+            contract = AnswerContract(
+                kind="scalar",
+                expected_columns=("answer",),
+                max_rows=1,
+                max_columns=1,
+                allow_empty=False,
+                reason="test",
+            )
 
-            self.assertEqual(decision.route, "deterministic")
-            self.assertEqual(decision.candidate.frame.to_dict(orient="list"), {"number": ["3", "5"]})
+            guarded, _ = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame({"answer": [3, 4], "total": [10, 11], "source": ["x", "y"]}),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
 
-    def test_deterministic_route_solves_driver_standings_race_list(self) -> None:
+            self.assertEqual(guarded.shape, (1, 1))
+            self.assertEqual(guarded.to_dict(orient="list"), {"answer": [3]})
+
+    def test_final_answer_shape_guard_enforces_entity_list_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
-            write_task(input_root, question="Which race was Alex Yoong in when he was in track number less than 20?")
-            context_dir = input_root / "task_1" / "context"
-            csv_dir = context_dir / "csv"
-            json_dir = context_dir / "json"
-            csv_dir.mkdir()
-            json_dir.mkdir()
-            (csv_dir / "driverStandings.csv").write_text(
-                "raceId,driverId,position\n124,62,19\n125,62,20\n126,62,18\n",
-                encoding="utf-8",
+            write_task(input_root, question="List matching names.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="table",
+                expected_columns=(),
+                max_rows=None,
+                max_columns=None,
+                allow_empty=False,
+                reason="test",
             )
-            (csv_dir / "races.csv").write_text(
-                "raceId,name\n124,Australian Grand Prix\n125,Malaysian Grand Prix\n126,Brazilian Grand Prix\n",
-                encoding="utf-8",
+
+            guarded, _ = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame({"name": ["A", "B"], "score": [1, 2], "source": ["x", "y"]}),
+                contract=contract,
+                candidate_source="databao_raw",
             )
-            (json_dir / "drivers.json").write_text(
-                json.dumps(
+
+            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A", "B"]})
+
+    def test_final_answer_shape_guard_preserves_explicit_table_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Return the name and status for matching rows.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="attribute_lookup",
+                expected_columns=("name", "status"),
+                max_rows=None,
+                max_columns=2,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, _ = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame(
                     {
-                        "table": "drivers",
-                        "records": [{"driverId": 62, "forename": "Alex", "surname": "Yoong"}],
+                        "name": ["A"],
+                        "status": ["active"],
+                        "value": [10],
+                        "confidence": [0.9],
                     }
                 ),
-                encoding="utf-8",
+                contract=contract,
+                candidate_source="databao_raw",
             )
-            task = DABenchPublicDataset(input_root).get_task("task_1")
-            task_context = build_task_context(task)
-            intent = infer_task_intent(task_context)
-            decision = choose_route_policy(task_context, intent, structured_planner_mode="fallback")
 
-            self.assertEqual(decision.route, "deterministic")
+            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A"], "status": ["active"]})
+
+    def test_candidate_ranking_prefers_contract_valid_clean_candidate(self) -> None:
+        contract = AnswerContract(
+            kind="scalar",
+            expected_columns=("answer",),
+            max_rows=1,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        bad = Candidate(
+            frame=pd.DataFrame({"answer": [3], "source_doc": ["doc.md"]}),
+            source="databao_raw",
+            confidence=0.8,
+            diagnostics={},
+        )
+        good = Candidate(
+            frame=pd.DataFrame({"answer": [3]}),
+            source="structured_planner",
+            confidence=0.7,
+            diagnostics={},
+        )
+
+        selected, report = rank_candidates(
+            candidates=[bad, good],
+            contract=contract,
+            question="How many rows match?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "structured_planner")
+        self.assertEqual(report.selected_source, "structured_planner")
+
+    def test_metadata_columns_never_reach_prediction_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, question="What is the final answer?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            artifact = run_databao_task(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=make_agent_builder(
+                    pd.DataFrame(
+                        {
+                            "answer": ["A"],
+                            "source_doc": ["doc.md"],
+                            "evidence_span": ["debug"],
+                            "confidence": [0.9],
+                        }
+                    )
+                ),
+                answer_finalizer=no_answer_finalizer,
+                structured_planner=no_structured_planner,
+                structured_planner_mode="off",
+            )
+
+            self.assertTrue(artifact.succeeded)
             self.assertEqual(
-                decision.candidate.frame.to_dict(orient="list"),
-                {"name": ["Australian Grand Prix", "Brazilian Grand Prix"]},
+                (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
+                "answer\nA\n",
             )
+
+    def test_ordinary_metadata_candidate_uses_cheap_repair_before_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, question="What is the final answer?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            def forbidden_planner(task, databao_env):
+                del task, databao_env
+                raise AssertionError("ordinary metadata repair should not start planner rescue")
+
+            artifact = run_databao_task(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=make_agent_builder(
+                    pd.DataFrame({"answer": ["databao"], "source_doc": ["doc.md"]})
+                ),
+                answer_finalizer=no_answer_finalizer,
+                structured_planner=forbidden_planner,
+            )
+
+            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
+            self.assertTrue(artifact.succeeded)
+            self.assertEqual(artifact.selected_candidate_source, "databao_raw_postprocessed")
+            self.assertEqual(log_payload["selected_candidate_source"], "databao_raw_postprocessed")
+            self.assertEqual(
+                (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
+                "answer\ndatabao\n",
+            )
+
+    def test_deadline_skips_planner_and_uses_best_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, question="What is the final answer?")
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            json_dir = context_dir / "json"
+            csv_dir.mkdir()
+            json_dir.mkdir()
+            (csv_dir / "left.csv").write_text("id,value\n1,A\n", encoding="utf-8")
+            (csv_dir / "right.csv").write_text("left_id,amount\n1,10\n", encoding="utf-8")
+            (json_dir / "extra.json").write_text(
+                json.dumps({"table": "extra", "records": [{"id": 1, "status": "ok"}]}),
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            def forbidden_planner(task, databao_env):
+                del task, databao_env
+                raise AssertionError("planner should be skipped by deadline")
+
+            with patch.dict(os.environ, {DATABAO_TASK_TIMEOUT_SECONDS_ENV: "30"}):
+                artifact = run_databao_task(
+                    task=task,
+                    output_root=output_root,
+                    logs_dir=logs_dir,
+                    databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                    agent_builder=make_agent_builder(
+                        pd.DataFrame({"answer": []})
+                    ),
+                    answer_finalizer=no_answer_finalizer,
+                    structured_planner=forbidden_planner,
+                    structured_planner_mode="fallback",
+                )
+
+            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
+            self.assertTrue(artifact.succeeded)
+            self.assertIn("Structured planner skipped", log_payload["planner_skipped_reason"])
+            self.assertEqual(
+                (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
+                "answer\n",
+            )
+
+    def test_query_context_retriever_selects_relevant_schema_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="What amount belongs to the matching customer name?")
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            csv_dir.mkdir()
+            (csv_dir / "orders.csv").write_text("customer_id,amount\n1,20\n", encoding="utf-8")
+            (csv_dir / "customers.csv").write_text("id,name\n1,A\n", encoding="utf-8")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            task_context = build_task_context(task)
+
+            retrieved = query_context_retriever(task_context, task.question)
+
+            self.assertIn("orders", retrieved.relevant_columns)
+            self.assertIn("customers", retrieved.relevant_columns)
+            self.assertIn("amount", retrieved.relevant_columns["orders"])
+            self.assertTrue(retrieved.candidate_join_paths)
 
     def test_route_policy_defaults_to_databao_for_low_confidence_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -269,6 +269,10 @@ def run_databao_demo_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
     task_id: str | None = typer.Option(None, help="Run one specific task id, e.g. task_25."),
+    difficulty: str | None = typer.Option(
+        None,
+        help="Run only tasks with this difficulty, e.g. easy, medium, hard, or extreme.",
+    ),
     task_timeout_seconds: int | None = typer.Option(
         None,
         min=1,
@@ -305,6 +309,7 @@ def run_databao_demo_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Logs: {logs_dir}")
     console.print(f"Task timeout: {effective_task_timeout_seconds}s")
+    console.print(f"Difficulty: {difficulty or 'all'}")
     console.print(f"Planner mode: {planner_mode or 'fallback'}")
     console.print(f"Finalizer mode: {finalizer_mode or 'off'}")
 
@@ -314,15 +319,21 @@ def run_databao_demo_command(
         logs_dir=logs_dir,
         limit=limit,
         task_ids=[task_id] if task_id else None,
+        difficulty=difficulty,
         task_timeout_seconds=effective_task_timeout_seconds,
         databao_env=databao_env,
         structured_planner_mode=planner_mode,
         finalizer_mode=finalizer_mode,
     )
     succeeded_count = sum(1 for artifact in artifacts if artifact.succeeded)
-    console.print(f"Tasks attempted: {len(artifacts)}")
+    prediction_written_count = sum(1 for artifact in artifacts if artifact.prediction_written)
+    scorable_count = sum(1 for artifact in artifacts if artifact.scorable)
+    console.print(f"Attempted tasks: {len(artifacts)}")
     console.print(f"Succeeded tasks: {succeeded_count}")
     console.print(f"Failed tasks: {len(artifacts) - succeeded_count}")
+    console.print(f"Prediction written: {prediction_written_count}")
+    console.print(f"Scorable tasks: {scorable_count}")
+    console.print(f"Missing prediction: {len(artifacts) - prediction_written_count}")
 
 
 @app.command("evaluate-public-run")
@@ -345,8 +356,10 @@ def evaluate_public_run_command(
 
     table = Table(title="Public Run Evaluation")
     table.add_column("Task")
+    table.add_column("Pred")
+    table.add_column("Artifact")
     table.add_column("Matched")
-    table.add_column("Coverage")
+    table.add_column("Score")
     table.add_column("Extra")
     table.add_column("Rows")
     table.add_column("Cols")
@@ -354,14 +367,26 @@ def evaluate_public_run_command(
     for task in evaluation.tasks:
         table.add_row(
             task.task_id,
+            "yes" if task.prediction_written else "no",
+            (
+                "-"
+                if task.artifact_succeeded is None
+                else "ok"
+                if task.artifact_succeeded
+                else "fail"
+            ),
             f"{task.matched_columns}/{task.gold_columns}",
-            f"{task.coverage:.3f}",
+            f"{task.estimated_score:.3f}",
             str(task.extra_columns),
             f"{task.prediction_rows}/{task.gold_rows}",
             f"{task.prediction_columns}/{task.gold_columns}",
             "yes" if task.exact_no_extra else "no",
         )
     console.print(table)
+    console.print(
+        "PER_TASK_AVERAGE_SCORE="
+        f"{evaluation.per_task_average_score:.3f}"
+    )
     console.print(
         "OVERALL_COLUMN_COVERAGE="
         f"{evaluation.matched_columns}/{evaluation.gold_columns}="
@@ -372,6 +397,9 @@ def evaluate_public_run_command(
         f"{evaluation.exact_no_extra_tasks}/{len(evaluation.tasks)}="
         f"{evaluation.exact_no_extra_rate:.3f}"
     )
+    console.print(f"PREDICTION_WRITTEN={evaluation.prediction_written_count}/{len(evaluation.tasks)}")
+    console.print(f"SCORABLE_TASKS={evaluation.scorable_task_count}/{len(evaluation.tasks)}")
+    console.print(f"MISSING_PREDICTION={evaluation.missing_prediction_count}/{len(evaluation.tasks)}")
 
 
 def main() -> None:

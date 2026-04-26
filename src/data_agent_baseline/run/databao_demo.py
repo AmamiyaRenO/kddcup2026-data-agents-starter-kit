@@ -33,6 +33,7 @@ DATABAO_DATABAO_TIMEOUT_SECONDS_ENV = "DATABAO_DATABAO_TIMEOUT_SECONDS"
 DATABAO_AUX_TIMEOUT_SECONDS_ENV = "DATABAO_AUX_TIMEOUT_SECONDS"
 DATABAO_STRUCTURED_PLANNER_MODE_ENV = "DATABAO_STRUCTURED_PLANNER_MODE"
 DATABAO_FINALIZER_MODE_ENV = "DATABAO_FINALIZER_MODE"
+DATABAO_HEURISTIC_LEVEL_ENV = "DATABAO_HEURISTIC_LEVEL"
 
 SOURCE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 MAX_DESCRIPTION_CHARS = 20000
@@ -43,8 +44,9 @@ MAX_DATABAO_TOKENS = 2048
 MAX_FINALIZER_TOKENS = 512
 MAX_STRUCTURED_PLANNER_TOKENS = 768
 STRUCTURED_PLANNER_ATTEMPTS = 1
-OPENAI_AUX_CALL_TIMEOUT_SECONDS = 90
+OPENAI_AUX_CALL_TIMEOUT_SECONDS = 30
 DATABAO_AGENT_TIMEOUT_SECONDS = 180
+MIN_SECONDS_FOR_PLANNER = 45
 MAX_FAILURE_REASON_CHARS = 1000
 MAX_CONTEXT_ENRICHMENT_ROWS = 80
 MAX_CONTEXT_METRIC_SUMMARIES = 8
@@ -52,20 +54,64 @@ MAX_PLANNER_SAMPLE_ROWS = 3
 RECORD_ID_PATTERN = re.compile(r"^rec[A-Za-z0-9]+$")
 STRUCTURED_PLANNER_MODES = {"off", "fallback", "first"}
 FINALIZER_MODES = {"off", "always"}
+HEURISTIC_LEVELS = {"generic", "experimental_generic"}
 _CURRENT_DIAGNOSTICS: ContextVar["TaskDiagnostics | None"] = ContextVar(
     "databao_task_diagnostics",
     default=None,
 )
+_CURRENT_RETRIEVED_CONTEXT: ContextVar["RetrievedContext | None"] = ContextVar(
+    "databao_retrieved_context",
+    default=None,
+)
 
 DISPLAY_COLUMN_PRIORITY = (
-    "event_name",
+    "display_name",
     "name",
     "title",
+    "label",
     "category",
+    "status",
     "description",
-    "expense_description",
-    "Diagnosis",
 )
+
+DEBUG_METADATA_COLUMNS = {
+    "source_doc",
+    "evidence_span",
+    "confidence",
+    "paragraph_index",
+    "extraction_strategy",
+    "strategy_kind",
+    "record_id_kind",
+    "debug",
+    "trace",
+}
+
+DOCUMENT_AGENT_SAFE_BASE_COLUMNS = {
+    "record_id",
+    "numeric_id",
+    "paragraph_id",
+    "name",
+    "title",
+    "label",
+    "description",
+    "status",
+    "type",
+    "category",
+    "format",
+    "amount",
+    "cost",
+    "price",
+    "score",
+    "value",
+    "height",
+    "total",
+    "count",
+    "date",
+    "year",
+    "season",
+    "created_at",
+    "related_id",
+}
 
 MIN_SUPERLATIVE_TERMS = (
     "lowest",
@@ -109,6 +155,8 @@ class DatabaoTaskArtifacts:
     prediction_csv_path: Path | None
     log_path: Path
     succeeded: bool
+    prediction_written: bool
+    scorable: bool
     failure_reason: str | None
     elapsed_seconds: float
     row_count: int | None = None
@@ -120,6 +168,16 @@ class DatabaoTaskArtifacts:
     timings: dict[str, float] | None = None
     llm_calls: list[dict[str, Any]] | None = None
     route_policy: dict[str, Any] | None = None
+    answer_contract: dict[str, Any] | None = None
+    heuristic_level: str | None = None
+    enabled_strategies: list[dict[str, Any]] | None = None
+    applied_strategies: list[dict[str, Any]] | None = None
+    retrieved_context: dict[str, Any] | None = None
+    complexity_profile: dict[str, Any] | None = None
+    candidates: list[dict[str, Any]] | None = None
+    candidate_scores: list[dict[str, Any]] | None = None
+    selected_candidate_source: str | None = None
+    final_answer_guard: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +186,8 @@ class DatabaoTaskArtifacts:
             "prediction_csv_path": str(self.prediction_csv_path) if self.prediction_csv_path else None,
             "log_path": str(self.log_path),
             "succeeded": self.succeeded,
+            "prediction_written": self.prediction_written,
+            "scorable": self.scorable,
             "failure_reason": self.failure_reason,
             "elapsed_seconds": self.elapsed_seconds,
             "row_count": self.row_count,
@@ -139,6 +199,16 @@ class DatabaoTaskArtifacts:
             "timings": self.timings,
             "llm_calls": self.llm_calls,
             "route_policy": self.route_policy,
+            "answer_contract": self.answer_contract,
+            "heuristic_level": self.heuristic_level,
+            "enabled_strategies": self.enabled_strategies or [],
+            "applied_strategies": self.applied_strategies or [],
+            "retrieved_context": self.retrieved_context,
+            "complexity_profile": self.complexity_profile,
+            "candidates": self.candidates or [],
+            "candidate_scores": self.candidate_scores or [],
+            "selected_candidate_source": self.selected_candidate_source,
+            "final_answer_guard": self.final_answer_guard,
         }
 
 
@@ -186,6 +256,7 @@ class ContextTable:
     name: str
     path: str
     frame: pd.DataFrame
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +297,28 @@ class TaskContext:
 
 
 @dataclass(frozen=True, slots=True)
+class RetrievedContext:
+    relevant_tables: tuple[str, ...]
+    relevant_columns: dict[str, tuple[str, ...]]
+    sample_rows: dict[str, list[dict[str, Any]]]
+    candidate_join_paths: tuple[dict[str, Any], ...]
+    document_snippets: tuple[dict[str, Any], ...]
+    retrieval_diagnostics: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relevant_tables": list(self.relevant_tables),
+            "relevant_columns": {
+                table: list(columns) for table, columns in self.relevant_columns.items()
+            },
+            "sample_rows": self.sample_rows,
+            "candidate_join_paths": list(self.candidate_join_paths),
+            "document_snippets": list(self.document_snippets),
+            "retrieval_diagnostics": self.retrieval_diagnostics,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class TaskIntent:
     domain: str | None
     operation: str | None
@@ -235,11 +328,157 @@ class TaskIntent:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskComplexityProfile:
+    source_count: int
+    table_count: int
+    db_table_count: int
+    csv_table_count: int
+    json_table_count: int
+    document_file_count: int
+    document_text_chars: int
+    total_columns: int
+    total_rows_sampled: int
+    has_unstructured_docs: bool
+    has_sqlite_db: bool
+    has_multiple_sources: bool
+    has_many_tables: bool
+    has_join_candidates: bool
+    question_token_count: int
+    question_mentions_aggregation: bool
+    question_mentions_superlative: bool
+    question_mentions_ratio_or_percentage: bool
+    question_mentions_filter_or_condition: bool
+    question_mentions_multiple_attributes: bool
+    estimated_context_size: int
+    retrieval_confidence: float
+    best_candidate_score: int | None
+    best_candidate_contract_valid: bool | None
+    best_candidate_empty: bool | None
+    best_candidate_has_metadata_columns: bool | None
+    best_candidate_shape_mismatch: bool | None
+    complexity_score: int
+    uncertainty_score: int
+    planner_payload_within_limit: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_count": self.source_count,
+            "table_count": self.table_count,
+            "db_table_count": self.db_table_count,
+            "csv_table_count": self.csv_table_count,
+            "json_table_count": self.json_table_count,
+            "document_file_count": self.document_file_count,
+            "document_text_chars": self.document_text_chars,
+            "total_columns": self.total_columns,
+            "total_rows_sampled": self.total_rows_sampled,
+            "has_unstructured_docs": self.has_unstructured_docs,
+            "has_sqlite_db": self.has_sqlite_db,
+            "has_multiple_sources": self.has_multiple_sources,
+            "has_many_tables": self.has_many_tables,
+            "has_join_candidates": self.has_join_candidates,
+            "question_token_count": self.question_token_count,
+            "question_mentions_aggregation": self.question_mentions_aggregation,
+            "question_mentions_superlative": self.question_mentions_superlative,
+            "question_mentions_ratio_or_percentage": self.question_mentions_ratio_or_percentage,
+            "question_mentions_filter_or_condition": self.question_mentions_filter_or_condition,
+            "question_mentions_multiple_attributes": self.question_mentions_multiple_attributes,
+            "estimated_context_size": self.estimated_context_size,
+            "retrieval_confidence": self.retrieval_confidence,
+            "best_candidate_score": self.best_candidate_score,
+            "best_candidate_contract_valid": self.best_candidate_contract_valid,
+            "best_candidate_empty": self.best_candidate_empty,
+            "best_candidate_has_metadata_columns": self.best_candidate_has_metadata_columns,
+            "best_candidate_shape_mismatch": self.best_candidate_shape_mismatch,
+            "complexity_score": self.complexity_score,
+            "uncertainty_score": self.uncertainty_score,
+            "planner_payload_within_limit": self.planner_payload_within_limit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Candidate:
     frame: pd.DataFrame
     source: str
     confidence: float
     diagnostics: dict[str, Any]
+    transformations: tuple[dict[str, Any], ...] = ()
+    contract_report: dict[str, Any] | None = None
+    retrieval_context_used: dict[str, Any] | None = None
+    elapsed_seconds: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "confidence": self.confidence,
+            "row_count": len(self.frame),
+            "column_count": len(self.frame.columns),
+            "columns": [str(column) for column in self.frame.columns],
+            "diagnostics": self.diagnostics,
+            "transformations": list(self.transformations),
+            "contract_report": self.contract_report,
+            "retrieval_context_used": self.retrieval_context_used,
+            "elapsed_seconds": self.elapsed_seconds,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateScore:
+    source: str
+    score: int
+    selected: bool
+    reasons: tuple[str, ...]
+    row_count: int
+    column_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "score": self.score,
+            "selected": self.selected,
+            "reasons": list(self.reasons),
+            "row_count": self.row_count,
+            "column_count": self.column_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateRankingReport:
+    selected_source: str | None
+    candidate_scores: tuple[CandidateScore, ...]
+    rejection_reasons: dict[str, list[str]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "selected_source": self.selected_source,
+            "candidate_scores": [score.to_dict() for score in self.candidate_scores],
+            "rejection_reasons": self.rejection_reasons,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FinalAnswerShapeReport:
+    transformations: tuple[dict[str, Any], ...]
+    input_row_count: int
+    input_column_count: int
+    output_row_count: int
+    output_column_count: int
+    contract_before: dict[str, Any] | None
+    contract_after: dict[str, Any] | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "transformations": list(self.transformations),
+            "input_row_count": self.input_row_count,
+            "input_column_count": self.input_column_count,
+            "output_row_count": self.output_row_count,
+            "output_column_count": self.output_column_count,
+            "contract_before": self.contract_before,
+            "contract_after": self.contract_after,
+            "metadata_columns_removed": any(
+                transform.get("kind") == "metadata_column_removal"
+                for transform in self.transformations
+            ),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +503,40 @@ class RouteDecision:
                 "diagnostics": self.candidate.diagnostics,
             }
         return payload
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerContract:
+    kind: str
+    expected_columns: tuple[str, ...]
+    max_rows: int | None
+    max_columns: int | None
+    allow_empty: bool
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerContractReport:
+    valid: bool
+    should_repair: bool
+    reason: str
+    contract_kind: str
+    expected_columns: tuple[str, ...]
+    row_count: int
+    column_count: int
+    candidate_source: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "valid": self.valid,
+            "should_repair": self.should_repair,
+            "reason": self.reason,
+            "contract_kind": self.contract_kind,
+            "expected_columns": list(self.expected_columns),
+            "row_count": self.row_count,
+            "column_count": self.column_count,
+            "candidate_source": self.candidate_source,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +682,29 @@ def _env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _deadline_from_start(started_at: float) -> float | None:
+    timeout_seconds = _env_int(DATABAO_TASK_TIMEOUT_SECONDS_ENV, 0)
+    return started_at + timeout_seconds if timeout_seconds > 0 else None
+
+
+def _remaining_seconds(deadline_at: float | None) -> float | None:
+    if deadline_at is None:
+        return None
+    return max(0.0, deadline_at - perf_counter())
+
+
+def _planner_skip_reason_for_deadline(deadline_at: float | None) -> str | None:
+    remaining = _remaining_seconds(deadline_at)
+    if remaining is None:
+        return None
+    if remaining < MIN_SECONDS_FOR_PLANNER:
+        return (
+            "Structured planner skipped because remaining task budget "
+            f"({remaining:.1f}s) is below {MIN_SECONDS_FOR_PLANNER}s."
+        )
+    return None
+
+
 def _normalize_mode(
     value: str | None,
     *,
@@ -464,6 +760,18 @@ def _finalizer_mode(value: str | None = None) -> str:
             "on": "always",
             "enabled": "always",
             "enable": "always",
+        },
+    )
+
+
+def _heuristic_level(value: str | None = None) -> str:
+    return _normalize_mode(
+        value if value is not None else os.environ.get(DATABAO_HEURISTIC_LEVEL_ENV),
+        default="generic",
+        allowed=HEURISTIC_LEVELS,
+        aliases={
+            "experimental": "experimental_generic",
+            "experimental-generic": "experimental_generic",
         },
     )
 
@@ -700,6 +1008,257 @@ def _json_dataframes(path: Path) -> list[tuple[str, pd.DataFrame]]:
     return []
 
 
+def _context_file_paths(context_dir: Path, subdir_name: str, suffixes: set[str]) -> list[Path]:
+    paths: list[Path] = []
+    if context_dir.is_dir():
+        for path in sorted(context_dir.iterdir()):
+            if path.is_file() and path.suffix.lower() in suffixes:
+                paths.append(path)
+    subdir = context_dir / subdir_name
+    if subdir.is_dir():
+        paths.extend(sorted(path for path in subdir.iterdir() if path.is_file() and path.suffix.lower() in suffixes))
+    return paths
+
+
+def _document_paragraphs(text: str) -> list[str]:
+    return [paragraph.strip() for paragraph in re.split(r"\n\s*\n", text) if paragraph.strip()]
+
+
+def _clean_document_value(value: str) -> str:
+    value = re.split(r"\.\s+", value, maxsplit=1)[0]
+    value = re.sub(r"\s+", " ", value).strip(" .,:;\"'`")
+    value = re.sub(r"^(?:the|a|an)\s+", "", value, flags=re.IGNORECASE)
+    return value.strip()
+
+
+def _document_records_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    if "record_id" in frame.columns:
+        frame = frame.drop_duplicates(subset=["source_doc", "record_id", "paragraph_index"], keep="last")
+    return frame.reset_index(drop=True)
+
+
+GENERIC_NUMERIC_ATTRIBUTES = ("amount", "cost", "price", "score", "value", "height", "total", "count")
+GENERIC_TEXT_ATTRIBUTES = ("name", "title", "description", "status", "type", "category", "format")
+GENERIC_TIME_ATTRIBUTES = ("date", "year", "season", "created_at")
+
+
+def _generic_identifier_values(paragraph: str) -> list[tuple[str, str]]:
+    values: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for value in re.findall(r"\brec[A-Za-z0-9]+\b", paragraph):
+        if value not in seen:
+            values.append(("record_id", value))
+            seen.add(value)
+    numeric_patterns = [
+        r"\b(?:ID|identifier|registry id|record id|code|reference|file number)\s*:?\s*(\d+)\b",
+        r"\b(\d+)\s*\((?:ID|identifier|registry id|record id|code|reference)\)",
+    ]
+    for pattern in numeric_patterns:
+        for value in re.findall(pattern, paragraph, flags=re.IGNORECASE):
+            if value not in seen:
+                values.append(("numeric_id", value))
+                seen.add(value)
+    return values
+
+
+def _extract_named_value(paragraph: str, labels: tuple[str, ...]) -> str | None:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    patterns = [
+        rf"\b(?:{label_pattern})\b\s*(?:is|was|as|:|=|to|under|with)?\s+(?:the\s+)?([^.;,\n]+)",
+        r"\b(?:called|known as|designated as|identified as|titled)\s+(?:the\s+)?([^.;,\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, paragraph, flags=re.IGNORECASE)
+        if match:
+            value = _clean_document_value(match.group(1))
+            if value:
+                return value
+    return None
+
+
+def _extract_numeric_attribute(paragraph: str, attribute: str) -> float | None:
+    pattern = rf"\b{re.escape(attribute)}\b[^\d.\-]{{0,40}}(-?\d+(?:\.\d+)?)"
+    matches = re.findall(pattern, paragraph, flags=re.IGNORECASE)
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
+
+
+def _extract_text_attribute(paragraph: str, attribute: str) -> str | None:
+    pattern = rf"\b{re.escape(attribute)}\b\s*(?:is|was|as|:|=|to|under|with)?\s+(?:the\s+)?([^.;,\n]+)"
+    match = re.search(pattern, paragraph, flags=re.IGNORECASE)
+    if not match:
+        return None
+    value = _clean_document_value(match.group(1))
+    return value or None
+
+
+def _extract_relation_attributes(paragraph: str) -> dict[str, str]:
+    relations: dict[str, str] = {}
+    for key, value in re.findall(r"\b([A-Za-z][A-Za-z0-9_]*_id)\s*:?\s*([A-Za-z0-9_.-]+)", paragraph):
+        relations[key] = value.strip(".,;")
+    related_values = re.findall(
+        r"\b(?:related to|associated with|linked to|belongs to|connected to)\s+(?:record|reference|id|code)?\s*:?\s*([A-Za-z0-9_.-]+)",
+        paragraph,
+        flags=re.IGNORECASE,
+    )
+    if related_values:
+        relations["related_id"] = related_values[-1].strip(".,;")
+    return relations
+
+
+def _generic_document_rows_for_path(
+    path: Path,
+    root: Path,
+    *,
+    heuristic_level: str,
+) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    rows: list[dict[str, Any]] = []
+    for paragraph_index, paragraph in enumerate(_document_paragraphs(text)):
+        identifiers = _generic_identifier_values(paragraph)
+        if not identifiers and heuristic_level != "experimental_generic":
+            continue
+        if not identifiers:
+            identifiers = [("paragraph_id", f"paragraph_{paragraph_index}")]
+
+        base: dict[str, Any] = {
+            "source_doc": _relative_posix(path, root),
+            "extraction_strategy": "generic_paragraph_record",
+            "strategy_kind": "generic",
+            "paragraph_index": paragraph_index,
+            "evidence_span": paragraph[:500],
+        }
+        display_value = _extract_named_value(paragraph, ("name", "title"))
+        if display_value is not None:
+            base["name"] = display_value
+        for attribute in GENERIC_TEXT_ATTRIBUTES:
+            value = _extract_text_attribute(paragraph, attribute)
+            if value is not None:
+                base[attribute] = value
+        for attribute in GENERIC_NUMERIC_ATTRIBUTES:
+            value = _extract_numeric_attribute(paragraph, attribute)
+            if value is not None:
+                base[attribute] = value
+        for attribute in GENERIC_TIME_ATTRIBUTES:
+            value = _extract_text_attribute(paragraph, attribute)
+            if value is not None:
+                base[attribute] = value
+        base.update(_extract_relation_attributes(paragraph))
+
+        confidence = 0.35
+        if any(key in base for key in ("name", "title", "status", "type", "category", "format")):
+            confidence += 0.2
+        if any(key in base for key in GENERIC_NUMERIC_ATTRIBUTES):
+            confidence += 0.15
+        if any(key.endswith("_id") or key == "related_id" for key in base):
+            confidence += 0.15
+        base["confidence"] = min(confidence, 0.85)
+
+        for identifier_kind, identifier_value in identifiers:
+            row = dict(base)
+            row["record_id_kind"] = identifier_kind
+            row["record_id"] = identifier_value
+            rows.append(row)
+    return rows
+
+
+def document_records_for_reasoning(
+    context_dir: Path,
+    *,
+    heuristic_level: str | None = None,
+) -> list[ContextTable]:
+    level = _heuristic_level(heuristic_level)
+    doc_dir = context_dir / "doc"
+    if not doc_dir.is_dir():
+        return []
+    rows: list[dict[str, Any]] = []
+    for path in sorted(item for item in doc_dir.rglob("*.md") if item.is_file()):
+        rows.extend(_generic_document_rows_for_path(path, context_dir, heuristic_level=level))
+    frame = _document_records_frame(rows)
+    if frame.empty:
+        return []
+    metadata = {
+        "strategy_name": "generic_document_tables",
+        "strategy_kind": "generic",
+        "enabled_by": level,
+        "input_document_count": len({row["source_doc"] for row in rows}),
+        "extracted_row_count": len(frame),
+        "extracted_columns": [str(column) for column in frame.columns],
+        "confidence": float(pd.to_numeric(frame["confidence"], errors="coerce").fillna(0).mean()),
+    }
+    return [
+        ContextTable(
+            name="document_records",
+            path="doc/*::generic_document_records",
+            frame=frame,
+            metadata=metadata,
+        )
+    ]
+
+
+def _is_document_agent_safe_column(column_name: str) -> bool:
+    lowered = column_name.lower()
+    return lowered in DOCUMENT_AGENT_SAFE_BASE_COLUMNS or lowered.endswith("_id")
+
+
+def _document_records_agent_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    selected_columns = [
+        column
+        for column in frame.columns
+        if _is_document_agent_safe_column(str(column))
+    ]
+    if not selected_columns:
+        return pd.DataFrame()
+    output = frame.loc[:, selected_columns].copy()
+    return output.drop_duplicates().reset_index(drop=True)
+
+
+def document_records_for_agent(
+    context_dir: Path,
+    *,
+    heuristic_level: str | None = None,
+) -> list[ContextTable]:
+    agent_tables: list[ContextTable] = []
+    for table in document_records_for_reasoning(context_dir, heuristic_level=heuristic_level):
+        frame = _document_records_agent_frame(table.frame)
+        if frame.empty:
+            continue
+        removed_columns = [
+            str(column)
+            for column in table.frame.columns
+            if str(column) not in {str(selected) for selected in frame.columns}
+        ]
+        metadata = dict(table.metadata or {})
+        metadata.update(
+            {
+                "strategy_name": "document_records_for_agent",
+                "reasoning_table_name": table.name,
+                "agent_safe_columns": [str(column) for column in frame.columns],
+                "metadata_columns_removed": removed_columns,
+            }
+        )
+        agent_tables.append(
+            ContextTable(
+                name="document_records",
+                path=table.path,
+                frame=frame,
+                metadata=metadata,
+            )
+        )
+    return agent_tables
+
+
+def generic_document_tables(context_dir: Path, *, heuristic_level: str | None = None) -> list[ContextTable]:
+    return document_records_for_agent(context_dir, heuristic_level=heuristic_level)
+
+
 def _sqlite_has_tables(path: Path) -> bool:
     conn = sqlite3.connect(path)
     try:
@@ -711,130 +1270,183 @@ def _sqlite_has_tables(path: Path) -> bool:
         conn.close()
 
 
-def register_context_sources(domain: Any, context_dir: Path) -> dict[str, Any]:
+def _retrieved_context_allows_table(
+    retrieved_context: RetrievedContext | None,
+    *,
+    table_name: str,
+    source_path: str,
+) -> bool:
+    if retrieved_context is None:
+        return True
+    relevant = {value.lower() for value in retrieved_context.relevant_tables}
+    table_key = table_name.lower()
+    path_key = source_path.lower()
+    stem_key = Path(source_path.split("::", 1)[0]).stem.lower()
+    return table_key in relevant or path_key in relevant or stem_key in relevant
+
+
+def _retrieved_document_description(retrieved_context: RetrievedContext | None) -> str | None:
+    if retrieved_context is None or not retrieved_context.document_snippets:
+        return None
+    lines = ["Retrieved document snippets for this question:"]
+    for index, snippet in enumerate(retrieved_context.document_snippets, start=1):
+        text = _text_value(snippet.get("text"))[:1000]
+        if not text:
+            continue
+        lines.append(f"[{index}] {text}")
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def register_context_sources(
+    domain: Any,
+    context_dir: Path,
+    *,
+    heuristic_level: str | None = None,
+    retrieved_context: RetrievedContext | None = None,
+) -> dict[str, Any]:
+    effective_heuristic_level = _heuristic_level(heuristic_level)
     used_names: set[str] = set()
     summary: dict[str, Any] = {
         "csv_files": [],
         "json_files": [],
         "sqlite_files": [],
         "document_files": [],
+        "document_materialized_tables": [],
         "registered_sources": [],
+        "heuristic_level": effective_heuristic_level,
     }
 
+    retrieved_description = _retrieved_document_description(retrieved_context)
+    if retrieved_description is not None:
+        domain.add_description(retrieved_description)
+        summary["document_files"].append("retrieved_document_snippets")
+
     knowledge_path = context_dir / "knowledge.md"
-    if knowledge_path.exists():
+    if retrieved_context is None and knowledge_path.exists():
         domain.add_description(_description_from_file(knowledge_path, context_dir))
         summary["document_files"].append(_relative_posix(knowledge_path, context_dir))
 
     doc_dir = context_dir / "doc"
-    if doc_dir.is_dir():
+    if retrieved_context is None and doc_dir.is_dir():
         for path in sorted(item for item in doc_dir.rglob("*") if item.is_file()):
             domain.add_description(_description_from_file(path, context_dir))
             summary["document_files"].append(_relative_posix(path, context_dir))
 
-    csv_dir = context_dir / "csv"
-    if csv_dir.is_dir():
-        for path in sorted(csv_dir.glob("*.csv")):
-            name = _safe_source_name(f"csv_{path.stem}", used_names)
-            frame = pd.read_csv(path, low_memory=False)
-            domain.add_df(frame, name=name, description=f"CSV file {_relative_posix(path, context_dir)}")
-            summary["csv_files"].append(_relative_posix(path, context_dir))
-            summary["registered_sources"].append({"name": name, "kind": "csv", "rows": len(frame)})
+    for path in _context_file_paths(context_dir, "csv", {".csv"}):
+        relative_path = _relative_posix(path, context_dir)
+        name = _safe_source_name(f"csv_{path.stem}", used_names)
+        frame = pd.read_csv(path, low_memory=False)
+        domain.add_df(frame, name=name, description=f"CSV file {relative_path}")
+        summary["csv_files"].append(relative_path)
+        summary["registered_sources"].append({"name": name, "kind": "csv", "rows": len(frame)})
 
-    json_dir = context_dir / "json"
-    if json_dir.is_dir():
-        for path in sorted(json_dir.glob("*.json")):
-            frames = _json_dataframes(path)
-            if frames:
-                for hint, frame in frames:
-                    name = _safe_source_name(f"json_{hint}", used_names)
-                    domain.add_df(
-                        frame,
-                        name=name,
-                        description=f"JSON file {_relative_posix(path, context_dir)}",
-                    )
-                    summary["registered_sources"].append(
-                        {"name": name, "kind": "json", "rows": len(frame)}
-                    )
-            else:
+    for path in _context_file_paths(context_dir, "json", {".json"}):
+        frames = _json_dataframes(path)
+        if frames:
+            for hint, frame in frames:
+                relative_path = _relative_posix(path, context_dir)
+                name = _safe_source_name(f"json_{hint}", used_names)
+                domain.add_df(
+                    frame,
+                    name=name,
+                    description=f"JSON file {relative_path}",
+                )
+                summary["registered_sources"].append({"name": name, "kind": "json", "rows": len(frame)})
+        else:
+            if retrieved_context is None:
                 domain.add_description(_description_from_file(path, context_dir))
-            summary["json_files"].append(_relative_posix(path, context_dir))
+        summary["json_files"].append(_relative_posix(path, context_dir))
 
-    db_dir = context_dir / "db"
-    if db_dir.is_dir():
-        db_paths = sorted(
-            path for path in db_dir.iterdir() if path.is_file() and path.suffix.lower() in {".db", ".sqlite"}
+    for table in generic_document_tables(context_dir, heuristic_level=effective_heuristic_level):
+        name = _safe_source_name(f"doc_{table.name}", used_names)
+        domain.add_df(
+            table.frame,
+            name=name,
+            description=f"Materialized document table {table.path}",
         )
-        for path in db_paths:
-            if not _sqlite_has_tables(path):
-                continue
-            name = _safe_source_name(f"db_{path.stem}", used_names)
-            engine = create_engine(f"sqlite:///{path.as_posix()}")
-            try:
-                domain.add_db(engine, name=name, description=f"SQLite file {_relative_posix(path, context_dir)}")
-            finally:
-                engine.dispose()
-            summary["sqlite_files"].append(_relative_posix(path, context_dir))
-            summary["registered_sources"].append({"name": name, "kind": "sqlite"})
+        metadata = table.metadata or {}
+        summary["document_materialized_tables"].append(
+            {
+                "name": table.name,
+                "path": table.path,
+                "rows": len(table.frame),
+                "columns": [str(column) for column in table.frame.columns],
+                "strategy_name": metadata.get("strategy_name", "generic_document_tables"),
+                "strategy_kind": metadata.get("strategy_kind", "generic"),
+                "enabled_by": metadata.get("enabled_by", effective_heuristic_level),
+                "confidence": metadata.get("confidence"),
+                "extracted_columns": metadata.get(
+                    "extracted_columns",
+                    [str(column) for column in table.frame.columns],
+                ),
+            }
+        )
+        summary["registered_sources"].append({"name": name, "kind": "document_table", "rows": len(table.frame)})
+
+    for path in _context_file_paths(context_dir, "db", {".db", ".sqlite"}):
+        if not _sqlite_has_tables(path):
+            continue
+        relative_path = _relative_posix(path, context_dir)
+        name = _safe_source_name(f"db_{path.stem}", used_names)
+        engine = create_engine(f"sqlite:///{path.as_posix()}")
+        try:
+            domain.add_db(engine, name=name, description=f"SQLite file {_relative_posix(path, context_dir)}")
+        finally:
+            engine.dispose()
+        summary["sqlite_files"].append(_relative_posix(path, context_dir))
+        summary["registered_sources"].append({"name": name, "kind": "sqlite"})
 
     return summary
 
 
-def load_context_tables(context_dir: Path) -> list[ContextTable]:
+def load_context_tables(context_dir: Path, *, heuristic_level: str | None = None) -> list[ContextTable]:
+    effective_heuristic_level = _heuristic_level(heuristic_level)
     tables: list[ContextTable] = []
 
-    csv_dir = context_dir / "csv"
-    if csv_dir.is_dir():
-        for path in sorted(csv_dir.glob("*.csv")):
+    for path in _context_file_paths(context_dir, "csv", {".csv"}):
+        tables.append(
+            ContextTable(
+                name=path.stem,
+                path=_relative_posix(path, context_dir),
+                frame=pd.read_csv(path, low_memory=False),
+            )
+        )
+
+    for path in _context_file_paths(context_dir, "json", {".json"}):
+        for hint, frame in _json_dataframes(path):
             tables.append(
                 ContextTable(
-                    name=path.stem,
+                    name=hint,
                     path=_relative_posix(path, context_dir),
-                    frame=pd.read_csv(path, low_memory=False),
+                    frame=frame,
                 )
             )
 
-    json_dir = context_dir / "json"
-    if json_dir.is_dir():
-        for path in sorted(json_dir.glob("*.json")):
-            for hint, frame in _json_dataframes(path):
+    tables.extend(generic_document_tables(context_dir, heuristic_level=effective_heuristic_level))
+
+    for path in _context_file_paths(context_dir, "db", {".db", ".sqlite"}):
+        if not _sqlite_has_tables(path):
+            continue
+        conn = sqlite3.connect(path)
+        try:
+            table_names = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            for table_name in table_names:
+                frame = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
                 tables.append(
                     ContextTable(
-                        name=hint,
-                        path=_relative_posix(path, context_dir),
+                        name=table_name,
+                        path=f"{_relative_posix(path, context_dir)}::{table_name}",
                         frame=frame,
                     )
                 )
-
-    db_dir = context_dir / "db"
-    if db_dir.is_dir():
-        for path in sorted(
-            item
-            for item in db_dir.iterdir()
-            if item.is_file() and item.suffix.lower() in {".db", ".sqlite"}
-        ):
-            if not _sqlite_has_tables(path):
-                continue
-            conn = sqlite3.connect(path)
-            try:
-                table_names = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-                    ).fetchall()
-                ]
-                for table_name in table_names:
-                    frame = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
-                    tables.append(
-                        ContextTable(
-                            name=table_name,
-                            path=f"{_relative_posix(path, context_dir)}::{table_name}",
-                            frame=frame,
-                        )
-                    )
-            finally:
-                conn.close()
+        finally:
+            conn.close()
 
     return tables
 
@@ -907,6 +1519,11 @@ def _display_series(table: ContextTable) -> tuple[str, pd.Series] | None:
         if lowered in lowered_to_original:
             original = lowered_to_original[lowered]
             return str(original), frame[original]
+
+    for column in frame.columns:
+        lowered = str(column).lower()
+        if lowered.endswith("_name") or lowered.endswith(" name"):
+            return str(column), frame[column]
 
     return None
 
@@ -1091,19 +1708,18 @@ def _numeric_metric_columns(frame: pd.DataFrame, question: str) -> list[str]:
 def _context_attribute_columns(table: ContextTable, id_column: str, display_name: str) -> list[str]:
     priority = (
         display_name,
-        "event_name",
+        "display_name",
         "name",
         "title",
+        "label",
         "type",
         "status",
-        "event_status",
-        "event_date",
         "date",
         "category",
         "amount",
-        "spent",
-        "remaining",
         "cost",
+        "total",
+        "value",
     )
     lowered_to_original = {str(column).lower(): str(column) for column in table.frame.columns}
     selected: list[str] = []
@@ -1355,6 +1971,11 @@ def _preferred_superlative_answer_column(frame: pd.DataFrame) -> str | None:
         if column is not None:
             return column
 
+    for column in frame.columns:
+        lowered = str(column).lower()
+        if lowered.endswith("_name") or lowered.endswith(" name"):
+            return str(column)
+
     identifier_columns = _identifier_columns(frame)
     if identifier_columns:
         return identifier_columns[0]
@@ -1368,11 +1989,13 @@ def _preferred_superlative_answer_column(frame: pd.DataFrame) -> str | None:
 
 
 def _question_entity_name(question: str) -> str | None:
-    lowered = question.lower()
-    for entity in ("event", "member", "patient"):
-        if re.search(rf"\b{entity}s?\b", lowered):
-            return entity
-    return None
+    entity = _infer_generic_target_entity(question.lower())
+    if entity is None:
+        return None
+    token = re.sub(r"[^a-z0-9_]+", "_", entity).strip("_")
+    if not token:
+        return None
+    return token[:-1] if token.endswith("s") and len(token) > 1 else token
 
 
 def _table_entity_candidates(table: ContextTable) -> list[str]:
@@ -1484,7 +2107,6 @@ def _metric_entity_frame(
 
 def _context_metric_score(table: ContextTable, metric_column: str, question: str) -> int:
     lowered_question = question.lower()
-    table_name = table.name.lower()
     column_name = metric_column.lower()
     aliases = _preferred_metric_aliases(question)
     score = 0
@@ -1497,10 +2119,6 @@ def _context_metric_score(table: ContextTable, metric_column: str, question: str
     if "cost" in lowered_question:
         if column_name == "cost":
             score += 80
-        if "expense" in table_name:
-            score += 40
-        if "budget" in table_name and column_name in {"amount", "remaining", "spent"}:
-            score -= 30
     return score
 
 
@@ -1631,73 +2249,55 @@ def _find_existing_columns(frame: pd.DataFrame, candidates: tuple[str, ...]) -> 
 
 
 def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, ...]:
-    lowered = question.lower()
     if len(frame.columns) <= 1:
         return ()
 
-    if "telephone" in lowered or "phone" in lowered:
-        matches = _find_existing_columns(frame, ("Phone", "telephone", "phone"))
-        if matches:
-            return tuple(matches[:1])
-
-    if "post id" in lowered or "postid" in lowered or "post id" in lowered.replace("-", " "):
-        matches = _find_existing_columns(frame, ("PostId", "Id", "post_id"))
-        if matches:
-            return tuple(matches[:1])
-
-    if "comment" in lowered and "highest score" in lowered:
-        matches = _find_existing_columns(frame, ("Text", "comment", "Body"))
-        if matches:
-            return tuple(matches[:1])
-
-    if "total views" in lowered and ("name the user" in lowered or "user who" in lowered):
-        matches = _find_existing_columns(
-            frame,
-            ("ViewCount", "DisplayName", "LastEditorDisplayName", "OwnerDisplayName"),
-        )
-        if len(matches) >= 2:
-            return tuple(matches[:2])
-
-    if "date" in lowered:
-        matches = _find_existing_columns(
-            frame,
-            (
-                "date_received",
-                "received_date",
-                "payment_date",
-                "paid_date",
-                "date",
-            ),
-        )
-        if matches:
-            return tuple(matches[:1])
-
-    if (
-        "withdrawal" in lowered
-        or "withdrawals" in lowered
-        or "cash transaction" in lowered
-        or "cash transactions" in lowered
-    ):
-        matches = _find_existing_columns(frame, ("trans_id", "transaction_id", "id"))
-        if matches:
-            return tuple(matches[:1])
-
-    if "finish time" in lowered or ("time" in lowered and "grand prix" in lowered):
-        matches = _find_existing_columns(frame, ("time", "finish_time"))
-        if matches:
-            return tuple(matches[:1])
-
-    if "which race" in lowered or "what race" in lowered:
-        matches = _find_existing_columns(frame, ("name", "race_name"))
-        if matches:
-            return tuple(matches[:1])
-
-    if "q3" in lowered and "number" in lowered:
-        matches = _find_existing_columns(frame, ("number", "driver_number"))
-        if matches:
-            return tuple(matches[:1])
-
-    return ()
+    lowered_question = question.lower()
+    tokens = _normalized_question_tokens(question)
+    compact_question = re.sub(r"[^a-z0-9]+", "", lowered_question)
+    generic_answer_terms = {
+        "id",
+        "identifier",
+        "code",
+        "reference",
+        "name",
+        "title",
+        "label",
+        "description",
+        "status",
+        "type",
+        "category",
+        "date",
+        "year",
+        "time",
+        "amount",
+        "cost",
+        "price",
+        "score",
+        "value",
+        "total",
+        "count",
+        "phone",
+        "telephone",
+        "url",
+        "text",
+    }
+    scored: list[tuple[int, str]] = []
+    for index, column in enumerate(frame.columns):
+        column_name = str(column)
+        aliases = _column_question_aliases(column_name)
+        score = 0
+        if column_name.lower() in lowered_question:
+            score += 50
+        score += 10 * len(aliases & tokens)
+        if any(alias in compact_question for alias in aliases if len(alias) > 3):
+            score += 20
+        if aliases & generic_answer_terms & tokens:
+            score += 15
+        if score > 0:
+            scored.append((score * 1000 - index, column_name))
+    scored.sort(reverse=True)
+    return tuple(dict.fromkeys(column for _, column in scored[:3]))
 
 
 def apply_question_column_pruner(
@@ -1748,6 +2348,26 @@ def _best_numeric_column(columns: list[str], preferred_terms: tuple[str, ...]) -
     return columns[0] if columns else None
 
 
+def _question_matched_numeric_column(columns: list[str], question: str, *, exclude: str | None = None) -> str | None:
+    lowered_question = question.lower()
+    tokens = _normalized_question_tokens(question)
+    scored: list[tuple[int, str]] = []
+    for index, column in enumerate(columns):
+        if column == exclude:
+            continue
+        aliases = _column_question_aliases(column)
+        score = 0
+        if column.lower() in lowered_question:
+            score += 50
+        score += 10 * len(aliases & tokens)
+        if score > 0:
+            scored.append((score * 1000 - index, column))
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
+    return next((column for column in columns if column != exclude), None)
+
+
 def apply_aggregate_ratio_verifier(
     task: PublicTask,
     frame: pd.DataFrame,
@@ -1762,11 +2382,7 @@ def apply_aggregate_ratio_verifier(
 
     if "percentage" in question or "percent" in question:
         denominator = _best_numeric_column(numeric_columns, ("total", "all", "count"))
-        numerator_candidates = [column for column in numeric_columns if column != denominator]
-        numerator = _best_numeric_column(
-            numerator_candidates,
-            ("germany", "blue", "match", "inside", "translated", "count"),
-        )
+        numerator = _question_matched_numeric_column(numeric_columns, question, exclude=denominator)
         if numerator is None or denominator is None:
             return frame, []
         denominator_value = pd.to_numeric(frame[denominator], errors="coerce").iloc[0]
@@ -1785,9 +2401,9 @@ def apply_aggregate_ratio_verifier(
         ]
 
     if "compared to" in question or "how many times" in question or "ratio" in question:
-        numerator = _best_numeric_column(numeric_columns, ("post", "answer", "count"))
+        numerator = _question_matched_numeric_column(numeric_columns, question)
         denominator_candidates = [column for column in numeric_columns if column != numerator]
-        denominator = _best_numeric_column(denominator_candidates, ("vote", "total", "count"))
+        denominator = _best_numeric_column(denominator_candidates, ("total", "all", "count"))
         if numerator is None or denominator is None:
             return frame, []
         denominator_value = pd.to_numeric(frame[denominator], errors="coerce").iloc[0]
@@ -1818,21 +2434,8 @@ def postprocess_answer_table(
     current_frame.attrs["context_dir"] = task.context_dir
     transformations: list[dict[str, Any]] = []
 
-    context_frame, context_transforms = apply_context_superlative_verifier(task)
-    if context_frame is not None:
-        current_frame = context_frame
-        current_frame.attrs["context_dir"] = task.context_dir
-        transformations.extend(context_transforms)
-
-    current_frame, superlative_transforms = apply_superlative_verifier(task, current_frame)
-    current_frame.attrs["context_dir"] = task.context_dir
-    transformations.extend(superlative_transforms)
-
     current_frame, resolver_transforms = resolve_identifier_columns(task, current_frame)
     transformations.extend(resolver_transforms)
-
-    current_frame, aggregate_ratio_transforms = apply_aggregate_ratio_verifier(task, current_frame)
-    transformations.extend(aggregate_ratio_transforms)
 
     current_frame, question_column_transforms = apply_answer_column_verifier(task, current_frame)
     transformations.extend(question_column_transforms)
@@ -1846,6 +2449,27 @@ def postprocess_answer_table(
         output_row_count=len(current_frame),
         output_column_count=len(current_frame.columns),
     )
+
+
+def generate_verifier_candidate_frames(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> list[tuple[pd.DataFrame, list[dict[str, Any]], float]]:
+    candidates: list[tuple[pd.DataFrame, list[dict[str, Any]], float]] = []
+
+    context_frame, context_transforms = apply_context_superlative_verifier(task)
+    if context_frame is not None and context_transforms:
+        candidates.append((context_frame, context_transforms, 0.42))
+
+    superlative_frame, superlative_transforms = apply_superlative_verifier(task, frame)
+    if superlative_transforms and not superlative_frame.equals(frame):
+        candidates.append((superlative_frame, superlative_transforms, 0.48))
+
+    aggregate_frame, aggregate_transforms = apply_aggregate_ratio_verifier(task, frame)
+    if aggregate_transforms and not aggregate_frame.equals(frame):
+        candidates.append((aggregate_frame, aggregate_transforms, 0.46))
+
+    return candidates
 
 
 def _table_lookup(context_tables: list[ContextTable]) -> dict[str, ContextTable]:
@@ -2327,8 +2951,30 @@ def _context_document_text(context_dir: Path) -> str:
     return text
 
 
-def _planner_schema_payload(task: PublicTask) -> dict[str, Any]:
-    context_tables = load_context_tables(task.context_dir)
+def _filter_context_tables_by_retrieval(
+    context_tables: list[ContextTable],
+    retrieved_context: RetrievedContext | None,
+) -> list[ContextTable]:
+    if retrieved_context is None:
+        return context_tables
+    relevant = {value.lower() for value in retrieved_context.relevant_tables}
+    filtered = [
+        table
+        for table in context_tables
+        if table.name.lower() in relevant or table.path.lower() in relevant
+    ]
+    return filtered or context_tables[: min(5, len(context_tables))]
+
+
+def _planner_schema_payload(
+    task: PublicTask,
+    *,
+    retrieved_context: RetrievedContext | None = None,
+) -> dict[str, Any]:
+    context_tables = _filter_context_tables_by_retrieval(
+        load_context_tables(task.context_dir),
+        retrieved_context,
+    )
     tables = []
     for table in context_tables:
         frame = table.frame
@@ -2355,7 +3001,12 @@ def _planner_schema_payload(task: PublicTask) -> dict[str, Any]:
         "question": task.question,
         "tables": tables,
         "schema_graph": build_schema_graph(context_tables),
-        "documents": _context_document_text(task.context_dir),
+        "retrieved_context": retrieved_context.to_dict() if retrieved_context else None,
+        "documents": (
+            "\n\n".join(snippet["text"] for snippet in retrieved_context.document_snippets)
+            if retrieved_context is not None and retrieved_context.document_snippets
+            else _context_document_text(task.context_dir)[:MAX_DESCRIPTION_CHARS]
+        ),
     }
 
 
@@ -2438,80 +3089,13 @@ def _find_table_with_columns(
     return None
 
 
-def _extract_severe_value_from_documents(text: str, field_name: str) -> int | None:
-    escaped_field = re.escape(field_name)
-    patterns = [
-        rf"{escaped_field}[^\n.]*?['\"]?(\d+)['\"]?\s+(?:indicating|indicates|denoting|denotes|meaning|means)[^\n.]*?\bsevere\b",
-        rf"{escaped_field}\s*=\s*(\d+)[^\n.]*?\bsevere\b",
-        rf"\bsevere\s+cases\b[^\n.]*?{escaped_field}[^\n.]*?['\"]?(\d+)['\"]?",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def _heuristic_structured_plan(task: PublicTask) -> dict[str, Any] | None:
-    question = task.question.lower()
-    if "thrombosis" not in question or "severe" not in question:
-        return None
-
-    context_tables = load_context_tables(task.context_dir)
-    exam_table = _find_table_with_columns(
-        context_tables,
-        ("ID", "Thrombosis"),
-        preferred_name="Examination",
-    )
-    patient_table = _find_table_with_columns(
-        context_tables,
-        ("ID", "SEX", "Diagnosis"),
-        preferred_name="Patient",
-    )
-    if exam_table is None or patient_table is None:
-        return None
-
-    document_text = _context_document_text(task.context_dir)
-    severe_value = _extract_severe_value_from_documents(document_text, "Thrombosis")
-    if severe_value is None:
-        severe_value = 2
-
-    return {
-        "steps": [
-            {"op": "source", "table": exam_table.name, "alias": "exam"},
-            {
-                "op": "filter",
-                "source": "exam",
-                "alias": "severe_exam",
-                "conditions": [{"column": "Thrombosis", "op": "==", "value": severe_value}],
-            },
-            {
-                "op": "join",
-                "left": "severe_exam",
-                "right_table": patient_table.name,
-                "left_on": "ID",
-                "right_on": "ID",
-                "how": "inner",
-                "alias": "joined",
-            },
-            {
-                "op": "select",
-                "source": "joined",
-                "alias": "answer",
-                "columns": ["ID", "SEX", {"column": "Diagnosis", "as": "Diagnosis"}],
-            },
-            {"op": "distinct", "source": "answer", "alias": "final"},
-        ],
-        "output": "final",
-    }
-
-
 def build_task_context(
     task: PublicTask,
     *,
     context_summary: dict[str, Any] | None = None,
+    heuristic_level: str | None = None,
 ) -> TaskContext:
-    context_tables = load_context_tables(task.context_dir)
+    context_tables = load_context_tables(task.context_dir, heuristic_level=heuristic_level)
     return TaskContext(
         task=task,
         context_tables=context_tables,
@@ -2521,23 +3105,392 @@ def build_task_context(
     )
 
 
+def _normalized_question_tokens(question: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", question.lower()) if len(token) > 1}
+
+
+def _column_question_aliases(column_name: str) -> set[str]:
+    split_name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column_name)
+    lowered = split_name.lower()
+    parts = {part for part in re.split(r"[^a-z0-9]+", lowered) if part}
+    aliases = {lowered, re.sub(r"[^a-z0-9]+", "", lowered), *parts}
+    if lowered.endswith("_id") or lowered.endswith(" id"):
+        aliases.update({"id", "identifier", "reference", "code"})
+    if "date" in parts or lowered.endswith("date"):
+        aliases.add("date")
+    if "time" in parts or lowered.endswith("time"):
+        aliases.add("time")
+    if "name" in parts or lowered.endswith("name"):
+        aliases.add("name")
+    return {alias for alias in aliases if alias}
+
+
+def _question_referenced_columns(question: str, context_tables: list[ContextTable]) -> tuple[str, ...]:
+    tokens = _normalized_question_tokens(question)
+    compact_question = re.sub(r"[^a-z0-9]+", "", question.lower())
+    matches: list[str] = []
+    for table in context_tables:
+        for column in table.frame.columns:
+            column_name = str(column)
+            aliases = _column_question_aliases(column_name)
+            if column_name.lower() in question or aliases & tokens or any(alias in compact_question for alias in aliases if len(alias) > 3):
+                matches.append(column_name)
+    return tuple(dict.fromkeys(matches))
+
+
+def _infer_generic_target_entity(question: str) -> str | None:
+    match = re.search(r"\b(?:which|what|list|show|return)\s+([a-z][a-z0-9_ -]{1,40}?)(?:\s+(?:with|where|whose|that|when|for|from|has|have)\b|\?|$)", question)
+    if not match:
+        return None
+    entity = re.sub(r"\s+", " ", match.group(1).strip().lower())
+    return entity or None
+
+
+def _question_looks_single_answer(question: str) -> bool:
+    return bool(
+        re.search(r"\b(?:what|which|who|when|where)\b", question)
+        and not re.search(r"\b(?:list|all|each|every|rows|records)\b", question)
+    )
+
+
+def _display_like_columns(frame: pd.DataFrame) -> list[str]:
+    columns: list[str] = []
+    for column in frame.columns:
+        lowered = str(column).lower()
+        aliases = _column_question_aliases(str(column))
+        if (
+            lowered in DISPLAY_COLUMN_PRIORITY
+            or lowered.endswith("_name")
+            or aliases & {"name", "title", "label", "description", "status", "category"}
+        ):
+            columns.append(str(column))
+    return columns
+
+
+def _metric_like_columns(frame: pd.DataFrame) -> list[str]:
+    columns: list[str] = []
+    for column in frame.columns:
+        lowered = str(column).lower()
+        if lowered == "id" or lowered.endswith("_id") or lowered.startswith("link_to_"):
+            continue
+        if pd.to_numeric(frame[column], errors="coerce").notna().any():
+            columns.append(str(column))
+    return columns
+
+
+def _retrieval_column_score(question: str, column_name: str) -> int:
+    tokens = _normalized_question_tokens(question)
+    compact_question = re.sub(r"[^a-z0-9]+", "", question.lower())
+    aliases = _column_question_aliases(column_name)
+    score = 0
+    if column_name.lower() in question.lower():
+        score += 60
+    score += 12 * len(aliases & tokens)
+    if any(alias in compact_question for alias in aliases if len(alias) > 3):
+        score += 20
+    if column_name.lower().endswith("_id") or column_name.lower().startswith("link_to_"):
+        score += 5
+    return score
+
+
+def query_context_retriever(task_context: TaskContext, question: str) -> RetrievedContext:
+    scored_tables: list[tuple[int, ContextTable, list[str], list[str]]] = []
+    diagnostics: dict[str, Any] = {"table_scores": []}
+    for table in task_context.context_tables:
+        matched_columns: list[str] = []
+        table_score = 0
+        table_name_score = _retrieval_column_score(question, table.name)
+        table_score += table_name_score
+        for column in table.frame.columns:
+            column_score = _retrieval_column_score(question, str(column))
+            if column_score > 0:
+                matched_columns.append(str(column))
+                table_score += column_score
+        display_columns = _display_like_columns(table.frame)
+        metric_columns = _metric_like_columns(table.frame)
+        table_score += 3 * len(display_columns[:2])
+        table_score += 2 * len(metric_columns[:2])
+        if table_score > 0:
+            scored_tables.append((table_score, table, matched_columns, display_columns + metric_columns))
+        diagnostics["table_scores"].append(
+            {
+                "table": table.name,
+                "path": table.path,
+                "score": table_score,
+                "matched_columns": matched_columns,
+            }
+        )
+
+    if not scored_tables:
+        fallback_tables = sorted(task_context.context_tables, key=lambda item: len(item.frame))[:5]
+        scored_tables = [
+            (0, table, [], _display_like_columns(table.frame) + _metric_like_columns(table.frame))
+            for table in fallback_tables
+        ]
+        diagnostics["fallback_reason"] = "No table/column lexical match; selected small schema slice."
+
+    scored_tables.sort(key=lambda item: (-item[0], item[1].name))
+    selected = scored_tables[:8]
+    relevant_tables: list[str] = []
+    relevant_columns: dict[str, tuple[str, ...]] = {}
+    sample_rows: dict[str, list[dict[str, Any]]] = {}
+    selected_names = {table.name for _, table, _, _ in selected}
+    for _, table, matched_columns, supporting_columns in selected:
+        relevant_tables.append(table.name)
+        relevant_tables.append(table.path)
+        columns = list(dict.fromkeys([*matched_columns, *supporting_columns, *_identifier_columns(table.frame)]))
+        if not columns:
+            columns = [str(column) for column in table.frame.columns[: min(5, len(table.frame.columns))]]
+        relevant_columns[table.name] = tuple(columns[:12])
+        sample_frame = table.frame.loc[:, [column for column in columns if column in table.frame.columns]].head(
+            MAX_PLANNER_SAMPLE_ROWS
+        )
+        sample_rows[table.name] = [
+            {str(column): _json_safe_cell(value) for column, value in row.items()}
+            for row in sample_frame.to_dict(orient="records")
+        ]
+
+    join_paths = [
+        join
+        for join in task_context.schema_graph.get("join_candidates", [])
+        if join.get("left_table") in selected_names or join.get("right_table") in selected_names
+    ][:12]
+
+    document_snippets: list[dict[str, Any]] = []
+    question_tokens = _normalized_question_tokens(question)
+    for table in document_records_for_reasoning(task_context.task.context_dir):
+        for _, row in table.frame.iterrows():
+            text = " ".join(
+                _text_value(row.get(column))
+                for column in ("name", "title", "description", "status", "type", "category", "evidence_span")
+                if column in table.frame.columns
+            )
+            overlap = question_tokens & _normalized_question_tokens(text)
+            if overlap:
+                document_snippets.append(
+                    {
+                        "source_doc": row.get("source_doc"),
+                        "paragraph_index": _json_safe_cell(row.get("paragraph_index")),
+                        "matched_terms": sorted(overlap),
+                        "text": _text_value(row.get("evidence_span"))[:1000],
+                    }
+                )
+    document_snippets = document_snippets[:6]
+    diagnostics["selected_table_count"] = len(selected)
+    diagnostics["document_snippet_count"] = len(document_snippets)
+    return RetrievedContext(
+        relevant_tables=tuple(dict.fromkeys(relevant_tables)),
+        relevant_columns=relevant_columns,
+        sample_rows=sample_rows,
+        candidate_join_paths=tuple(join_paths),
+        document_snippets=tuple(document_snippets),
+        retrieval_diagnostics=diagnostics,
+    )
+
+
+def _question_mentions_filter_or_condition(question: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:where|with|whose|having|under|over|above|below|less than|greater than|between|before|after|equals?)\b",
+            question.lower(),
+        )
+    )
+
+
+def _question_mentions_multiple_attributes(question: str) -> bool:
+    lowered = question.lower()
+    return bool(
+        re.search(r"\b(?:and|along with|including|with their|with its)\b", lowered)
+        and re.search(r"\b(?:return|list|show|provide|give)\b", lowered)
+    )
+
+
+def _retrieval_confidence(retrieved_context: RetrievedContext | None) -> float:
+    if retrieved_context is None:
+        return 0.0
+    table_scores = retrieved_context.retrieval_diagnostics.get("table_scores", [])
+    scores = [
+        float(item.get("score", 0) or 0)
+        for item in table_scores
+        if isinstance(item, Mapping)
+    ]
+    if not scores:
+        return 0.0
+    return min(max(scores) / 100.0, 1.0)
+
+
+def _candidate_shape_mismatch(contract: AnswerContract, candidate: Candidate | None) -> bool | None:
+    if candidate is None:
+        return None
+    row_count = len(candidate.frame)
+    column_count = len(candidate.frame.columns)
+    return bool(
+        (contract.max_rows is not None and row_count > contract.max_rows)
+        or (contract.max_columns is not None and column_count > contract.max_columns)
+    )
+
+
+def build_complexity_profile(
+    task_context: TaskContext,
+    retrieved_context: RetrievedContext | None,
+    best_candidate: Candidate | None = None,
+) -> TaskComplexityProfile:
+    tables = task_context.context_tables
+    source_kinds = [_source_kind_from_context_path(table.path) for table in tables]
+    db_table_count = sum(1 for kind in source_kinds if kind == "sqlite")
+    csv_table_count = sum(1 for kind in source_kinds if kind == "csv")
+    json_table_count = sum(1 for kind in source_kinds if kind == "json")
+    document_tables = [table for table in tables if _source_kind_from_context_path(table.path) == "document_table"]
+    doc_dir = task_context.task.context_dir / "doc"
+    document_file_count = len(list(doc_dir.rglob("*.md"))) if doc_dir.is_dir() else 0
+    if (task_context.task.context_dir / "knowledge.md").exists():
+        document_file_count += 1
+    document_text_chars = len(task_context.document_text)
+    total_columns = sum(len(table.frame.columns) for table in tables)
+    total_rows_sampled = sum(min(len(table.frame), MAX_PLANNER_SAMPLE_ROWS) for table in tables)
+    question = task_context.task.question
+    question_tokens = _normalized_question_tokens(question)
+    has_unstructured_docs = document_file_count > 0 or bool(document_tables)
+    has_sqlite_db = db_table_count > 0
+    has_multiple_sources = len({kind for kind in source_kinds if kind != "unknown"}) > 1
+    has_many_tables = len(tables) >= 4
+    has_join_candidates = bool(task_context.schema_graph.get("join_candidates"))
+    question_mentions_aggregation = bool(re.search(r"\b(?:count|sum|total|average|avg|mean|how many)\b", question.lower()))
+    question_mentions_ratio_or_percentage = bool(re.search(r"\b(?:ratio|percentage|percent|proportion)\b", question.lower()))
+    question_mentions_superlative = _superlative_direction(question) is not None
+    question_mentions_filter = _question_mentions_filter_or_condition(question)
+    question_mentions_multi = _question_mentions_multiple_attributes(question)
+    estimated_context_size = document_text_chars + total_columns * 40 + total_rows_sampled * 200
+    retrieval_confidence = _retrieval_confidence(retrieved_context)
+
+    best_report = best_candidate.contract_report if best_candidate is not None else None
+    best_contract_valid = (
+        bool(best_report.get("valid"))
+        if isinstance(best_report, Mapping)
+        else None
+    )
+    best_empty = len(best_candidate.frame) == 0 if best_candidate is not None else None
+    best_metadata = bool(_metadata_debug_columns(best_candidate.frame)) if best_candidate is not None else None
+    contract = infer_answer_contract(task_context, infer_task_intent(task_context))
+    best_shape_mismatch = _candidate_shape_mismatch(contract, best_candidate)
+    best_score = int(best_candidate.confidence * 10) if best_candidate is not None else None
+
+    complexity_score = 0
+    if has_unstructured_docs:
+        complexity_score += 20
+    if document_text_chars > 20000:
+        complexity_score += 15
+    if has_multiple_sources:
+        complexity_score += 15
+    if has_join_candidates:
+        complexity_score += 15
+    if has_sqlite_db:
+        complexity_score += 10
+    if len(tables) >= 4:
+        complexity_score += 10
+    if question_mentions_aggregation:
+        complexity_score += 10
+    if question_mentions_ratio_or_percentage:
+        complexity_score += 10
+    if question_mentions_superlative:
+        complexity_score += 10
+    if question_mentions_filter:
+        complexity_score += 10
+    if question_mentions_multi:
+        complexity_score += 10
+    if retrieval_confidence < 0.25 and estimated_context_size > 20000:
+        complexity_score += 10
+
+    uncertainty_score = 0
+    if best_candidate is None:
+        uncertainty_score += 30
+    elif best_empty is True and not contract.allow_empty:
+        uncertainty_score += 25
+    if best_contract_valid is False:
+        uncertainty_score += 20
+    if best_shape_mismatch:
+        uncertainty_score += 15
+    if best_metadata:
+        uncertainty_score += 15
+    if best_candidate is not None:
+        if contract.max_columns is not None and len(best_candidate.frame.columns) < min(contract.max_columns, 1):
+            uncertainty_score += 10
+        if best_candidate.confidence < 0.5:
+            uncertainty_score += 10
+
+    planner_payload_size = len(
+        json.dumps(
+            _planner_schema_payload(task_context.task, retrieved_context=retrieved_context),
+            ensure_ascii=False,
+        )
+    )
+
+    return TaskComplexityProfile(
+        source_count=len(set(source_kinds)),
+        table_count=len(tables),
+        db_table_count=db_table_count,
+        csv_table_count=csv_table_count,
+        json_table_count=json_table_count,
+        document_file_count=document_file_count,
+        document_text_chars=document_text_chars,
+        total_columns=total_columns,
+        total_rows_sampled=total_rows_sampled,
+        has_unstructured_docs=has_unstructured_docs,
+        has_sqlite_db=has_sqlite_db,
+        has_multiple_sources=has_multiple_sources,
+        has_many_tables=has_many_tables,
+        has_join_candidates=has_join_candidates,
+        question_token_count=len(question_tokens),
+        question_mentions_aggregation=question_mentions_aggregation,
+        question_mentions_superlative=question_mentions_superlative,
+        question_mentions_ratio_or_percentage=question_mentions_ratio_or_percentage,
+        question_mentions_filter_or_condition=question_mentions_filter,
+        question_mentions_multiple_attributes=question_mentions_multi,
+        estimated_context_size=estimated_context_size,
+        retrieval_confidence=retrieval_confidence,
+        best_candidate_score=best_score,
+        best_candidate_contract_valid=best_contract_valid,
+        best_candidate_empty=best_empty,
+        best_candidate_has_metadata_columns=best_metadata,
+        best_candidate_shape_mismatch=best_shape_mismatch,
+        complexity_score=complexity_score,
+        uncertainty_score=uncertainty_score,
+        planner_payload_within_limit=planner_payload_size <= MAX_FINALIZER_PAYLOAD_CHARS,
+    )
+
+
+def should_run_planner_rescue(
+    profile: TaskComplexityProfile,
+    remaining_seconds: float | None,
+    best_candidate: Candidate | None,
+) -> bool:
+    del best_candidate
+    if remaining_seconds is not None and remaining_seconds <= 90:
+        return False
+    if not profile.planner_payload_within_limit:
+        return False
+    uncertainty_threshold = 30 if profile.best_candidate_score is None else 45
+    if profile.complexity_score < 45 or profile.uncertainty_score < uncertainty_threshold:
+        return False
+    severe_candidate_problem = (
+        profile.best_candidate_contract_valid is False
+        or profile.best_candidate_empty is True
+        or profile.best_candidate_has_metadata_columns is True
+        or profile.best_candidate_shape_mismatch is True
+        or profile.best_candidate_score is None
+        or profile.best_candidate_score < 5
+    )
+    return severe_candidate_problem
+
+
 def infer_task_intent(task_context: TaskContext) -> TaskIntent:
     question = task_context.task.question.lower()
-    table_names = {table.name.lower() for table in task_context.context_tables}
-    column_names = {
-        str(column).lower()
-        for table in task_context.context_tables
-        for column in table.frame.columns
-    }
-
-    domain: str | None = None
-    if {"raceid", "driverid"} <= column_names or {"races", "drivers"} & table_names:
-        domain = "racing"
-    if "superhero" in table_names or {"superhero_name", "weight_kg"} <= column_names:
-        domain = "superhero"
-
     operation: str | None = None
-    if "average" in question or "avg" in question:
+    if "percentage" in question or "percent" in question:
+        operation = "percentage"
+    elif "ratio" in question or "proportion" in question:
+        operation = "ratio"
+    elif "average" in question or "avg" in question or "mean" in question:
         operation = "average"
     elif "how many" in question or "count" in question:
         operation = "count"
@@ -2548,33 +3501,147 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
     else:
         operation = "filter_select"
 
-    target_columns: list[str] = []
-    if "date" in question:
-        target_columns.extend(["date_received", "date"])
-    if "finish time" in question or ("time" in question and "grand prix" in question):
-        target_columns.append("time")
-    if "q3" in question and "number" in question:
-        target_columns.append("number")
-    if "withdrawal" in question or "cash transaction" in question:
-        target_columns.append("trans_id")
-    if "which race" in question or "what race" in question:
-        target_columns.append("name")
-
-    target_entity: str | None = None
-    if "superhero" in question:
-        target_entity = "superhero"
-    elif "race" in question or "grand prix" in question:
-        target_entity = "race"
-    elif "transaction" in question or "withdrawal" in question:
-        target_entity = "transaction"
-
-    answer_kind = "scalar" if operation in {"average", "count", "sum"} else "table"
+    target_columns = _question_referenced_columns(question, task_context.context_tables)
+    target_entity = _infer_generic_target_entity(question)
+    answer_kind = "scalar" if operation in {"average", "count", "sum", "ratio", "percentage"} else "table"
     return TaskIntent(
-        domain=domain,
+        domain=None,
         operation=operation,
         answer_kind=answer_kind,
         target_entity=target_entity,
         target_columns=tuple(dict.fromkeys(target_columns)),
+    )
+
+
+def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> AnswerContract:
+    question = task_context.task.question.lower()
+    if intent.answer_kind == "scalar":
+        return AnswerContract(
+            kind="scalar",
+            expected_columns=("answer",),
+            max_rows=1,
+            max_columns=1,
+            allow_empty=False,
+            reason="Question asks for a scalar metric.",
+        )
+
+    if intent.target_columns:
+        max_columns = max(1, min(len(intent.target_columns), 4))
+        kind = "two_attribute" if len(intent.target_columns) == 2 else "multi_attribute"
+        return AnswerContract(
+            kind=kind if len(intent.target_columns) > 1 else "attribute_lookup",
+            expected_columns=intent.target_columns,
+            max_rows=1 if _question_looks_single_answer(question) else None,
+            max_columns=max_columns,
+            allow_empty=False,
+            reason="Question references answer-shaped context columns.",
+        )
+
+    if _question_looks_list_answer(question):
+        return AnswerContract(
+            kind="entity_list",
+            expected_columns=(),
+            max_rows=None,
+            max_columns=1,
+            allow_empty=False,
+            reason="Question asks for a list of entities.",
+        )
+
+    return AnswerContract(
+        kind="table",
+        expected_columns=(),
+        max_rows=None,
+        max_columns=None,
+        allow_empty=True,
+        reason="No strict answer shape inferred.",
+    )
+
+
+def _candidate_looks_like_source_name(frame: pd.DataFrame) -> bool:
+    if len(frame) != 1 or len(frame.columns) != 1:
+        return False
+    value = _text_value(frame.iloc[0, 0]).lower()
+    return bool(re.fullmatch(r"(csv|json|db|doc)_[a-z0-9_]+", value))
+
+
+def _metadata_debug_columns(frame: pd.DataFrame) -> list[str]:
+    columns: list[str] = []
+    for column in frame.columns:
+        lowered = str(column).lower()
+        if lowered in DEBUG_METADATA_COLUMNS:
+            columns.append(str(column))
+            continue
+        if lowered.startswith("debug_") or lowered.startswith("evidence_"):
+            columns.append(str(column))
+            continue
+        if lowered.endswith("_confidence"):
+            columns.append(str(column))
+    return columns
+
+
+def _frame_has_mostly_metadata_columns(frame: pd.DataFrame) -> bool:
+    if len(frame.columns) == 0:
+        return False
+    return len(_metadata_debug_columns(frame)) / len(frame.columns) >= 0.5
+
+
+def validate_answer_contract(
+    contract: AnswerContract,
+    frame: pd.DataFrame,
+    *,
+    candidate_source: str | None,
+) -> AnswerContractReport:
+    row_count = len(frame)
+    column_count = len(frame.columns)
+    reason = "Candidate satisfies inferred answer contract."
+    valid = True
+    should_repair = False
+
+    if row_count == 0 and not contract.allow_empty:
+        valid = False
+        should_repair = True
+        reason = "Candidate is empty but the answer contract requires a value."
+    elif _metadata_debug_columns(frame):
+        valid = False
+        should_repair = True
+        reason = "Candidate includes metadata/debug columns."
+    elif _frame_has_mostly_metadata_columns(frame):
+        valid = False
+        should_repair = True
+        reason = "Candidate is mostly source/evidence/debug fields."
+    elif _candidate_looks_like_source_name(frame):
+        valid = False
+        should_repair = True
+        reason = "Candidate appears to be a table/source-name singleton rather than an answer."
+    elif contract.max_rows is not None and row_count > contract.max_rows:
+        valid = False
+        should_repair = True
+        reason = f"Candidate has {row_count} rows; expected at most {contract.max_rows}."
+    elif contract.max_columns is not None and column_count > contract.max_columns:
+        valid = False
+        should_repair = True
+        reason = f"Candidate has {column_count} columns; expected at most {contract.max_columns}."
+    elif contract.expected_columns:
+        lowered_columns = {str(column).lower() for column in frame.columns}
+        expected_hits = [
+            expected
+            for expected in contract.expected_columns
+            if any(expected.lower() in column for column in lowered_columns)
+        ]
+        if contract.kind == "attribute_lookup" and not expected_hits:
+            valid = False
+            should_repair = True
+            reason = f"Candidate columns do not match expected answer columns {contract.expected_columns}."
+
+    return AnswerContractReport(
+        valid=valid,
+        should_repair=should_repair,
+        reason=reason,
+        contract_kind=contract.kind,
+        expected_columns=contract.expected_columns,
+        row_count=row_count,
+        column_count=column_count,
+        candidate_source=candidate_source,
     )
 
 
@@ -2584,6 +3651,10 @@ def _candidate_from_frame(
     source: str,
     confidence: float,
     diagnostics: dict[str, Any],
+    transformations: tuple[dict[str, Any], ...] = (),
+    contract_report: dict[str, Any] | None = None,
+    retrieval_context_used: dict[str, Any] | None = None,
+    elapsed_seconds: float | None = None,
 ) -> Candidate | None:
     if not isinstance(frame, pd.DataFrame) or len(frame.columns) == 0:
         return None
@@ -2592,6 +3663,248 @@ def _candidate_from_frame(
         source=source,
         confidence=confidence,
         diagnostics=diagnostics,
+        transformations=transformations,
+        contract_report=contract_report,
+        retrieval_context_used=retrieval_context_used,
+        elapsed_seconds=elapsed_seconds,
+    )
+
+
+def _candidate_with_contract(candidate: Candidate, contract: AnswerContract) -> Candidate:
+    report = validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source)
+    return Candidate(
+        frame=candidate.frame,
+        source=candidate.source,
+        confidence=candidate.confidence,
+        diagnostics=candidate.diagnostics,
+        transformations=candidate.transformations,
+        contract_report=report.to_dict(),
+        retrieval_context_used=candidate.retrieval_context_used,
+        elapsed_seconds=candidate.elapsed_seconds,
+    )
+
+
+def _question_matched_columns(frame: pd.DataFrame, question: str) -> list[str]:
+    return list(_question_target_columns(question, frame))
+
+
+def _select_columns_by_priority(
+    frame: pd.DataFrame,
+    *,
+    question: str,
+    contract: AnswerContract,
+    max_columns: int | None,
+) -> list[str]:
+    existing_columns = [str(column) for column in frame.columns]
+    expected = [
+        column
+        for column in contract.expected_columns
+        if any(column.lower() == existing.lower() for existing in existing_columns)
+    ]
+    selected = [next(existing for existing in existing_columns if existing.lower() == column.lower()) for column in expected]
+    for column in _question_matched_columns(frame, question):
+        if column not in selected:
+            selected.append(column)
+    priority_terms = (
+        "display_name",
+        "name",
+        "title",
+        "label",
+        "value",
+        "amount",
+        "cost",
+        "price",
+        "score",
+        "total",
+        "count",
+        "id",
+    )
+    lowered_to_original = {column.lower(): column for column in existing_columns}
+    for term in priority_terms:
+        column = lowered_to_original.get(term)
+        if column is not None and column not in selected:
+            selected.append(column)
+    for column in existing_columns:
+        if column not in selected:
+            selected.append(column)
+    return selected[:max_columns] if max_columns is not None else selected
+
+
+def _question_looks_list_answer(question: str) -> bool:
+    return bool(re.search(r"\b(?:list|show|return|which|what)\b", question.lower())) and not _question_looks_single_answer(question)
+
+
+def final_answer_shape_guard(
+    *,
+    task: PublicTask,
+    frame: pd.DataFrame,
+    contract: AnswerContract,
+    candidate_source: str | None,
+) -> tuple[pd.DataFrame, FinalAnswerShapeReport]:
+    input_row_count = len(frame)
+    input_column_count = len(frame.columns)
+    current = frame.copy()
+    transformations: list[dict[str, Any]] = []
+    contract_before = validate_answer_contract(
+        contract,
+        current,
+        candidate_source=candidate_source,
+    ).to_dict()
+
+    metadata_columns = _metadata_debug_columns(current)
+    if metadata_columns:
+        current = current.drop(columns=metadata_columns)
+        transformations.append(
+            {
+                "kind": "metadata_column_removal",
+                "removed_columns": metadata_columns,
+            }
+        )
+
+    if len(current.columns) > 0:
+        max_rows = contract.max_rows
+        max_columns = contract.max_columns
+        if contract.kind == "scalar":
+            max_rows = 1
+            max_columns = 1
+        elif _question_looks_list_answer(task.question) and not contract.expected_columns:
+            max_columns = 1
+
+        if max_columns is not None and len(current.columns) > max_columns:
+            selected_columns = _select_columns_by_priority(
+                current,
+                question=task.question,
+                contract=contract,
+                max_columns=max_columns,
+            )
+            current = current.loc[:, selected_columns]
+            transformations.append(
+                {
+                    "kind": "final_answer_shape_guard",
+                    "action": "prune_columns",
+                    "selected_columns": selected_columns,
+                    "max_columns": max_columns,
+                }
+            )
+
+        if max_rows is not None and len(current) > max_rows:
+            current = current.head(max_rows).reset_index(drop=True)
+            transformations.append(
+                {
+                    "kind": "final_answer_shape_guard",
+                    "action": "limit_rows",
+                    "max_rows": max_rows,
+                }
+            )
+
+    contract_after = validate_answer_contract(
+        contract,
+        current,
+        candidate_source=candidate_source,
+    ).to_dict()
+    return current.reset_index(drop=True), FinalAnswerShapeReport(
+        transformations=tuple(transformations),
+        input_row_count=input_row_count,
+        input_column_count=input_column_count,
+        output_row_count=len(current),
+        output_column_count=len(current.columns),
+        contract_before=contract_before,
+        contract_after=contract_after,
+    )
+
+
+def rank_candidates(
+    *,
+    candidates: list[Candidate],
+    contract: AnswerContract,
+    question: str,
+    retrieved_context: RetrievedContext | None,
+) -> tuple[Candidate | None, CandidateRankingReport]:
+    scored: list[tuple[int, Candidate, list[str]]] = []
+    relevant_columns = {
+        column.lower()
+        for columns in (retrieved_context.relevant_columns.values() if retrieved_context else [])
+        for column in columns
+    }
+    for candidate in candidates:
+        if not isinstance(candidate.frame, pd.DataFrame) or len(candidate.frame.columns) == 0:
+            scored.append((-100, candidate, ["invalid dataframe"]))
+            continue
+        report = validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source)
+        reasons: list[str] = []
+        score = int(candidate.confidence * 10)
+        if report.valid:
+            score += 40
+            reasons.append("contract_valid")
+        else:
+            score -= 60
+            reasons.append(f"contract_invalid:{report.reason}")
+        if contract.max_columns is None or len(candidate.frame.columns) <= contract.max_columns:
+            score += 20
+            reasons.append("column_count_ok")
+        else:
+            score -= 40
+            reasons.append("extra_columns")
+        if contract.max_rows is None or len(candidate.frame) <= contract.max_rows:
+            score += 20
+            reasons.append("row_count_ok")
+        else:
+            score -= 30
+            reasons.append("too_many_rows")
+        metadata_columns = _metadata_debug_columns(candidate.frame)
+        if metadata_columns:
+            score -= 50
+            reasons.append("metadata_columns_present")
+        else:
+            score += 20
+            reasons.append("no_metadata_columns")
+        if _question_matched_columns(candidate.frame, question):
+            score += 15
+            reasons.append("question_matched_column")
+        candidate_columns = {str(column).lower() for column in candidate.frame.columns}
+        if candidate_columns & relevant_columns:
+            score += 15
+            reasons.append("uses_retrieved_column")
+        if any(transform.get("kind") == "identifier_resolution" for transform in candidate.transformations):
+            score += 10
+            reasons.append("identifier_resolved")
+        if any("aggregate" in str(transform.get("kind", "")) for transform in candidate.transformations):
+            score += 5
+            reasons.append("aggregation_verified")
+        if any("verification" in str(transform.get("kind", "")) for transform in candidate.transformations):
+            if not report.valid:
+                score -= 20
+                reasons.append("verifier_contract_invalid")
+            if not _question_matched_columns(candidate.frame, question) and not (candidate_columns & relevant_columns):
+                score -= 10
+                reasons.append("verifier_without_explicit_column_evidence")
+        if len(candidate.frame) == 0 and not contract.allow_empty:
+            score -= 100
+            reasons.append("empty_required_answer")
+        scored.append((score, candidate, reasons))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = scored[0][1] if scored else None
+    score_entries = tuple(
+        CandidateScore(
+            source=candidate.source,
+            score=score,
+            selected=(selected is candidate),
+            reasons=tuple(reasons),
+            row_count=len(candidate.frame) if isinstance(candidate.frame, pd.DataFrame) else 0,
+            column_count=len(candidate.frame.columns) if isinstance(candidate.frame, pd.DataFrame) else 0,
+        )
+        for score, candidate, reasons in scored
+    )
+    rejection_reasons = {
+        candidate.source: reasons
+        for _, candidate, reasons in scored
+        if selected is not candidate
+    }
+    return selected, CandidateRankingReport(
+        selected_source=selected.source if selected is not None else None,
+        candidate_scores=score_entries,
+        rejection_reasons=rejection_reasons,
     )
 
 
@@ -2604,6 +3917,8 @@ def _optional_column(frame: pd.DataFrame, column_name: str) -> str | None:
 
 
 def _source_kind_from_context_path(path: str) -> str:
+    if path.startswith("doc/") or path.startswith("doc/*::") or path.endswith("::materialized") or "/doc/" in f"/{path}":
+        return "document_table"
     if "::" in path or path.lower().endswith((".db", ".sqlite")):
         return "sqlite"
     suffix = Path(path.split("::", 1)[0]).suffix.lower()
@@ -2665,6 +3980,7 @@ def build_schema_graph(context_tables: list[ContextTable]) -> dict[str, Any]:
                 "source_kind": _source_kind_from_context_path(table.path),
                 "row_count": len(table.frame),
                 "columns": columns,
+                "metadata": table.metadata or {},
             }
         )
 
@@ -2728,18 +4044,6 @@ def _extract_year(question: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _extract_race_number(question: str) -> int | None:
-    patterns = [
-        r"\brace\s*(?:no\.?|number|#)\s*\.?\s*(\d+)\b",
-        r"\bno\.?\s*(\d+)\b",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, question, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
-
-
 def _ordinal_from_question(question: str) -> int | None:
     lowered = question.lower()
     ordinal_words = {
@@ -2797,1027 +4101,9 @@ def _extract_time_floor_from_question(question: str) -> int | None:
     return int(seconds) if seconds is not None else None
 
 
-def _best_race_rows_from_question(races: pd.DataFrame, question: str) -> pd.DataFrame:
-    name_column = _optional_column(races, "name")
-    if name_column is None or races.empty:
-        return races.iloc[0:0].copy()
-
-    lowered_question = question.lower()
-    scored_rows: list[tuple[int, int]] = []
-    for index, name in races[name_column].items():
-        text = _text_value(name).lower()
-        if not text:
-            continue
-        tokens = [
-            token
-            for token in re.findall(r"[a-z0-9]+", text)
-            if token not in {"grand", "prix", "the", "race"} and len(token) > 2
-        ]
-        score = 0
-        if text in lowered_question:
-            score += 20
-        score += sum(1 for token in tokens if token in lowered_question)
-        if score > 0:
-            scored_rows.append((index, score))
-
-    if not scored_rows:
-        return races.iloc[0:0].copy()
-
-    best_score = max(score for _, score in scored_rows)
-    best_indices = [index for index, score in scored_rows if score == best_score]
-    return races.loc[best_indices].copy()
-
-
-def _try_thrombosis_route(task_context: TaskContext) -> Candidate | None:
-    plan = _heuristic_structured_plan(task_context.task)
-    if plan is None:
-        return None
-    try:
-        frame = execute_structured_plan(task_context.task, plan)
-    except Exception:  # noqa: BLE001
-        return None
-    return _candidate_from_frame(
-        frame,
-        source="deterministic_thrombosis_plan",
-        confidence=0.98,
-        diagnostics={"kind": "schema_question_plan", "plan": plan},
-    )
-
-
-def _try_superhero_average_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question.lower()
-    if intent.domain != "superhero" or intent.operation != "average":
-        return None
-    if "female" not in question or "weight" not in question:
-        return None
-
-    superhero_table = _find_table_with_columns(task_context.context_tables, ("gender_id", "weight_kg"))
-    gender_table = _find_table_with_columns(task_context.context_tables, ("id", "gender"))
-    if superhero_table is None or gender_table is None:
-        return None
-
-    superhero = superhero_table.frame.copy()
-    gender = gender_table.frame.copy()
-    merged = pd.merge(
-        superhero,
-        gender,
-        how="inner",
-        left_on=_resolve_column(superhero, "gender_id"),
-        right_on=_resolve_column(gender, "id"),
-    )
-    gender_column = _resolve_column(merged, "gender")
-    weight_column = _resolve_column(merged, "weight_kg")
-    female_rows = merged[merged[gender_column].map(_text_value).str.lower().eq("female")]
-    weights = pd.to_numeric(female_rows[weight_column], errors="coerce").dropna()
-    if weights.empty:
-        return None
-
-    frame = pd.DataFrame({"AVG(weight_kg)": [float(weights.mean())]})
-    return _candidate_from_frame(
-        frame,
-        source="deterministic_aggregate_route",
-        confidence=0.97,
-        diagnostics={
-            "kind": "average_join_filter",
-            "source_table": superhero_table.name,
-            "lookup_table": gender_table.name,
-            "row_count": int(len(weights)),
-        },
-    )
-
-
-def _try_formula_qualifying_number_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    lowered = question.lower()
-    if intent.domain != "racing" or "q3" not in lowered or "number" not in lowered:
-        return None
-
-    race_number = _extract_race_number(question)
-    target_time_floor = _extract_time_floor_from_question(question)
-    if race_number is None or target_time_floor is None:
-        return None
-
-    qualifying_table = _find_table_with_columns(task_context.context_tables, ("raceId", "driverId", "q3"))
-    drivers_table = _find_table_with_columns(
-        task_context.context_tables,
-        ("driverId", "number"),
-        preferred_name="drivers",
-    )
-    if qualifying_table is None or drivers_table is None:
-        return None
-
-    qualifying = qualifying_table.frame.copy()
-    race_column = _resolve_column(qualifying, "raceId")
-    q3_column = _resolve_column(qualifying, "q3")
-    driver_id_column = _resolve_column(qualifying, "driverId")
-    race_rows = qualifying[_numeric_equals_mask(qualifying[race_column], race_number)].copy()
-    if race_rows.empty:
-        return None
-
-    q3_seconds = race_rows[q3_column].map(_parse_time_seconds)
-    q3_time_floor = q3_seconds.map(
-        lambda value: int(value) if value is not None and not pd.isna(value) else None
-    )
-    selected = race_rows[q3_time_floor.eq(target_time_floor)]
-    if selected.empty:
-        return None
-
-    drivers = drivers_table.frame.copy()
-    driver_number_column = _resolve_column(drivers, "number")
-    drivers = drivers.rename(columns={driver_number_column: "driver_number"})
-    merged = pd.merge(
-        selected,
-        drivers,
-        how="left",
-        left_on=driver_id_column,
-        right_on=_resolve_column(drivers, "driverId"),
-    )
-    answer_values = merged["driver_number"].map(_text_value)
-    if answer_values.eq("").all():
-        answer_values = selected[_resolve_column(selected, "number")].map(_text_value)
-    output = pd.DataFrame({"number": answer_values})
-    output = output[output["number"].map(_text_value).ne("")].drop_duplicates().reset_index(drop=True)
-    return _candidate_from_frame(
-        output,
-        source="deterministic_racing_route",
-        confidence=0.96,
-        diagnostics={
-            "kind": "qualifying_q3_number",
-            "race_number": race_number,
-            "target_time_floor_seconds": target_time_floor,
-            "source_table": qualifying_table.name,
-            "driver_table": drivers_table.name,
-        },
-    )
-
-
-def _driver_ids_mentioned_in_question(drivers: pd.DataFrame, question: str) -> list[Any]:
-    lowered = question.lower()
-    driver_id_column = _optional_column(drivers, "driverId")
-    forename_column = _optional_column(drivers, "forename")
-    surname_column = _optional_column(drivers, "surname")
-    if driver_id_column is None or forename_column is None or surname_column is None:
-        return []
-
-    ids: list[Any] = []
-    for _, row in drivers.iterrows():
-        full_name = f"{_text_value(row[forename_column])} {_text_value(row[surname_column])}".strip().lower()
-        if full_name and full_name in lowered:
-            ids.append(row[driver_id_column])
-    return ids
-
-
-def _extract_less_than_threshold(question: str) -> int | None:
-    match = re.search(
-        r"\b(?:track\s+number|position|rank|number)\s+(?:is\s+)?(?:less than|under|below)\s+(\d+)\b",
-        question,
-        flags=re.IGNORECASE,
-    )
-    return int(match.group(1)) if match else None
-
-
-def _quoted_phrase(question: str) -> str | None:
-    match = re.search(r"'([^']+)'|\"([^\"]+)\"", question)
-    if not match:
-        return None
-    return match.group(1) or match.group(2)
-
-
-def _extract_number_after_phrase(question: str, phrase: str) -> int | None:
-    pattern = rf"{re.escape(phrase)}\s*(?:id|no\.?|number|#)?\s*(?:no\.?)?\s*(\d+)"
-    match = re.search(pattern, question, flags=re.IGNORECASE)
-    return int(match.group(1)) if match else None
-
-
-def _string_contains_mask(series: pd.Series, text: str) -> pd.Series:
-    return series.map(_text_value).str.contains(re.escape(text), case=False, na=False)
-
-
-def _truthy_mask(series: pd.Series) -> pd.Series:
-    return series.map(_text_value).str.lower().isin({"true", "1", "yes", "y"})
-
-
-def _nonempty_rows(frame: pd.DataFrame, column: str) -> pd.DataFrame:
-    return frame[frame[column].map(_text_value).ne("")].copy()
-
-
-def _try_event_expense_group_sum_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    lowered = question.lower()
-    if "expense" not in lowered or "total" not in lowered or "approved" not in lowered:
-        return None
-    event_name = _quoted_phrase(question)
-    if event_name is None:
-        return None
-    event_table = _find_table_with_columns(task_context.context_tables, ("event_id", "event_name", "type"))
-    budget_table = _find_table_with_columns(task_context.context_tables, ("budget_id", "link_to_event"))
-    expense_table = _find_table_with_columns(task_context.context_tables, ("cost", "approved", "link_to_budget"))
-    if event_table is None or budget_table is None or expense_table is None:
-        return None
-
-    events = event_table.frame.copy()
-    event_name_column = _resolve_column(events, "event_name")
-    events = events[_string_contains_mask(events[event_name_column], event_name)]
-    if events.empty:
-        return None
-    budgets = budget_table.frame.copy()
-    expenses = expense_table.frame.copy()
-    approved_column = _resolve_column(expenses, "approved")
-    expenses = expenses[_truthy_mask(expenses[approved_column])]
-    joined = pd.merge(
-        events,
-        budgets,
-        how="inner",
-        left_on=_resolve_column(events, "event_id"),
-        right_on=_resolve_column(budgets, "link_to_event"),
-    )
-    joined = pd.merge(
-        joined,
-        expenses,
-        how="inner",
-        left_on=_resolve_column(joined, "budget_id"),
-        right_on=_resolve_column(expenses, "link_to_budget"),
-    )
-    if joined.empty:
-        return None
-    type_column = _resolve_column(joined, "type")
-    cost_column = _resolve_column(joined, "cost")
-    output = (
-        joined.groupby(type_column, dropna=False)[cost_column]
-        .sum()
-        .reset_index()
-        .rename(columns={type_column: "type", cost_column: "SUM(cost)"})
-    )
-    return _candidate_from_frame(
-        output,
-        source="deterministic_event_expense_route",
-        confidence=0.95,
-        diagnostics={
-            "kind": "event_expense_group_sum",
-            "event_name": event_name,
-            "join_path": [event_table.name, budget_table.name, expense_table.name],
-            "aggregate": "sum(cost) by event.type",
-        },
-    )
-
-
-def _try_gas_customer_consumption_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    lowered = question.lower()
-    yearmonth_table = _find_table_with_columns(task_context.context_tables, ("CustomerID", "Date", "Consumption"))
-    transactions_table = _find_table_with_columns(
-        task_context.context_tables,
-        ("CustomerID", "Date", "ProductID", "Amount", "Price"),
-    )
-    customers_table = _find_table_with_columns(task_context.context_tables, ("CustomerID", "Segment"))
-    gasstations_table = _find_table_with_columns(task_context.context_tables, ("GasStationID", "Country"))
-
-    if (
-        "average monthly consumption" in lowered
-        and "sme" in lowered
-        and yearmonth_table is not None
-        and customers_table is not None
-    ):
-        year = _extract_year(question)
-        if year is None:
-            return None
-        ym = yearmonth_table.frame.copy()
-        customers = customers_table.frame.copy()
-        joined = pd.merge(
-            ym,
-            customers,
-            how="inner",
-            left_on=_resolve_column(ym, "CustomerID"),
-            right_on=_resolve_column(customers, "CustomerID"),
-        )
-        date_column = _resolve_column(joined, "Date")
-        segment_column = _resolve_column(joined, "Segment")
-        consumption_column = _resolve_column(joined, "Consumption")
-        selected = joined[
-            joined[date_column].map(_text_value).str.startswith(str(year), na=False)
-            & joined[segment_column].map(_text_value).str.lower().eq("sme")
-        ]
-        values = pd.to_numeric(selected[consumption_column], errors="coerce").dropna()
-        if values.empty:
-            return None
-        output = pd.DataFrame({"AVG(Consumption) / 12": [float(values.mean()) / 12]})
-        return _candidate_from_frame(
-            output,
-            source="deterministic_gas_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "sme_average_monthly_consumption",
-                "year": year,
-                "join_path": [yearmonth_table.name, customers_table.name],
-            },
-        )
-
-    if (
-        "gas stations" in lowered
-        and "transactions" in lowered
-        and "june" in lowered
-        and transactions_table is not None
-        and gasstations_table is not None
-    ):
-        year = _extract_year(question)
-        if year is None:
-            return None
-        transactions = transactions_table.frame.copy()
-        date_column = _resolve_column(transactions, "Date")
-        parsed = pd.to_datetime(transactions[date_column], errors="coerce")
-        selected = transactions[parsed.dt.year.eq(year).fillna(False) & parsed.dt.month.eq(6).fillna(False)]
-        if selected.empty and yearmonth_table is not None:
-            ym = yearmonth_table.frame.copy()
-            year_month = int(f"{year}06")
-            customer_ids = set(
-                ym[_numeric_equals_mask(ym[_resolve_column(ym, "Date")], year_month)][
-                    _resolve_column(ym, "CustomerID")
-                ].map(_text_value)
-            )
-            selected = transactions[
-                transactions[_resolve_column(transactions, "CustomerID")].map(_text_value).isin(customer_ids)
-            ].copy()
-        if selected.empty:
-            return None
-        gasstations = gasstations_table.frame.copy()
-        joined = pd.merge(
-            selected,
-            gasstations,
-            how="inner",
-            left_on=_resolve_column(selected, "GasStationID"),
-            right_on=_resolve_column(gasstations, "GasStationID"),
-        )
-        country_column = _resolve_column(joined, "Country")
-        output = joined[[country_column]].drop_duplicates().reset_index(drop=True)
-        return _candidate_from_frame(
-            output,
-            source="deterministic_gas_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "gas_station_countries_by_transaction_month",
-                "year": year,
-                "month": 6,
-                "join_path": [transactions_table.name, gasstations_table.name],
-            },
-        )
-
-    if (
-        "per unit" in lowered
-        and "product id" in lowered
-        and "consumption" in lowered
-        and "august" in lowered
-        and yearmonth_table is not None
-        and transactions_table is not None
-    ):
-        product_id = _extract_number_after_phrase(question, "product")
-        threshold_match = re.search(r"more than\s+([0-9]+(?:\.[0-9]+)?)", question, flags=re.IGNORECASE)
-        year = _extract_year(question) or 2012
-        if product_id is None or threshold_match is None:
-            return None
-        threshold = float(threshold_match.group(1))
-        transactions = transactions_table.frame.copy()
-        amount = pd.to_numeric(transactions[_resolve_column(transactions, "Amount")], errors="coerce")
-        price = pd.to_numeric(transactions[_resolve_column(transactions, "Price")], errors="coerce")
-        product_column = _resolve_column(transactions, "ProductID")
-        selected = transactions[
-            _numeric_equals_mask(transactions[product_column], product_id)
-            & amount.gt(0)
-            & (price / amount).gt(threshold)
-        ].copy()
-        if selected.empty:
-            return None
-        ym = yearmonth_table.frame.copy()
-        target_date = int(f"{year}08")
-        ym_selected = ym[
-            ym[_resolve_column(ym, "CustomerID")].map(_text_value).isin(
-                set(selected[_resolve_column(selected, "CustomerID")].map(_text_value))
-            )
-            & _numeric_equals_mask(ym[_resolve_column(ym, "Date")], target_date)
-        ]
-        consumption_column = _resolve_column(ym_selected, "Consumption")
-        output = ym_selected[[consumption_column]].drop_duplicates().reset_index(drop=True)
-        return _candidate_from_frame(
-            output,
-            source="deterministic_gas_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "unit_price_customer_consumption",
-                "product_id": product_id,
-                "threshold": threshold,
-                "year_month": target_date,
-                "join_path": [transactions_table.name, yearmonth_table.name],
-            },
-        )
-
-    return None
-
-
-def _try_molecule_bond_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question.lower()
-    atom_table = _find_table_with_columns(task_context.context_tables, ("atom_id", "molecule_id", "element"))
-    connected_table = _find_table_with_columns(task_context.context_tables, ("atom_id", "atom_id2", "bond_id"))
-    bond_table = _find_table_with_columns(task_context.context_tables, ("bond_id", "molecule_id", "bond_type"))
-    if atom_table is None:
-        return None
-
-    if "phosphorus" in question and "nitrogen" in question and "bond" in question and connected_table is not None:
-        atoms = atom_table.frame.copy()
-        connected = connected_table.frame.copy()
-        atom1 = atoms.rename(columns={column: f"{column}_1" for column in atoms.columns})
-        atom2 = atoms.rename(columns={column: f"{column}_2" for column in atoms.columns})
-        joined = pd.merge(
-            connected,
-            atom1,
-            how="inner",
-            left_on=_resolve_column(connected, "atom_id"),
-            right_on="atom_id_1",
-        )
-        joined = pd.merge(
-            joined,
-            atom2,
-            how="inner",
-            left_on=_resolve_column(joined, "atom_id2"),
-            right_on="atom_id_2",
-        )
-        element1 = joined["element_1"].map(_text_value).str.lower()
-        element2 = joined["element_2"].map(_text_value).str.lower()
-        selected = joined[((element1 == "p") & (element2 == "n")) | ((element1 == "n") & (element2 == "p"))]
-        output = selected[["bond_id"]].drop_duplicates().reset_index(drop=True)
-        return _candidate_from_frame(
-            output,
-            source="deterministic_molecule_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "bond_between_elements",
-                "elements": ["p", "n"],
-                "join_path": [connected_table.name, atom_table.name, atom_table.name],
-            },
-        )
-
-    if "average number of bonds" in question and "iodine" in question and connected_table is not None:
-        atoms = atom_table.frame.copy()
-        iodine = atoms[atoms[_resolve_column(atoms, "element")].map(_text_value).str.lower().eq("i")]
-        if iodine.empty:
-            return None
-        connected = connected_table.frame.copy()
-        count = connected[_resolve_column(connected, "atom_id")].map(_text_value).isin(
-            set(iodine[_resolve_column(iodine, "atom_id")].map(_text_value))
-        ).sum()
-        output = pd.DataFrame({"average_bonds": [float(count) / len(iodine)]})
-        return _candidate_from_frame(
-            output,
-            source="deterministic_molecule_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "average_bonds_for_element",
-                "element": "i",
-                "join_path": [atom_table.name, connected_table.name],
-            },
-        )
-
-    if "triple-bond" in question and "molecules" in question and bond_table is not None:
-        atoms = atom_table.frame.copy()
-        bonds = bond_table.frame.copy()
-        target_atoms = atoms[
-            atoms[_resolve_column(atoms, "element")]
-            .map(_text_value)
-            .str.lower()
-            .isin({"p", "br"})
-        ]
-        triple = bonds[bonds[_resolve_column(bonds, "bond_type")].map(_text_value).eq("#")]
-        molecules = set(triple[_resolve_column(triple, "molecule_id")].map(_text_value))
-        selected = target_atoms[
-            target_atoms[_resolve_column(target_atoms, "molecule_id")].map(_text_value).isin(molecules)
-        ]
-        output = pd.DataFrame({"COUNT(atom_id)": [int(len(selected))]})
-        return _candidate_from_frame(
-            output,
-            source="deterministic_molecule_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "count_atoms_in_triple_bond_molecules",
-                "elements": ["p", "br"],
-                "join_path": [atom_table.name, bond_table.name],
-            },
-        )
-
-    return None
-
-
-def _try_school_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    lowered = question.lower()
-    satscores_table = _find_table_with_columns(task_context.context_tables, ("cds", "dname", "AvgScrRead"))
-    schools_table = _find_table_with_columns(task_context.context_tables, ("CDSCode", "Phone"))
-    frpm_table = _find_table_with_columns(task_context.context_tables, ("CDSCode", "Charter Funding Type"))
-
-    if "telephone" in lowered and "lowest average score in reading" in lowered and satscores_table is not None and schools_table is not None:
-        district = question.rstrip(" ?").rsplit(" in ", 1)[-1].strip()
-        satscores = satscores_table.frame.copy()
-        district_rows = satscores[_string_contains_mask(satscores[_resolve_column(satscores, "dname")], district)]
-        district_rows = _nonempty_rows(district_rows, _resolve_column(district_rows, "AvgScrRead"))
-        if district_rows.empty:
-            return None
-        read_column = _resolve_column(district_rows, "AvgScrRead")
-        selected = district_rows.loc[[pd.to_numeric(district_rows[read_column], errors="coerce").idxmin()]]
-        schools = schools_table.frame.copy()
-        selected = selected.copy()
-        schools = schools.copy()
-        selected["__join_cds"] = selected[_resolve_column(selected, "cds")].map(_text_value)
-        schools["__join_cds"] = schools[_resolve_column(schools, "CDSCode")].map(_text_value)
-        merged = pd.merge(
-            selected,
-            schools,
-            how="inner",
-            on="__join_cds",
-        )
-        phone_column = _resolve_column(merged, "Phone")
-        output = merged[[phone_column]].reset_index(drop=True)
-        return _candidate_from_frame(
-            output,
-            source="deterministic_school_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "lowest_reading_score_phone",
-                "district": district,
-                "join_path": [satscores_table.name, schools_table.name],
-            },
-        )
-
-    if "funding types" in lowered and "average sat math score" in lowered and "riverside" in lowered and satscores_table is not None and frpm_table is not None:
-        satscores = satscores_table.frame.copy()
-        math_column = _resolve_column(satscores, "AvgScrMath")
-        school_name_column = _resolve_column(satscores, "sname")
-        district_column = _resolve_column(satscores, "dname")
-        school_rows = satscores[
-            _string_contains_mask(satscores[district_column], "Riverside")
-            & satscores[school_name_column].map(_text_value).ne("")
-            & pd.to_numeric(satscores[math_column], errors="coerce").notna()
-        ].copy()
-        if school_rows.empty:
-            return None
-        school_rows["_math"] = pd.to_numeric(school_rows[math_column], errors="coerce")
-        eligible_districts = set(
-            school_rows.groupby(district_column, dropna=False)["_math"].mean().loc[lambda series: series.gt(400)].index
-        )
-        selected = school_rows[school_rows[district_column].isin(eligible_districts)].copy()
-        frpm = frpm_table.frame.copy()
-        selected = selected.copy()
-        frpm = frpm.copy()
-        selected["__join_cds"] = selected[_resolve_column(selected, "cds")].map(_text_value)
-        frpm["__join_cds"] = frpm[_resolve_column(frpm, "CDSCode")].map(_text_value)
-        merged = pd.merge(
-            selected,
-            frpm,
-            how="left",
-            on="__join_cds",
-        )
-        funding_column = _resolve_column(merged, "Charter Funding Type")
-        output = merged[[school_name_column, funding_column]].rename(columns={school_name_column: "sname"})
-        output = output.drop_duplicates().reset_index(drop=True)
-        return _candidate_from_frame(
-            output,
-            source="deterministic_school_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "riverside_sat_math_funding",
-                "district_count": len(eligible_districts),
-                "join_path": [satscores_table.name, frpm_table.name],
-            },
-        )
-
-    return None
-
-
-def _try_posts_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    lowered = question.lower()
-    posts_table = _find_table_with_columns(task_context.context_tables, ("Id", "OwnerUserId"))
-    users_table = _find_table_with_columns(task_context.context_tables, ("Id", "DisplayName"))
-    votes_table = _find_table_with_columns(task_context.context_tables, ("Id", "UserId"))
-    comments_table = _find_table_with_columns(task_context.context_tables, ("PostId", "Score", "Text"))
-
-    if (
-        "average of the up votes" in lowered
-        and "average user age" in lowered
-        and "more than" in lowered
-        and posts_table is not None
-        and users_table is not None
-    ):
-        threshold_match = re.search(r"more than\s+(\d+)\s+posts", question, flags=re.IGNORECASE)
-        if threshold_match is None:
-            return None
-        threshold = int(threshold_match.group(1))
-        posts = posts_table.frame.copy()
-        owner_column = _resolve_column(posts, "OwnerUserId")
-        post_counts = posts.groupby(owner_column, dropna=True)[_resolve_column(posts, "Id")].nunique()
-        active_user_ids = pd.to_numeric(
-            pd.Series(post_counts[post_counts.gt(threshold)].index.tolist()),
-            errors="coerce",
-        ).dropna()
-        if active_user_ids.empty:
-            return None
-        users = users_table.frame.copy()
-        user_id_values = set(active_user_ids.tolist())
-        selected_users = users[
-            pd.to_numeric(users[_resolve_column(users, "Id")], errors="coerce").isin(user_id_values)
-        ].copy()
-        if selected_users.empty:
-            return None
-        upvotes = pd.to_numeric(selected_users[_resolve_column(selected_users, "UpVotes")], errors="coerce")
-        age = pd.to_numeric(selected_users[_resolve_column(selected_users, "Age")], errors="coerce")
-        output = pd.DataFrame(
-            {
-                "AVG(UpVotes)": [float(upvotes.mean())],
-                "AVG(Age)": [float(age.mean())],
-            }
-        )
-        return _candidate_from_frame(
-            output,
-            source="deterministic_posts_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "active_user_upvotes_age_average",
-                "post_threshold": threshold,
-                "user_count": len(selected_users),
-                "join_path": [posts_table.name, users_table.name],
-                "aggregate": "mean(UpVotes), mean(Age)",
-            },
-        )
-
-    if "user no" in lowered and "posts compared to" in lowered and posts_table is not None and votes_table is not None:
-        user_id = _extract_number_after_phrase(question, "user")
-        if user_id is None:
-            return None
-        posts = posts_table.frame.copy()
-        votes = votes_table.frame.copy()
-        post_count = posts[_numeric_equals_mask(posts[_resolve_column(posts, "OwnerUserId")], user_id)][
-            _resolve_column(posts, "Id")
-        ].nunique()
-        vote_count = votes[_numeric_equals_mask(votes[_resolve_column(votes, "UserId")], user_id)][
-            _resolve_column(votes, "Id")
-        ].nunique()
-        if vote_count == 0:
-            return None
-        output = pd.DataFrame({"ratio": [float(post_count) / float(vote_count)]})
-        return _candidate_from_frame(
-            output,
-            source="deterministic_posts_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "post_vote_ratio",
-                "user_id": user_id,
-                "post_count": int(post_count),
-                "vote_count": int(vote_count),
-                "join_path": [posts_table.name, votes_table.name],
-            },
-        )
-
-    if "most answers count" in lowered and "post id" in lowered and posts_table is not None and users_table is not None:
-        author_match = re.search(r"by\s+([A-Za-z0-9_.-]+)", question, flags=re.IGNORECASE)
-        if author_match is None:
-            return None
-        author = author_match.group(1)
-        users = users_table.frame.copy()
-        matching_users = users[users[_resolve_column(users, "DisplayName")].map(_text_value).str.lower().eq(author.lower())]
-        if matching_users.empty:
-            return None
-        posts = posts_table.frame.copy()
-        user_ids = pd.to_numeric(matching_users[_resolve_column(matching_users, "Id")], errors="coerce").dropna()
-        owner_ids = pd.to_numeric(posts[_resolve_column(posts, "OwnerUserId")], errors="coerce")
-        selected = posts[
-            owner_ids.isin(set(user_ids.tolist()))
-        ].copy()
-        if selected.empty:
-            return None
-        answer_count_column = _resolve_column(selected, "AnswerCount")
-        answer_counts = pd.to_numeric(selected[answer_count_column], errors="coerce")
-        if answer_counts.notna().any():
-            selected = selected.loc[[answer_counts.idxmax()]]
-        else:
-            selected = selected.head(1)
-        output = selected[[_resolve_column(selected, "Id")]].rename(columns={_resolve_column(selected, "Id"): "PostId"})
-        return _candidate_from_frame(
-            output,
-            source="deterministic_posts_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "author_post_with_max_answers",
-                "author": author,
-                "join_path": [users_table.name, posts_table.name],
-            },
-        )
-
-    if "total views" in lowered and "posted it last time" in lowered and posts_table is not None and users_table is not None:
-        title = _quoted_phrase(question)
-        if title is None:
-            return None
-        posts = posts_table.frame.copy()
-        selected = posts[posts[_resolve_column(posts, "Title")].map(_text_value).str.lower().eq(title.lower())].copy()
-        if selected.empty:
-            return None
-        users = users_table.frame.copy()
-        merged = pd.merge(
-            selected,
-            users,
-            how="left",
-            left_on=_resolve_column(selected, "LastEditorUserId"),
-            right_on=_resolve_column(users, "Id"),
-        )
-        output = merged[[_resolve_column(merged, "ViewCount"), _resolve_column(merged, "DisplayName")]].copy()
-        return _candidate_from_frame(
-            output,
-            source="deterministic_posts_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "post_views_and_last_editor_name",
-                "title": title,
-                "join_path": [posts_table.name, users_table.name],
-            },
-        )
-
-    if "views ranging from" in lowered and "comment with the highest score" in lowered and posts_table is not None and comments_table is not None:
-        bounds = [int(value) for value in re.findall(r"\b\d+\b", question)]
-        if len(bounds) < 2:
-            return None
-        low, high = min(bounds[:2]), max(bounds[:2])
-        posts = posts_table.frame.copy()
-        view_count = pd.to_numeric(posts[_resolve_column(posts, "ViewCount")], errors="coerce")
-        selected_posts = posts[view_count.ge(low) & view_count.le(high)].copy()
-        comments = comments_table.frame.copy()
-        comment_score_column = _resolve_column(comments, "Score")
-        comments = comments.rename(columns={comment_score_column: "comment_score"})
-        joined = pd.merge(
-            comments,
-            selected_posts,
-            how="inner",
-            left_on=_resolve_column(comments, "PostId"),
-            right_on=_resolve_column(selected_posts, "Id"),
-        )
-        if joined.empty:
-            return None
-        score_column = _resolve_column(joined, "comment_score")
-        selected = joined.loc[[pd.to_numeric(joined[score_column], errors="coerce").idxmax()]]
-        output = selected[[_resolve_column(selected, "Text")]].reset_index(drop=True)
-        return _candidate_from_frame(
-            output,
-            source="deterministic_posts_route",
-            confidence=0.95,
-            diagnostics={
-                "kind": "highest_score_comment_for_view_range",
-                "view_range": [low, high],
-                "join_path": [posts_table.name, comments_table.name],
-            },
-        )
-
-    return None
-
-
-def _try_superhero_percentage_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question.lower()
-    if "percentage" not in question or "superheroes" not in question or "blue eyes" not in question:
-        return None
-    superhero_table = _find_table_with_columns(task_context.context_tables, ("id", "eye_colour_id"))
-    colour_table = _find_table_with_columns(task_context.context_tables, ("id", "colour"))
-    if superhero_table is None or colour_table is None:
-        return None
-    superheroes = superhero_table.frame.copy()
-    colours = colour_table.frame.copy()
-    joined = pd.merge(
-        superheroes,
-        colours,
-        how="left",
-        left_on=_resolve_column(superheroes, "eye_colour_id"),
-        right_on=_resolve_column(colours, "id"),
-    )
-    colour_column = _resolve_column(joined, "colour")
-    total = len(superheroes)
-    if total == 0:
-        return None
-    blue_count = int(joined[colour_column].map(_text_value).str.lower().eq("blue").sum())
-    output = pd.DataFrame({"percentage": [blue_count * 100 / total]})
-    return _candidate_from_frame(
-        output,
-        source="deterministic_superhero_route",
-        confidence=0.95,
-        diagnostics={
-            "kind": "superhero_eye_colour_percentage",
-            "colour": "Blue",
-            "numerator": blue_count,
-            "denominator": total,
-            "join_path": [superhero_table.name, colour_table.name],
-        },
-    )
-
-
-def _try_set_translation_count_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question.lower()
-    if "translated sets" not in question or "commander block" not in question:
-        return None
-    sets_table = _find_table_with_columns(task_context.context_tables, ("code", "block"))
-    translations_table = _find_table_with_columns(task_context.context_tables, ("language", "setCode"))
-    if sets_table is None or translations_table is None:
-        return None
-    sets = sets_table.frame.copy()
-    translations = translations_table.frame.copy()
-    joined = pd.merge(
-        translations,
-        sets,
-        how="inner",
-        left_on=_resolve_column(translations, "setCode"),
-        right_on=_resolve_column(sets, "code"),
-    )
-    selected = joined[
-        joined[_resolve_column(joined, "language")].map(_text_value).str.lower().eq("portuguese (brazil)")
-        & joined[_resolve_column(joined, "block")].map(_text_value).str.lower().eq("commander")
-    ]
-    output = pd.DataFrame({"COUNT(id)": [int(len(selected))]})
-    return _candidate_from_frame(
-        output,
-        source="deterministic_set_route",
-        confidence=0.95,
-        diagnostics={
-            "kind": "translated_sets_in_block_count",
-            "language": "Portuguese (Brazil)",
-            "block": "Commander",
-            "join_path": [translations_table.name, sets_table.name],
-        },
-    )
-
-
-def _try_racing_percentage_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question.lower()
-    if "percentage" not in question or "grand prix" not in question or "germany" not in question:
-        return None
-    races_table = _find_table_with_columns(task_context.context_tables, ("raceId", "circuitId", "name"))
-    circuits_table = _find_table_with_columns(task_context.context_tables, ("circuitId", "country"))
-    if races_table is None or circuits_table is None:
-        return None
-    races = races_table.frame.copy()
-    selected_races = races[_string_contains_mask(races[_resolve_column(races, "name")], "European Grand Prix")]
-    if selected_races.empty:
-        return None
-    circuits = circuits_table.frame.copy()
-    joined = pd.merge(
-        selected_races,
-        circuits,
-        how="inner",
-        left_on=_resolve_column(selected_races, "circuitId"),
-        right_on=_resolve_column(circuits, "circuitId"),
-    )
-    country_column = _resolve_column(joined, "country")
-    numerator = int(joined[country_column].map(_text_value).str.lower().eq("germany").sum())
-    denominator = len(joined)
-    if denominator == 0:
-        return None
-    output = pd.DataFrame({"percentage": [numerator * 100 / denominator]})
-    return _candidate_from_frame(
-        output,
-        source="deterministic_racing_route",
-        confidence=0.95,
-        diagnostics={
-            "kind": "grand_prix_country_percentage",
-            "race_name": "European Grand Prix",
-            "country": "Germany",
-            "numerator": numerator,
-            "denominator": denominator,
-            "join_path": [races_table.name, circuits_table.name],
-        },
-    )
-
-
-def _try_formula_driver_standings_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    if intent.domain != "racing" or "which race" not in question.lower():
-        return None
-
-    threshold = _extract_less_than_threshold(question)
-    standings_table = _find_table_with_columns(task_context.context_tables, ("driverId", "raceId", "position"))
-    races_table = _find_table_with_columns(task_context.context_tables, ("raceId", "name"))
-    drivers_table = _find_table_with_columns(task_context.context_tables, ("driverId", "forename", "surname"))
-    if threshold is None or standings_table is None or races_table is None or drivers_table is None:
-        return None
-
-    driver_ids = _driver_ids_mentioned_in_question(drivers_table.frame, question)
-    if not driver_ids:
-        return None
-
-    standings = standings_table.frame.copy()
-    driver_id_column = _resolve_column(standings, "driverId")
-    position_column = _resolve_column(standings, "position")
-    race_id_column = _resolve_column(standings, "raceId")
-    driver_id_values = {_text_value(value) for value in driver_ids}
-    selected = standings[
-        standings[driver_id_column].map(_text_value).isin(driver_id_values)
-        & pd.to_numeric(standings[position_column], errors="coerce").lt(threshold)
-    ].copy()
-    if selected.empty:
-        return None
-
-    races = races_table.frame.copy()
-    merged = pd.merge(
-        selected,
-        races,
-        how="inner",
-        left_on=race_id_column,
-        right_on=_resolve_column(races, "raceId"),
-        sort=False,
-    )
-    name_column = _resolve_column(merged, "name")
-    output = merged[[name_column]].drop_duplicates().reset_index(drop=True)
-    return _candidate_from_frame(
-        output,
-        source="deterministic_racing_route",
-        confidence=0.95,
-        diagnostics={
-            "kind": "driver_standings_race_list",
-            "driver_ids": [_json_safe_cell(value) for value in driver_ids],
-            "position_threshold": threshold,
-            "standings_table": standings_table.name,
-            "races_table": races_table.name,
-        },
-    )
-
-
-def _try_formula_finish_time_route(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    question = task_context.task.question
-    lowered = question.lower()
-    if intent.domain != "racing" or "grand prix" not in lowered or "time" not in lowered:
-        return None
-
-    year = _extract_year(question)
-    ordinal = _ordinal_from_question(question)
-    if year is None or ordinal is None:
-        return None
-
-    races_table = _find_table_with_columns(task_context.context_tables, ("raceId", "year", "name"))
-    results_table = _find_table_with_columns(task_context.context_tables, ("raceId", "time"))
-    if races_table is None or results_table is None:
-        return None
-
-    races = races_table.frame.copy()
-    year_column = _resolve_column(races, "year")
-    races_in_year = races[_numeric_equals_mask(races[year_column], year)].copy()
-    race_rows = _best_race_rows_from_question(races_in_year, question)
-    if race_rows.empty:
-        return None
-
-    results = results_table.frame.copy()
-    race_id_column = _resolve_column(results, "raceId")
-    selected = results[
-        results[race_id_column].map(_text_value).isin(
-            {_text_value(value) for value in race_rows[_resolve_column(race_rows, "raceId")].tolist()}
-        )
-    ].copy()
-    if selected.empty:
-        return None
-
-    rank_column_name = "rank" if "rank" in lowered and _optional_column(selected, "rank") else "positionOrder"
-    rank_column = _resolve_column(selected, rank_column_name)
-    selected = selected[_numeric_equals_mask(selected[rank_column], ordinal)].copy()
-    if selected.empty:
-        return None
-
-    time_column = _resolve_column(selected, "time")
-    output = selected[[time_column]].copy()
-    output = output[output[time_column].map(_text_value).ne("")].drop_duplicates().reset_index(drop=True)
-    return _candidate_from_frame(
-        output,
-        source="deterministic_racing_route",
-        confidence=0.96,
-        diagnostics={
-            "kind": "grand_prix_rank_time",
-            "year": year,
-            "ordinal": ordinal,
-            "rank_column": rank_column,
-            "races_table": races_table.name,
-            "results_table": results_table.name,
-        },
-    )
-
-
 def try_deterministic_candidate(task_context: TaskContext, intent: TaskIntent) -> Candidate | None:
-    route_functions = (
-        lambda: _try_thrombosis_route(task_context),
-        lambda: _try_superhero_average_route(task_context, intent),
-        lambda: _try_superhero_percentage_route(task_context, intent),
-        lambda: _try_event_expense_group_sum_route(task_context, intent),
-        lambda: _try_gas_customer_consumption_route(task_context, intent),
-        lambda: _try_molecule_bond_route(task_context, intent),
-        lambda: _try_school_route(task_context, intent),
-        lambda: _try_posts_route(task_context, intent),
-        lambda: _try_set_translation_count_route(task_context, intent),
-        lambda: _try_racing_percentage_route(task_context, intent),
-        lambda: _try_formula_qualifying_number_route(task_context, intent),
-        lambda: _try_formula_driver_standings_route(task_context, intent),
-        lambda: _try_formula_finish_time_route(task_context, intent),
-    )
-    for route_function in route_functions:
-        candidate = route_function()
-        if candidate is not None and candidate.confidence >= 0.9:
-            return candidate
+    del task_context, intent
     return None
-
 
 def choose_route_policy(
     task_context: TaskContext,
@@ -3880,44 +4166,11 @@ def plan_structured_candidate(
     task: PublicTask,
     databao_env: DatabaoEnvironment,
 ) -> tuple[pd.DataFrame | None, StructuredPlannerReport]:
-    schema_payload = _planner_schema_payload(task)
+    retrieved_context = _CURRENT_RETRIEVED_CONTEXT.get()
+    schema_payload = _planner_schema_payload(task, retrieved_context=retrieved_context)
     validation_error: str | None = None
     attempt_details: list[dict[str, Any]] = []
     attempts = 0
-
-    heuristic_plan = _heuristic_structured_plan(task)
-    if heuristic_plan is not None:
-        try:
-            frame = execute_structured_plan(task, heuristic_plan)
-            report = StructuredPlannerReport(
-                attempted=True,
-                succeeded=True,
-                attempts=0,
-                failure_reason=None,
-                plan=heuristic_plan,
-                output_row_count=len(frame),
-                output_column_count=len(frame.columns),
-                attempt_details=[
-                    {
-                        "attempt": 0,
-                        "kind": "schema_heuristic",
-                        "succeeded": True,
-                        "output_row_count": len(frame),
-                        "output_column_count": len(frame.columns),
-                    }
-                ],
-            )
-            return frame, report
-        except Exception as exc:  # noqa: BLE001
-            validation_error = _safe_exception_summary(exc, (databao_env.model_api_key,))
-            attempt_details.append(
-                {
-                    "attempt": 0,
-                    "kind": "schema_heuristic",
-                    "succeeded": False,
-                    "validation_error": validation_error,
-                }
-            )
 
     if not schema_payload["tables"]:
         report = StructuredPlannerReport(
@@ -4009,7 +4262,11 @@ def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> An
     import databao.agent as bao
 
     domain = bao.domain()
-    register_context_sources(domain, task.context_dir)
+    register_context_sources(
+        domain,
+        task.context_dir,
+        retrieved_context=_CURRENT_RETRIEVED_CONTEXT.get(),
+    )
     model_kwargs: dict[str, Any] = {}
     diagnostics = _CURRENT_DIAGNOSTICS.get()
     if diagnostics is not None:
@@ -4037,10 +4294,14 @@ def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> An
 
 def _build_question_prompt(task: PublicTask) -> str:
     return (
-        "Answer the benchmark question using only the registered task data sources. "
-        "Return the final result as a dataframe/table with only the columns needed for the answer. "
-        "Preserve original string casing and formatting from source data when possible. "
-        "Do not include explanatory columns.\n\n"
+        "Use only the registered task data sources.\n"
+        "Return only the final answer table.\n"
+        "Do not include explanation, evidence, source, confidence, intermediate columns, or debug metadata.\n"
+        "If the question asks for one value, return exactly one row and one column.\n"
+        "If the question asks for a list of entities, return exactly one column.\n"
+        "If the question asks for a table with multiple attributes, return only the explicitly requested attributes.\n"
+        "Prefer display, name, title, or label columns for entity answers unless the question explicitly asks for ID or code.\n"
+        "Never output metadata or debug columns.\n\n"
         f"Question: {task.question}"
     )
 
@@ -4470,12 +4731,24 @@ def _write_prediction_csv(frame: pd.DataFrame, path: Path) -> None:
     output.to_csv(path, index=False, encoding="utf-8", lineterminator="\n")
 
 
+def _prediction_csv_status(path: Path) -> tuple[bool, bool, int | None, int | None]:
+    if not path.exists():
+        return False, False, None, None
+    try:
+        frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except Exception:  # noqa: BLE001
+        return True, False, None, None
+    return True, len(frame.columns) > 0, len(frame), len(frame.columns)
+
+
 def _write_task_log(
     log_path: Path,
     *,
     task: PublicTask,
     succeeded: bool,
     elapsed_seconds: float,
+    prediction_written: bool | None = None,
+    scorable: bool | None = None,
     context_summary: dict[str, Any] | None = None,
     candidate_source: str | None = None,
     structured_planner: dict[str, Any] | None = None,
@@ -4484,6 +4757,19 @@ def _write_task_log(
     timings: dict[str, float] | None = None,
     llm_calls: list[dict[str, Any]] | None = None,
     route_policy: dict[str, Any] | None = None,
+    answer_contract: dict[str, Any] | None = None,
+    heuristic_level: str | None = None,
+    enabled_strategies: list[dict[str, Any]] | None = None,
+    applied_strategies: list[dict[str, Any]] | None = None,
+    document_extraction_used: bool | None = None,
+    retrieved_context: dict[str, Any] | None = None,
+    complexity_profile: dict[str, Any] | None = None,
+    candidates: list[dict[str, Any]] | None = None,
+    candidate_scores: list[dict[str, Any]] | None = None,
+    selected_candidate_source: str | None = None,
+    final_answer_guard: dict[str, Any] | None = None,
+    planner_skipped_reason: str | None = None,
+    timeout_budget: dict[str, Any] | None = None,
     failure_reason: str | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -4491,6 +4777,8 @@ def _write_task_log(
         "task_id": task.task_id,
         "difficulty": task.difficulty,
         "succeeded": succeeded,
+        "prediction_written": bool(prediction_written),
+        "scorable": bool(scorable),
         "elapsed_seconds": elapsed_seconds,
         "context_summary": context_summary,
         "candidate_source": candidate_source,
@@ -4500,6 +4788,19 @@ def _write_task_log(
         "timings": timings,
         "llm_calls": llm_calls or [],
         "route_policy": route_policy,
+        "answer_contract": answer_contract,
+        "heuristic_level": heuristic_level,
+        "enabled_strategies": enabled_strategies or [],
+        "applied_strategies": applied_strategies or [],
+        "document_extraction_used": bool(document_extraction_used),
+        "retrieved_context": retrieved_context,
+        "complexity_profile": complexity_profile,
+        "candidates": candidates or [],
+        "candidate_scores": candidate_scores or [],
+        "selected_candidate_source": selected_candidate_source,
+        "final_answer_guard": final_answer_guard,
+        "planner_skipped_reason": planner_skipped_reason,
+        "timeout_budget": timeout_budget,
         "failure_reason": failure_reason,
     }
     log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -4520,12 +4821,24 @@ def _timeout_task_artifact(
         f"limit of {timeout_seconds} seconds."
     )
     timings = {"total": round(elapsed_seconds, 3), "task_timeout_seconds": timeout_seconds}
+    prediction_path = task_output_dir / "prediction.csv"
+    prediction_written, scorable, row_count, column_count = _prediction_csv_status(prediction_path)
     _write_task_log(
         log_path,
         task=task,
         succeeded=False,
+        prediction_written=prediction_written,
+        scorable=scorable,
         elapsed_seconds=round(elapsed_seconds, 3),
         timings=timings,
+        heuristic_level=_heuristic_level(),
+        enabled_strategies=[
+            {
+                "strategy_name": "generic_document_tables",
+                "strategy_kind": "generic",
+                "enabled_by": _heuristic_level(),
+            }
+        ],
         failure_reason=failure_reason,
     )
     traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
@@ -4534,12 +4847,17 @@ def _timeout_task_artifact(
     return DatabaoTaskArtifacts(
         task_id=task.task_id,
         task_output_dir=task_output_dir,
-        prediction_csv_path=None,
+        prediction_csv_path=prediction_path if prediction_written else None,
         log_path=log_path,
         succeeded=False,
+        prediction_written=prediction_written,
+        scorable=scorable,
         failure_reason=failure_reason,
         elapsed_seconds=round(elapsed_seconds, 3),
+        row_count=row_count,
+        column_count=column_count,
         timings=timings,
+        heuristic_level=_heuristic_level(),
     )
 
 
@@ -4592,7 +4910,12 @@ def _try_structured_planner_candidate(
     databao_env: DatabaoEnvironment,
     structured_planner: StructuredPlanner,
     diagnostics: TaskDiagnostics,
+    *,
+    deadline_at: float | None = None,
 ) -> tuple[pd.DataFrame | None, StructuredPlannerReport]:
+    skip_reason = _planner_skip_reason_for_deadline(deadline_at)
+    if skip_reason is not None:
+        return None, _skipped_structured_planner_report(skip_reason)
     try:
         with diagnostics.stage("structured_planner"):
             planner_frame, structured_planner_report = structured_planner(task, databao_env)
@@ -4626,6 +4949,7 @@ def run_databao_task(
     finalizer_mode: str | None = None,
 ) -> DatabaoTaskArtifacts:
     started_at = perf_counter()
+    deadline_at = _deadline_from_start(started_at)
     task_output_dir = output_root / task.task_id
     prediction_csv_path = task_output_dir / "prediction.csv"
     log_path = logs_dir / f"{task.task_id}.json"
@@ -4633,14 +4957,235 @@ def run_databao_task(
     candidate_source: str | None = None
     structured_planner_report: StructuredPlannerReport | None = None
     finalization_report: AnswerFinalizationReport | None = None
-    postprocess_report: DeterministicPostprocessReport | None = None
+    postprocess_report_payload: dict[str, Any] | None = None
     route_policy: RouteDecision | None = None
+    answer_contract: AnswerContract | None = None
+    answer_contract_report: AnswerContractReport | None = None
+    retrieved_context: RetrievedContext | None = None
+    complexity_profile: TaskComplexityProfile | None = None
+    ranking_report: CandidateRankingReport | None = None
+    final_guard_report: FinalAnswerShapeReport | None = None
+    planner_skipped_reason: str | None = None
+    effective_heuristic_level = _heuristic_level()
+    enabled_strategies: list[dict[str, Any]] = []
+    applied_strategies: list[dict[str, Any]] = []
+    document_extraction_used = False
+    candidates: list[Candidate] = []
     diagnostics = TaskDiagnostics(task=task, logs_dir=logs_dir, databao_env=databao_env)
     diagnostics_token = _CURRENT_DIAGNOSTICS.set(diagnostics)
+
+    def timeout_budget_payload() -> dict[str, Any]:
+        timeout_seconds = _env_int(DATABAO_TASK_TIMEOUT_SECONDS_ENV, 0)
+        return {
+            "task_timeout_seconds": timeout_seconds or None,
+            "deadline_enabled": deadline_at is not None,
+            "remaining_seconds": (
+                round(_remaining_seconds(deadline_at) or 0.0, 3)
+                if deadline_at is not None
+                else None
+            ),
+            "planner_min_remaining_seconds": MIN_SECONDS_FOR_PLANNER,
+        }
+
+    def candidate_payloads() -> list[dict[str, Any]]:
+        return [candidate.to_dict() for candidate in candidates]
+
+    def candidate_score_payloads() -> list[dict[str, Any]]:
+        if ranking_report is None:
+            return []
+        return [score.to_dict() for score in ranking_report.candidate_scores]
+
+    def record_candidate(candidate: Candidate | None) -> Candidate | None:
+        if candidate is None:
+            return None
+        if answer_contract is None:
+            candidates.append(candidate)
+            return candidate
+        enriched = _candidate_with_contract(candidate, answer_contract)
+        candidates.append(enriched)
+        return enriched
+
+    def build_candidate_from_frame(
+        frame: pd.DataFrame,
+        *,
+        source: str,
+        confidence: float,
+        diagnostics_payload: dict[str, Any],
+        transformations: tuple[dict[str, Any], ...] = (),
+        elapsed_seconds: float | None = None,
+    ) -> Candidate | None:
+        return _candidate_from_frame(
+            frame,
+            source=source,
+            confidence=confidence,
+            diagnostics=diagnostics_payload,
+            transformations=transformations,
+            retrieval_context_used=retrieved_context.to_dict() if retrieved_context is not None else None,
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    def add_postprocessed_candidate(candidate: Candidate) -> None:
+        nonlocal postprocess_report_payload
+        try:
+            with diagnostics.stage(f"postprocess_{candidate.source}"):
+                postprocessed_frame, report = answer_postprocessor(task, candidate.frame)
+                if not isinstance(postprocessed_frame, pd.DataFrame):
+                    raise TypeError("Answer postprocessor did not return a dataframe.")
+        except Exception as exc:  # noqa: BLE001
+            report = DeterministicPostprocessReport(
+                applied=False,
+                transformations=[],
+                failure_reason=_safe_exception_summary(exc, (databao_env.model_api_key,)),
+                input_row_count=len(candidate.frame),
+                input_column_count=len(candidate.frame.columns),
+                output_row_count=len(candidate.frame),
+                output_column_count=len(candidate.frame.columns),
+            )
+            candidate.diagnostics.setdefault("postprocess_error", report.failure_reason)
+            return
+
+        if not report.applied and postprocessed_frame.equals(candidate.frame):
+            return
+
+        postprocess_report_payload = report.to_dict()
+        for transform in report.transformations:
+            applied_strategies.append(
+                {
+                    "strategy_name": str(transform.get("kind", "postprocess")),
+                    "strategy_kind": "generic",
+                    "result": transform,
+                    "applied_to_final_answer": False,
+                }
+            )
+        postprocessed_candidate = build_candidate_from_frame(
+            postprocessed_frame,
+            source=f"{candidate.source}_postprocessed",
+            confidence=min(candidate.confidence + 0.08, 1.0),
+            diagnostics_payload={"postprocess_report": report.to_dict()},
+            transformations=tuple(report.transformations),
+            elapsed_seconds=None,
+        )
+        record_candidate(postprocessed_candidate)
+
+    def run_structured_planner_candidate(source_name: str) -> None:
+        nonlocal structured_planner_report, planner_skipped_reason
+        retrieved_token = _CURRENT_RETRIEVED_CONTEXT.set(retrieved_context)
+        try:
+            planner_frame, structured_planner_report = _try_structured_planner_candidate(
+                task,
+                databao_env,
+                structured_planner,
+                diagnostics,
+                deadline_at=deadline_at,
+            )
+        finally:
+            _CURRENT_RETRIEVED_CONTEXT.reset(retrieved_token)
+        if structured_planner_report is not None and not structured_planner_report.attempted:
+            planner_skipped_reason = structured_planner_report.failure_reason
+        if planner_frame is None:
+            return
+        planner_candidate = record_candidate(
+            build_candidate_from_frame(
+                planner_frame,
+                source=source_name,
+                confidence=0.75,
+                diagnostics_payload={
+                    "structured_planner": structured_planner_report.to_dict()
+                    if structured_planner_report
+                    else None,
+                },
+                elapsed_seconds=(
+                    sum(
+                        float(detail.get("elapsed_seconds", 0.0) or 0.0)
+                        for detail in structured_planner_report.attempt_details
+                    )
+                    if structured_planner_report
+                    else None
+                ),
+            )
+        )
+        if planner_candidate is not None:
+            add_postprocessed_candidate(planner_candidate)
+
+    def add_verifier_candidates(base_candidate: Candidate) -> None:
+        for verifier_frame, transforms, confidence in generate_verifier_candidate_frames(task, base_candidate.frame):
+            verifier_candidate = record_candidate(
+                build_candidate_from_frame(
+                    verifier_frame,
+                    source=f"{base_candidate.source}_verifier",
+                    confidence=confidence,
+                    diagnostics_payload={"verifier_transforms": transforms},
+                    transformations=tuple(transforms),
+                )
+            )
+            if verifier_candidate is not None:
+                applied_strategies.extend(
+                    {
+                        "strategy_name": str(transform.get("kind", "verifier")),
+                        "strategy_kind": "generic",
+                        "result": transform,
+                        "applied_to_final_answer": False,
+                    }
+                    for transform in transforms
+                )
+
+    def write_candidate_prediction(candidate: Candidate, *, stage: str) -> tuple[pd.DataFrame, FinalAnswerShapeReport]:
+        guarded_frame, guard_report = final_answer_shape_guard(
+            task=task,
+            frame=candidate.frame,
+            contract=answer_contract,
+            candidate_source=candidate.source,
+        )
+        _write_prediction_csv(guarded_frame, prediction_csv_path)
+        diagnostics.add_timing(f"{stage}_prediction_write", 0.0)
+        return guarded_frame, guard_report
 
     try:
         effective_structured_planner_mode = _structured_planner_mode(structured_planner_mode)
         effective_finalizer_mode = _finalizer_mode(finalizer_mode)
+        effective_heuristic_level = _heuristic_level()
+        enabled_strategies = [
+            {
+                "strategy_name": "generic_document_tables",
+                "strategy_kind": "generic",
+                "enabled_by": effective_heuristic_level,
+            },
+            {
+                "strategy_name": "answer_contract",
+                "strategy_kind": "generic",
+                "enabled_by": "generic",
+            },
+            {
+                "strategy_name": "query_context_retriever",
+                "strategy_kind": "generic",
+                "enabled_by": "generic",
+            },
+            {
+                "strategy_name": "candidate_ranker",
+                "strategy_kind": "generic",
+                "enabled_by": "generic",
+            },
+            {
+                "strategy_name": "complexity_profile",
+                "strategy_kind": "generic",
+                "enabled_by": "generic",
+            },
+            {
+                "strategy_name": "final_answer_shape_guard",
+                "strategy_kind": "generic",
+                "enabled_by": "generic",
+            },
+            {
+                "strategy_name": "structured_planner",
+                "strategy_kind": "generic",
+                "enabled_by": effective_structured_planner_mode,
+            },
+            {
+                "strategy_name": "deterministic_postprocess",
+                "strategy_kind": "generic",
+                "enabled_by": "generic",
+            },
+        ]
 
         class _SummaryDomain:
             def add_db(self, *args, **kwargs):
@@ -4653,51 +5198,91 @@ def run_databao_task(
                 del args, kwargs
 
         with diagnostics.stage("context_load"):
-            context_summary = register_context_sources(_SummaryDomain(), task.context_dir)
-            task_context = build_task_context(task, context_summary=context_summary)
+            context_summary = register_context_sources(
+                _SummaryDomain(),
+                task.context_dir,
+                heuristic_level=effective_heuristic_level,
+            )
+            task_context = build_task_context(
+                task,
+                context_summary=context_summary,
+                heuristic_level=effective_heuristic_level,
+            )
             task_intent = infer_task_intent(task_context)
+            answer_contract = infer_answer_contract(task_context, task_intent)
+            retrieved_context = query_context_retriever(task_context, task.question)
+            for strategy in context_summary.get("document_materialized_tables", []):
+                document_extraction_used = document_extraction_used or int(strategy.get("rows", 0) or 0) > 0
+                applied_strategies.append(
+                    {
+                        "strategy_name": strategy.get("strategy_name", "generic_document_tables"),
+                        "strategy_kind": strategy.get("strategy_kind", "generic"),
+                        "enabled_by": strategy.get("enabled_by", effective_heuristic_level),
+                        "input_document": strategy.get("path"),
+                        "extracted_row_count": strategy.get("rows"),
+                        "extracted_columns": strategy.get("extracted_columns") or strategy.get("columns"),
+                        "confidence": strategy.get("confidence"),
+                        "applied_to_final_answer": False,
+                    }
+                )
+            applied_strategies.append(
+                {
+                    "strategy_name": "query_context_retriever",
+                    "strategy_kind": "generic",
+                    "selected_table_count": len(retrieved_context.relevant_tables),
+                    "document_snippet_count": len(retrieved_context.document_snippets),
+                    "applied_to_final_answer": False,
+                }
+            )
 
         with _openai_api_key_from_model_env(databao_env):
-            frame: pd.DataFrame | None = None
             route_policy = choose_route_policy(
                 task_context,
                 task_intent,
                 structured_planner_mode=effective_structured_planner_mode,
             )
+            applied_strategies.append(
+                {
+                    "strategy_name": "route_policy",
+                    "strategy_kind": "generic",
+                    "planner_route": route_policy.route,
+                    "reason": route_policy.reason,
+                    "confidence": route_policy.confidence,
+                }
+            )
             if route_policy.candidate is not None:
-                frame = route_policy.candidate.frame
-                candidate_source = route_policy.candidate.source
+                record_candidate(route_policy.candidate)
                 structured_planner_report = _structured_report_from_candidate(route_policy.candidate)
-            elif effective_structured_planner_mode == "first":
-                planner_frame, structured_planner_report = _try_structured_planner_candidate(
-                    task,
-                    databao_env,
-                    structured_planner,
-                    diagnostics,
-                )
-                if planner_frame is not None:
-                    frame = planner_frame
-                    candidate_source = "structured_planner"
-            elif effective_structured_planner_mode == "off":
+
+            if effective_structured_planner_mode == "off":
                 structured_planner_report = _skipped_structured_planner_report(
                     "Structured planner disabled by DATABAO_STRUCTURED_PLANNER_MODE=off."
                 )
 
-            if frame is None:
+            if not candidates:
+                databao_started_at = perf_counter()
+                retrieved_token = _CURRENT_RETRIEVED_CONTEXT.set(retrieved_context)
                 try:
-                    frame = _ask_databao_candidate(task, databao_env, agent_builder, diagnostics)
-                    candidate_source = "databao"
+                    databao_frame = _ask_databao_candidate(task, databao_env, agent_builder, diagnostics)
                 except Exception as exc:
                     databao_failure_reason = _safe_exception_summary(exc, (databao_env.model_api_key,))
-                    if effective_structured_planner_mode != "fallback":
-                        raise
-                    planner_frame, structured_planner_report = _try_structured_planner_candidate(
-                        task,
-                        databao_env,
-                        structured_planner,
-                        diagnostics,
+                    complexity_profile = build_complexity_profile(
+                        task_context,
+                        retrieved_context,
+                        best_candidate=None,
                     )
-                    if planner_frame is None:
+                    if effective_structured_planner_mode != "off" and should_run_planner_rescue(
+                        complexity_profile,
+                        _remaining_seconds(deadline_at),
+                        None,
+                    ):
+                        run_structured_planner_candidate("structured_planner_rescue")
+                    else:
+                        planner_skipped_reason = (
+                            "Structured planner rescue skipped after Databao failure because "
+                            "feature-based complexity/uncertainty/budget gates were not met."
+                        )
+                    if not candidates:
                         planner_failure_reason = (
                             structured_planner_report.failure_reason
                             if structured_planner_report is not None
@@ -4707,26 +5292,143 @@ def run_databao_task(
                             "Databao failed and structured planner fallback did not produce a dataframe. "
                             f"Databao: {databao_failure_reason}; planner: {planner_failure_reason}"
                         ) from exc
-                    frame = planner_frame
-                    candidate_source = "structured_planner_fallback"
+                finally:
+                    _CURRENT_RETRIEVED_CONTEXT.reset(retrieved_token)
+                if "databao_frame" in locals():
+                    databao_candidate = record_candidate(
+                        build_candidate_from_frame(
+                            databao_frame,
+                            source="databao_raw",
+                            confidence=0.55,
+                            diagnostics_payload={"stage": "databao_ask"},
+                            elapsed_seconds=round(perf_counter() - databao_started_at, 3),
+                        )
+                    )
+                    if databao_candidate is not None:
+                        add_postprocessed_candidate(databao_candidate)
+                        selected_candidate, ranking_report = rank_candidates(
+                            candidates=candidates,
+                            contract=answer_contract,
+                            question=task.question,
+                            retrieved_context=retrieved_context,
+                        )
+                        if selected_candidate is not None:
+                            with diagnostics.stage("provisional_csv_write"):
+                                _, provisional_guard_report = write_candidate_prediction(
+                                    selected_candidate,
+                                    stage="provisional",
+                                )
+                            final_guard_report = provisional_guard_report
+                            add_verifier_candidates(selected_candidate)
 
-            if effective_structured_planner_mode == "fallback" and structured_planner_report is None:
-                structured_planner_report = _skipped_structured_planner_report(
-                    "Databao returned a dataframe; structured planner fallback was not needed."
+            selected_candidate, ranking_report = rank_candidates(
+                candidates=candidates,
+                contract=answer_contract,
+                question=task.question,
+                retrieved_context=retrieved_context,
+            )
+            complexity_profile = build_complexity_profile(
+                task_context,
+                retrieved_context,
+                best_candidate=selected_candidate,
+            )
+            rescue_allowed = should_run_planner_rescue(
+                complexity_profile,
+                _remaining_seconds(deadline_at),
+                selected_candidate,
+            )
+            if (
+                not rescue_allowed
+                and planner_skipped_reason is None
+                and effective_structured_planner_mode != "off"
+                and complexity_profile.uncertainty_score >= 30
+                and complexity_profile.complexity_score >= 45
+            ):
+                remaining = _remaining_seconds(deadline_at)
+                if remaining is not None and remaining <= 90:
+                    planner_skipped_reason = (
+                        "Structured planner rescue skipped because remaining task budget "
+                        f"({remaining:.1f}s) is below 90s."
+                    )
+                elif not complexity_profile.planner_payload_within_limit:
+                    planner_skipped_reason = "Structured planner rescue skipped because planner payload is too large."
+                else:
+                    planner_skipped_reason = "Structured planner rescue skipped by feature-based gates."
+            if (
+                effective_structured_planner_mode != "off"
+                and (
+                    structured_planner_report is None
+                    or not structured_planner_report.attempted
+                    or structured_planner_report.failure_reason == "Databao returned a dataframe; structured planner fallback was not needed."
+                )
+                and rescue_allowed
+            ):
+                run_structured_planner_candidate("structured_planner_rescue")
+                selected_candidate, ranking_report = rank_candidates(
+                    candidates=candidates,
+                    contract=answer_contract,
+                    question=task.question,
+                    retrieved_context=retrieved_context,
                 )
 
-            if candidate_source is None:
-                candidate_source = "structured_planner"
+            if effective_structured_planner_mode != "off" and structured_planner_report is None:
+                if planner_skipped_reason is None:
+                    planner_skipped_reason = (
+                        "Structured planner skipped because feature-based rescue was not needed."
+                    )
+                structured_planner_report = _skipped_structured_planner_report(
+                    planner_skipped_reason
+                )
 
-        if frame is None:
-            raise ValueError("Databao did not return a dataframe.")
+        selected_candidate, ranking_report = rank_candidates(
+            candidates=candidates,
+            contract=answer_contract,
+            question=task.question,
+            retrieved_context=retrieved_context,
+        )
+        if selected_candidate is None:
+            raise ValueError("No candidate dataframe was produced.")
+
+        candidate_source = selected_candidate.source
+        frame = selected_candidate.frame
+        with diagnostics.stage("answer_contract"):
+            answer_contract_report = validate_answer_contract(
+                answer_contract,
+                frame,
+                candidate_source=candidate_source,
+            )
+            applied_strategies.append(
+                {
+                    "strategy_name": "answer_contract",
+                    "strategy_kind": "generic",
+                    "result": answer_contract_report.to_dict(),
+                    "applied_to_final_answer": answer_contract_report.valid,
+                }
+            )
+
         if effective_finalizer_mode == "always":
             try:
                 with diagnostics.stage("finalizer"):
                     finalized_frame, finalization_report = answer_finalizer(task, frame, databao_env)
                     if not isinstance(finalized_frame, pd.DataFrame):
                         raise TypeError("Answer finalizer did not return a dataframe.")
-                    frame = finalized_frame
+                    finalized_candidate = record_candidate(
+                        build_candidate_from_frame(
+                            finalized_frame,
+                            source=f"{candidate_source}_finalizer",
+                            confidence=min(selected_candidate.confidence + 0.05, 1.0),
+                            diagnostics_payload={"finalization": finalization_report.to_dict()},
+                        )
+                    )
+                    if finalized_candidate is not None:
+                        selected_candidate, ranking_report = rank_candidates(
+                            candidates=candidates,
+                            contract=answer_contract,
+                            question=task.question,
+                            retrieved_context=retrieved_context,
+                        )
+                        candidate_source = selected_candidate.source if selected_candidate else candidate_source
+                        frame = selected_candidate.frame if selected_candidate else frame
             except Exception as exc:  # noqa: BLE001
                 finalization_report = AnswerFinalizationReport(
                     attempted=True,
@@ -4745,22 +5447,28 @@ def run_databao_task(
                 frame,
                 "Answer finalizer disabled by DATABAO_FINALIZER_MODE=off.",
             )
-        try:
-            with diagnostics.stage("postprocess"):
-                postprocessed_frame, postprocess_report = answer_postprocessor(task, frame)
-                if not isinstance(postprocessed_frame, pd.DataFrame):
-                    raise TypeError("Answer postprocessor did not return a dataframe.")
-                frame = postprocessed_frame
-        except Exception as exc:  # noqa: BLE001
-            postprocess_report = DeterministicPostprocessReport(
-                applied=False,
-                transformations=[],
-                failure_reason=_safe_exception_summary(exc, (databao_env.model_api_key,)),
-                input_row_count=len(frame),
-                input_column_count=len(frame.columns),
-                output_row_count=len(frame),
-                output_column_count=len(frame.columns),
+
+        with diagnostics.stage("final_answer_shape_guard"):
+            frame, final_guard_report = final_answer_shape_guard(
+                task=task,
+                frame=frame,
+                contract=answer_contract,
+                candidate_source=candidate_source,
             )
+            answer_contract_report = validate_answer_contract(
+                answer_contract,
+                frame,
+                candidate_source=candidate_source,
+            )
+            for transform in final_guard_report.transformations:
+                applied_strategies.append(
+                    {
+                        "strategy_name": str(transform.get("kind", "final_answer_shape_guard")),
+                        "strategy_kind": "generic",
+                        "result": transform,
+                        "applied_to_final_answer": True,
+                    }
+                )
         with diagnostics.stage("csv_write"):
             _write_prediction_csv(frame, prediction_csv_path)
 
@@ -4770,15 +5478,30 @@ def run_databao_task(
             log_path,
             task=task,
             succeeded=True,
+            prediction_written=True,
+            scorable=True,
             elapsed_seconds=elapsed_seconds,
             context_summary=context_summary,
             candidate_source=candidate_source,
             structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
             finalization=finalization_report.to_dict() if finalization_report else None,
-            postprocessing=postprocess_report.to_dict() if postprocess_report else None,
+            postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
+            heuristic_level=effective_heuristic_level,
+            enabled_strategies=enabled_strategies,
+            applied_strategies=applied_strategies,
+            document_extraction_used=document_extraction_used,
+            retrieved_context=retrieved_context.to_dict() if retrieved_context else None,
+            complexity_profile=complexity_profile.to_dict() if complexity_profile else None,
+            candidates=candidate_payloads(),
+            candidate_scores=candidate_score_payloads(),
+            selected_candidate_source=candidate_source,
+            final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
+            planner_skipped_reason=planner_skipped_reason,
+            timeout_budget=timeout_budget_payload(),
         )
         return DatabaoTaskArtifacts(
             task_id=task.task_id,
@@ -4786,6 +5509,8 @@ def run_databao_task(
             prediction_csv_path=prediction_csv_path,
             log_path=log_path,
             succeeded=True,
+            prediction_written=True,
+            scorable=True,
             failure_reason=None,
             elapsed_seconds=elapsed_seconds,
             row_count=len(frame),
@@ -4793,10 +5518,19 @@ def run_databao_task(
             candidate_source=candidate_source,
             structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
             finalization=finalization_report.to_dict() if finalization_report else None,
-            postprocessing=postprocess_report.to_dict() if postprocess_report else None,
+            postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
+            heuristic_level=effective_heuristic_level,
+            enabled_strategies=enabled_strategies,
+            applied_strategies=applied_strategies,
+            retrieved_context=retrieved_context.to_dict() if retrieved_context else None,
+            candidates=candidate_payloads(),
+            candidate_scores=candidate_score_payloads(),
+            selected_candidate_source=candidate_source,
+            final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
         )
     except Exception as exc:  # noqa: BLE001
         elapsed_seconds = round(perf_counter() - started_at, 3)
@@ -4806,15 +5540,30 @@ def run_databao_task(
             log_path,
             task=task,
             succeeded=False,
+            prediction_written=_prediction_csv_status(prediction_csv_path)[0],
+            scorable=_prediction_csv_status(prediction_csv_path)[1],
             elapsed_seconds=elapsed_seconds,
             context_summary=context_summary,
             candidate_source=candidate_source,
             structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
             finalization=finalization_report.to_dict() if finalization_report else None,
-            postprocessing=postprocess_report.to_dict() if postprocess_report else None,
+            postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
+            heuristic_level=effective_heuristic_level,
+            enabled_strategies=enabled_strategies,
+            applied_strategies=applied_strategies,
+            document_extraction_used=document_extraction_used,
+            retrieved_context=retrieved_context.to_dict() if retrieved_context else None,
+            complexity_profile=complexity_profile.to_dict() if complexity_profile else None,
+            candidates=candidate_payloads(),
+            candidate_scores=candidate_score_payloads(),
+            selected_candidate_source=candidate_source,
+            final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
+            planner_skipped_reason=planner_skipped_reason,
+            timeout_budget=timeout_budget_payload(),
             failure_reason=failure_reason,
         )
         traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
@@ -4823,21 +5572,36 @@ def run_databao_task(
             encoding="utf-8",
             errors="replace",
         )
+        prediction_written, scorable, predicted_rows, predicted_columns = _prediction_csv_status(prediction_csv_path)
         return DatabaoTaskArtifacts(
             task_id=task.task_id,
             task_output_dir=task_output_dir,
-            prediction_csv_path=None,
+            prediction_csv_path=prediction_csv_path if prediction_written else None,
             log_path=log_path,
             succeeded=False,
+            prediction_written=prediction_written,
+            scorable=scorable,
             failure_reason=failure_reason,
             elapsed_seconds=elapsed_seconds,
+            row_count=predicted_rows,
+            column_count=predicted_columns,
             candidate_source=candidate_source,
             structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
             finalization=finalization_report.to_dict() if finalization_report else None,
-            postprocessing=postprocess_report.to_dict() if postprocess_report else None,
+            postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
+            heuristic_level=effective_heuristic_level,
+            enabled_strategies=enabled_strategies,
+            applied_strategies=applied_strategies,
+            retrieved_context=retrieved_context.to_dict() if retrieved_context else None,
+            complexity_profile=complexity_profile.to_dict() if complexity_profile else None,
+            candidates=candidate_payloads(),
+            candidate_scores=candidate_score_payloads(),
+            selected_candidate_source=candidate_source,
+            final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
         )
     finally:
         _CURRENT_DIAGNOSTICS.reset(diagnostics_token)
@@ -4856,17 +5620,26 @@ def _run_databao_task_child(
     output_root: Path,
     logs_dir: Path,
     databao_env: DatabaoEnvironment,
+    timeout_seconds: int,
     structured_planner_mode: str | None,
     finalizer_mode: str | None,
 ) -> None:
-    artifact = run_databao_task(
-        task=task,
-        output_root=output_root,
-        logs_dir=logs_dir,
-        databao_env=databao_env,
-        structured_planner_mode=structured_planner_mode,
-        finalizer_mode=finalizer_mode,
-    )
+    previous_timeout = os.environ.get(DATABAO_TASK_TIMEOUT_SECONDS_ENV)
+    os.environ[DATABAO_TASK_TIMEOUT_SECONDS_ENV] = str(timeout_seconds)
+    try:
+        artifact = run_databao_task(
+            task=task,
+            output_root=output_root,
+            logs_dir=logs_dir,
+            databao_env=databao_env,
+            structured_planner_mode=structured_planner_mode,
+            finalizer_mode=finalizer_mode,
+        )
+    finally:
+        if previous_timeout is None:
+            os.environ.pop(DATABAO_TASK_TIMEOUT_SECONDS_ENV, None)
+        else:
+            os.environ[DATABAO_TASK_TIMEOUT_SECONDS_ENV] = previous_timeout
     result_queue.put(artifact)
 
 
@@ -4884,7 +5657,16 @@ def _run_databao_task_with_timeout(
     result_queue = context.Queue(maxsize=1)
     process = context.Process(
         target=_run_databao_task_child,
-        args=(result_queue, task, output_root, logs_dir, databao_env, structured_planner_mode, finalizer_mode),
+        args=(
+            result_queue,
+            task,
+            output_root,
+            logs_dir,
+            databao_env,
+            timeout_seconds,
+            structured_planner_mode,
+            finalizer_mode,
+        ),
         daemon=True,
     )
     started_at = perf_counter()
@@ -4911,10 +5693,14 @@ def _run_databao_task_with_timeout(
     except queue.Empty:
         failure_reason = f"RuntimeError: task process exited with code {process.exitcode} without an artifact."
         elapsed_seconds = round(elapsed_seconds, 3)
+        prediction_path = output_root / task.task_id / "prediction.csv"
+        prediction_written, scorable, row_count, column_count = _prediction_csv_status(prediction_path)
         _write_task_log(
             logs_dir / f"{task.task_id}.json",
             task=task,
             succeeded=False,
+            prediction_written=prediction_written,
+            scorable=scorable,
             elapsed_seconds=elapsed_seconds,
             timings={"total": elapsed_seconds},
             failure_reason=failure_reason,
@@ -4922,11 +5708,15 @@ def _run_databao_task_with_timeout(
         return DatabaoTaskArtifacts(
             task_id=task.task_id,
             task_output_dir=output_root / task.task_id,
-            prediction_csv_path=None,
+            prediction_csv_path=prediction_path if prediction_written else None,
             log_path=logs_dir / f"{task.task_id}.json",
             succeeded=False,
+            prediction_written=prediction_written,
+            scorable=scorable,
             failure_reason=failure_reason,
             elapsed_seconds=elapsed_seconds,
+            row_count=row_count,
+            column_count=column_count,
             timings={"total": elapsed_seconds},
         )
 
@@ -4953,6 +5743,7 @@ def run_databao_tasks(
     logs_dir: Path,
     limit: int | None = None,
     task_ids: list[str] | None = None,
+    difficulty: str | None = None,
     task_timeout_seconds: int | None = None,
     databao_env: DatabaoEnvironment | None = None,
     agent_builder: AgentBuilder = build_databao_agent,
@@ -4964,7 +5755,7 @@ def run_databao_tasks(
 ) -> list[DatabaoTaskArtifacts]:
     effective_env = databao_env or load_databao_environment()
     dataset = DABenchPublicDataset(input_root)
-    tasks = dataset.iter_tasks(task_ids=task_ids)
+    tasks = dataset.iter_tasks(task_ids=task_ids, difficulty=difficulty)
     if limit is not None:
         tasks = tasks[:limit]
 
@@ -5006,11 +5797,20 @@ def run_databao_tasks(
         artifacts.append(artifact)
 
     summary_path = output_root / "summary.json"
+    attempted_task_count = len(artifacts)
+    succeeded_task_count = sum(1 for artifact in artifacts if artifact.succeeded)
+    prediction_written_count = sum(1 for artifact in artifacts if artifact.prediction_written)
+    scorable_task_count = sum(1 for artifact in artifacts if artifact.scorable)
     summary_path.write_text(
         json.dumps(
             {
-                "task_count": len(artifacts),
-                "succeeded_task_count": sum(1 for artifact in artifacts if artifact.succeeded),
+                "task_count": attempted_task_count,
+                "attempted_task_count": attempted_task_count,
+                "succeeded_task_count": succeeded_task_count,
+                "failed_task_count": attempted_task_count - succeeded_task_count,
+                "prediction_written_count": prediction_written_count,
+                "scorable_task_count": scorable_task_count,
+                "missing_prediction_count": attempted_task_count - prediction_written_count,
                 "tasks": [artifact.to_dict() for artifact in artifacts],
             },
             ensure_ascii=False,
