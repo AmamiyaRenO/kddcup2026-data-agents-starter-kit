@@ -1,225 +1,261 @@
 <div align="center">
 
-# DataAgent-Bench Starter Kit
-
-English | [中文](README.zh.md)
-
-[![Official Website](https://img.shields.io/badge/Official%20Website-Visit%20dataagent.top-0ea5e9?style=for-the-badge&logo=googlechrome&logoColor=white&labelColor=0f172a)](https://dataagent.top)
-[![Demo Dataset](https://img.shields.io/badge/Demo%20Dataset-Download%20Phase%201-f59e0b?style=for-the-badge&logo=googledrive&logoColor=white&labelColor=0f172a)](https://drive.google.com/file/d/1c6u5WlFw4KV7CBRyXh5BvFYbKqxhBSbL/view)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=0f172a)](https://discord.com/invite/7eFwJQN3Fx)
+# Databao 链路运行说明
 
 </div>
 
-> Official starter kit for the KDD Cup 2026 DataAgent-Bench challenge. The repository reads tasks from `data/public/input/` and writes predictions for downstream evaluation.
+> 本仓库当前主要维护 `src/data_agent_baseline/run/databao_demo.py` 这一条 Databao-backed demo 链路。它读取 DataAgent-Bench public demo 输入，调用 Databao 生成候选答案表，再经过通用后处理、答案形状约束和本地 evaluator 产出可检查的运行结果。
 
-## Overview
+## 适用范围
 
-| Item | Value |
-| --- | --- |
-| Dataset input | `data/public/input/` |
-| Public demo ground truth | `data/public/output/task_<id>/gold.csv` |
-| Hidden test data | `input/` only, no `output/` |
-| Entry command | `uv run dabench <command> --config PATH` |
-| Default run output | `artifacts/runs/` |
+这份说明面向本地 Databao 链路调试，不是原始 ReAct baseline 的使用文档。常用入口是：
 
-## Quick Start
+```powershell
+uv run dabench run-databao-demo --config configs/react_baseline.local.yaml
+```
 
-1. Install `uv` by following the official guide:
-   - https://docs.astral.sh/uv/getting-started/installation/
-2. On macOS and Linux, the standalone installer is:
+当前链路默认读取：
 
-   ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-   ```
+- 输入数据：`data/public/input/`
+- public gold：`data/public/output/task_<id>/gold.csv`
+- 本地配置：`configs/react_baseline.local.yaml`
+- 输出目录：`artifacts/databao-demo/<run_id>/`
+- 核心实现：`src/data_agent_baseline/run/databao_demo.py`
 
-3. Install project dependencies:
+## 运行前准备
 
-   ```bash
-   uv sync
-   ```
+在 Windows PowerShell 中，建议先设置本机 `uv` 路径和缓存目录：
 
-4. Confirm the dataset root is visible:
+```powershell
+$env:Path = "C:\Users\tianj\.local\bin;$env:Path"
+$env:UV_CACHE_DIR = "D:\Data\.uv-cache"
+```
 
-   ```bash
-   uv run dabench status --config configs/react_baseline.example.yaml
-   ```
+安装或同步依赖：
 
-5. Run the baseline:
+```powershell
+uv sync --extra dev
+```
 
-   ```bash
-   uv run dabench run-benchmark --config configs/react_baseline.example.yaml
-   ```
+Databao/OpenAI-compatible 模型配置通过环境变量传入，不要把真实 key 写入配置文件：
 
-## Dataset
+```powershell
+$env:MODEL_API_URL = "https://openrouter.ai/api/v1"
+$env:MODEL_API_KEY = $env:Open_Router_Key
+$env:MODEL_NAME = "qwen/qwen3.5-35b-a3b"
+```
 
-The public demo dataset lives under `data/public/input/`. Each task directory follows this structure:
+建议的超时设置：
+
+```powershell
+$env:DATABAO_DATABAO_TIMEOUT_SECONDS = "60"
+$env:DATABAO_AUX_TIMEOUT_SECONDS = "30"
+```
+
+## 推荐运行方式
+
+### 单任务 smoke test
+
+```powershell
+uv run dabench run-databao-demo `
+  --config configs/react_baseline.local.yaml `
+  --task-id task_25 `
+  --task-timeout-seconds 150
+```
+
+### 按难度运行
+
+```powershell
+uv run dabench run-databao-demo `
+  --config configs/react_baseline.local.yaml `
+  --difficulty easy `
+  --task-timeout-seconds 150
+
+uv run dabench run-databao-demo `
+  --config configs/react_baseline.local.yaml `
+  --difficulty medium `
+  --task-timeout-seconds 150
+
+uv run dabench run-databao-demo `
+  --config configs/react_baseline.local.yaml `
+  --difficulty hard `
+  --task-timeout-seconds 150
+```
+
+### 限制任务数量
+
+```powershell
+uv run dabench run-databao-demo `
+  --config configs/react_baseline.local.yaml `
+  --difficulty easy `
+  --limit 5
+```
+
+## 关键开关
+
+### Structured planner
+
+`DATABAO_STRUCTURED_PLANNER_MODE` 控制安全 JSON planner 是否参与 rescue：
+
+- `fallback`：默认模式。Databao 先跑，只有在门控认为需要 rescue 且预算足够时才尝试 planner。
+- `off`：完全关闭 planner。适合排查 Databao 原始输出、避免 planner 长尾超时。
+- `first`：兼容旧实验入口，不建议作为默认评测模式。
+
+关闭 planner：
+
+```powershell
+$env:DATABAO_STRUCTURED_PLANNER_MODE = "off"
+```
+
+注意：CLI 目前打印的 `Planner mode: fallback` 是展示值；若命令没有显式传 `--planner-mode`，实际执行仍会读取环境变量。要确认是否生效，请看任务日志里的 `structured_planner.attempted` 和 `failure_reason`。关闭成功时通常会看到：
 
 ```text
-data/public/input/task_<id>/
-├── task.json
-└── context/
+Structured planner disabled by DATABAO_STRUCTURED_PLANNER_MODE=off.
 ```
 
-The corresponding public demo answers live separately under `data/public/output/task_<id>/gold.csv`.
-Hidden test sets only include `input/`, so there is no `output/` directory there.
+### Finalizer
 
-`task.json` contains:
+`DATABAO_FINALIZER_MODE` 控制额外 LLM finalizer：
 
-- `task_id`
-- `difficulty`
-- `question`
+- `off`：默认关闭。
+- `always`：总是尝试 finalizer，会增加延迟和漂移风险。
 
-The `context/` directory may contain one or more of:
-
-- CSV files
-- JSON files
-- SQLite / DB files
-- Text documents
-
-## Configuration
-
-An example config file lives at `configs/react_baseline.example.yaml`.
-
-```yaml
-dataset:
-  root_path: data/public/input
-
-agent:
-  model: YOUR_MODEL_NAME
-  api_base: YOUR_API_BASE_URL
-  api_key: YOUR_API_KEY
-  max_steps: 16
-  temperature: 0.0
-
-run:
-  output_dir: artifacts/runs
-  run_id:
-  max_workers: 4
-  task_timeout_seconds: 600
+```powershell
+$env:DATABAO_FINALIZER_MODE = "off"
 ```
 
-Config fields:
+### Heuristic level
 
-| Field | Meaning |
-| --- | --- |
-| `dataset.root_path` | Root directory of the public demo `input/` dataset. Relative paths are resolved from the project root. |
-| `agent.model` | Model name. |
-| `agent.api_base` | OpenAI-compatible API base URL. |
-| `agent.api_key` | API key, read directly from the config file. |
-| `agent.max_steps` | Maximum ReAct steps per task. |
-| `agent.temperature` | Sampling temperature. |
-| `run.output_dir` | Output directory for run artifacts. |
-| `run.run_id` | Optional run directory name. Defaults to a UTC timestamp if omitted. Must be a single directory name; existing run directories are rejected. |
-| `run.max_workers` | Parallel worker count for `run-benchmark`. |
-| `run.task_timeout_seconds` | Maximum wall-clock time per task. Set to `0` or a negative value to disable the task-level timeout. |
+`DATABAO_HEURISTIC_LEVEL` 控制通用启发式强度：
 
-## CLI
+- `generic`：默认。只使用通用 schema、document records、answer contract、verifier、candidate ranking 和 final shape guard。
+- `experimental_generic`：允许更激进的通用文本记录抽取，但仍不能引入 public set 的领域记忆或 task-id 分支。
 
-```bash
-uv run dabench <command> --config PATH [options]
+```powershell
+$env:DATABAO_HEURISTIC_LEVEL = "generic"
 ```
 
-| Command | Purpose | Example |
-| --- | --- | --- |
-| `status` | Show project paths, config path, dataset root, and public task counts. | `uv run dabench status --config configs/react_baseline.example.yaml` |
-| `inspect-task` | Show task metadata and list accessible files under `context/`. | `uv run dabench inspect-task task_1 --config configs/react_baseline.local.yaml` |
-| `run-task` | Run the baseline on one task and write outputs. | `uv run dabench run-task task_1 --config configs/react_baseline.local.yaml` |
-| `run-benchmark` | Run the baseline across the public dataset. | `uv run dabench run-benchmark --config configs/react_baseline.local.yaml` |
+## Databao 链路流程
 
-`run-benchmark` also supports `--limit N` to cap the number of tasks.
+单个任务大致按以下步骤执行：
 
-## Tools
+1. 读取 `task.json` 和 `context/`。
+2. 加载 CSV、JSON、SQLite/DB、Markdown 文档为通用上下文表。
+3. 构建 schema graph，记录表、列、样例值和候选 join 关系。
+4. 运行通用 context retriever，给相关表、列、样例、文档片段和 join path 打分。
+5. 从问题和 schema 推断 `AnswerContract`。
+6. 注册上下文给 Databao，调用 Databao 生成原始候选 DataFrame。
+7. 生成候选答案：`databao_raw`、通用后处理候选、verifier 候选，必要时再考虑 planner rescue。
+8. 用通用 ranker 选择最合适候选。
+9. 运行 final answer shape guard，剪掉明显不该输出的调试列、元数据列和弱相关列。
+10. 写出 `prediction.csv`、任务日志、进度日志和 `summary.json`。
 
-The baseline exposes these tools to the model:
+## 输出文件
 
-| Tool | Purpose | Inputs |
-| --- | --- | --- |
-| `list_context` | List files and directories under `context/`. | `max_depth` |
-| `read_csv` | Read a CSV preview. | `path`, `max_rows` |
-| `read_json` | Read a JSON preview. | `path`, `max_chars` |
-| `read_doc` | Read a text document preview. | `path`, `max_chars` |
-| `inspect_sqlite_schema` | Inspect tables in a SQLite / DB file. | `path` |
-| `execute_context_sql` | Execute read-only SQL against a SQLite / DB file in `context/`. | `path`, `sql`, `limit` |
-| `execute_python` | Execute arbitrary Python code inside the task `context/` directory. | `code` |
-| `answer` | Submit the final answer table and terminate the task. | `columns`, `rows` |
-
-All file paths passed to tools must be relative to the task `context/` directory.
-
-## Outputs
-
-Each successful task run may produce:
-
-- `trace.json`
-- `prediction.csv`
-
-Per-task outputs are written to:
+每次 `run-databao-demo` 会写到：
 
 ```text
-artifacts/runs/<run_id>/<task_id>/
-├── trace.json
-└── prediction.csv
+artifacts/databao-demo/<run_id>/
+├── summary.json
+├── logs/
+│   ├── task_<id>.json
+│   └── task_<id>.progress.json
+└── task_<id>/
+    └── prediction.csv
 ```
 
-Benchmark runs also write:
+重点看这些字段：
 
-```text
-artifacts/runs/<run_id>/summary.json
+- `prediction_written`：是否实际写出了 `prediction.csv`。
+- `scorable`：是否可以被 public evaluator 评分。
+- `succeeded`：内部 pipeline 是否成功结束。它和 `prediction_written` 不完全等价。
+- `candidate_source`：最终选择的候选来源，例如 `databao_raw`、`databao_raw_postprocessed`。
+- `candidate_scores`：候选排序原因。
+- `postprocessing`：后处理和 final shape guard 做过哪些变换。
+- `structured_planner`：planner 是否尝试、跳过或被关闭。
+- `timings`：各阶段耗时。
+
+## 本地评估
+
+对某个 run 进行 public demo 评估：
+
+```powershell
+uv run dabench evaluate-public-run artifacts/databao-demo/<run_id>
 ```
 
-## Contact
+评估输出包含：
 
-- Open issues: https://github.com/HKUSTDial/kddcup2026-data-agents-starter-kit/issues
-- Official website: https://dataagent.top
-- Discord: https://discord.com/invite/7eFwJQN3Fx
-- WeChat official account: `数据智能与分析实验室 DIAL`
+- `PER_TASK_AVERAGE_SCORE`
+- `OVERALL_COLUMN_COVERAGE`
+- `EXACT_NO_EXTRA_TASKS`
+- `PREDICTION_WRITTEN`
+- `SCORABLE_TASKS`
 
-<div align="center">
-  <table>
-    <tr>
-      <td align="center">
-        <a href="https://dataagent.top">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://dataagent.top&bgcolor=ffffff&color=111827&margin=8"
-            alt="Official website QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Official Website
-      </td>
-      <td align="center">
-        <a href="https://discord.com/invite/7eFwJQN3Fx">
-          <img
-            src="https://api.qrserver.com/v1/create-qr-code/?size=144x144&data=https://discord.com/invite/7eFwJQN3Fx&bgcolor=ffffff&color=111827&margin=8"
-            alt="Discord QR code"
-            width="144"
-          />
-        </a>
-        <br />
-        Discord
-      </td>
-      <td align="center">
-        <img
-          src="https://dataagent.top/HKUSTGZ_DIAL.jpg"
-          alt="WeChat official account QR code"
-          width="144"
-        />
-        <br />
-        WeChat Official Account
-      </td>
-    </tr>
-  </table>
-</div>
+常见不 exact 原因：
 
-## Main Modules
+- `matched=0/N`：预测列签名没有命中 gold，通常是值或语义错。
+- `extra > 0`：输出了 gold 不需要的额外列。
+- `Rows` 不一致：返回过多、过少或空结果。
+- `Pred=no`：没有写出 `prediction.csv`。
+- `Artifact=fail` 但 `Pred=yes`：任务 summary 记录失败，但已有 provisional prediction，可以继续评估。
 
-| Module | Responsibility |
-| --- | --- |
-| `src/data_agent_baseline/benchmark/dataset.py` | Public dataset loader |
-| `src/data_agent_baseline/tools/filesystem.py` | `list_context`, `read_csv`, `read_json`, `read_doc` |
-| `src/data_agent_baseline/tools/python_exec.py` | `execute_python` |
-| `src/data_agent_baseline/tools/sqlite.py` | `inspect_sqlite_schema`, `execute_context_sql` |
-| `src/data_agent_baseline/tools/registry.py` | Tool registration and terminal `answer` |
-| `src/data_agent_baseline/agents/prompt.py` | System prompt, task prompt, observation prompt |
-| `src/data_agent_baseline/agents/react.py` | ReAct runtime with JSON action protocol |
-| `src/data_agent_baseline/run/runner.py` | Single-task and benchmark execution |
+## 本地验证
+
+修改代码后先跑无 API 检查：
+
+```powershell
+uv run python -m unittest discover tests
+uv run --extra dev ruff check src tests
+uv run python -m compileall src
+```
+
+当前测试重点覆盖：
+
+- Databao 环境变量加载。
+- 上下文源注册和通用表加载。
+- schema graph 和 join candidate 构建。
+- 通用后处理、答案列校验、比例/百分比 verifier。
+- planner 关闭、跳过和 rescue 行为。
+- timeout 后是否保留已写出的 provisional prediction。
+- public evaluator 的列签名评分。
+
+## 调试建议
+
+1. 先用 `--task-id` 复现单个失败任务。
+2. 看 `logs/task_<id>.json`，确认 `candidate_source`、`candidate_scores` 和 `postprocessing`。
+3. 如果 `prediction.csv` 已写出但 summary 是失败，优先检查 `timings` 和 timeout artifact 是否覆盖了最终状态。
+4. 如果 `matched=0/N`，打开 `prediction.csv` 和 gold 比较值，而不是只看列名。
+5. 如果只有 extra columns，优先改 final shape guard 或 answer column verifier。
+6. 如果行数差很多，优先看 Databao 原始候选和 verifier/ranker 是否有足够证据做行选择。
+7. 避免加入 task-id、文件名、领域实体、public gold 记忆相关分支；生产链路只允许通用策略。
+
+## 常用命令速查
+
+```powershell
+# 环境
+$env:Path = "C:\Users\tianj\.local\bin;$env:Path"
+$env:UV_CACHE_DIR = "D:\Data\.uv-cache"
+$env:MODEL_API_URL = "https://openrouter.ai/api/v1"
+$env:MODEL_API_KEY = $env:Open_Router_Key
+$env:MODEL_NAME = "qwen/qwen3.5-35b-a3b"
+$env:DATABAO_DATABAO_TIMEOUT_SECONDS = "60"
+$env:DATABAO_AUX_TIMEOUT_SECONDS = "30"
+$env:DATABAO_STRUCTURED_PLANNER_MODE = "off"
+$env:DATABAO_FINALIZER_MODE = "off"
+
+# 单任务
+uv run dabench run-databao-demo --config configs/react_baseline.local.yaml --task-id task_25 --task-timeout-seconds 150
+
+# 分难度
+uv run dabench run-databao-demo --config configs/react_baseline.local.yaml --difficulty easy --task-timeout-seconds 150
+uv run dabench run-databao-demo --config configs/react_baseline.local.yaml --difficulty medium --task-timeout-seconds 150
+uv run dabench run-databao-demo --config configs/react_baseline.local.yaml --difficulty hard --task-timeout-seconds 150
+
+# 评估
+uv run dabench evaluate-public-run artifacts/databao-demo/<run_id>
+
+# 无 API 检查
+uv run python -m unittest discover tests
+uv run --extra dev ruff check src tests
+uv run python -m compileall src
+```
