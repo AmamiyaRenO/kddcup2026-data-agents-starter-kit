@@ -363,8 +363,13 @@ def evaluate_public_run_command(
     table.add_column("Extra")
     table.add_column("Rows")
     table.add_column("Cols")
+    table.add_column("Source")
+    table.add_column("GuardRm")
+    table.add_column("Post")
     table.add_column("Exact")
     for task in evaluation.tasks:
+        removed_columns = ",".join(task.final_guard_removed_columns)
+        postprocess = ",".join(task.postprocess_transformations)
         table.add_row(
             task.task_id,
             "yes" if task.prediction_written else "no",
@@ -380,6 +385,9 @@ def evaluate_public_run_command(
             str(task.extra_columns),
             f"{task.prediction_rows}/{task.gold_rows}",
             f"{task.prediction_columns}/{task.gold_columns}",
+            task.selected_candidate_source or "-",
+            removed_columns[:40] if removed_columns else "-",
+            postprocess[:40] if postprocess else "-",
             "yes" if task.exact_no_extra else "no",
         )
     console.print(table)

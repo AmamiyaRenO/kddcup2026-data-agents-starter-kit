@@ -65,10 +65,15 @@ _CURRENT_RETRIEVED_CONTEXT: ContextVar["RetrievedContext | None"] = ContextVar(
 )
 
 DISPLAY_COLUMN_PRIORITY = (
-    "display_name",
     "name",
     "title",
     "label",
+    "display_name",
+    "url",
+    "link",
+    "website",
+    "text",
+    "value",
     "category",
     "status",
     "description",
@@ -462,6 +467,8 @@ class FinalAnswerShapeReport:
     input_column_count: int
     output_row_count: int
     output_column_count: int
+    removed_rows: int
+    removed_columns: tuple[str, ...]
     contract_before: dict[str, Any] | None
     contract_after: dict[str, Any] | None
 
@@ -472,6 +479,8 @@ class FinalAnswerShapeReport:
             "input_column_count": self.input_column_count,
             "output_row_count": self.output_row_count,
             "output_column_count": self.output_column_count,
+            "removed_rows": self.removed_rows,
+            "removed_columns": list(self.removed_columns),
             "contract_before": self.contract_before,
             "contract_after": self.contract_after,
             "metadata_columns_removed": any(
@@ -1489,13 +1498,42 @@ def _identifier_column_hint(column_name: str) -> str | None:
 def _identifier_columns(frame: pd.DataFrame) -> list[str]:
     columns: list[str] = []
     for column in frame.columns:
-        lowered = str(column).lower()
-        if lowered == "id" or lowered.endswith("_id") or lowered.startswith("link_to_"):
+        if _is_id_like_column(str(column)):
             columns.append(str(column))
             continue
         if _column_is_record_id_like(frame[column]):
             columns.append(str(column))
     return columns
+
+
+def _is_id_like_column(column: str) -> bool:
+    original = str(column)
+    lowered = column.lower()
+    return (
+        lowered == "id"
+        or lowered.endswith("_id")
+        or lowered.startswith("link_to_")
+        or bool(re.search(r"[A-Za-z0-9]Id$", original))
+        or lowered in {"identifier", "code", "reference"}
+    )
+
+
+def _question_asks_for_identifier(question: str) -> bool:
+    return bool(re.search(r"\b(?:id|identifier|code|reference)\b", question.lower()))
+
+
+def _question_asks_for_url(question: str) -> bool:
+    return bool(re.search(r"\b(?:url|link|website|web site)\b", question.lower()))
+
+
+def _is_display_like_column(column: str) -> bool:
+    lowered = column.lower()
+    aliases = _column_question_aliases(column)
+    return (
+        lowered in DISPLAY_COLUMN_PRIORITY
+        or lowered.endswith("_name")
+        or bool(aliases & {"name", "title", "label", "description", "text", "value", "url", "link"})
+    )
 
 
 def _display_series(table: ContextTable) -> tuple[str, pd.Series] | None:
@@ -1605,7 +1643,8 @@ def resolve_identifier_columns(
     task: PublicTask,
     frame: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    del task
+    if _question_asks_for_identifier(task.question):
+        return frame, []
     context_tables = load_context_tables(frame.attrs.get("context_dir", Path()))
     if not context_tables:
         return frame, []
@@ -1616,15 +1655,11 @@ def resolve_identifier_columns(
     for column in list(current_frame.columns):
         column_name = str(column)
         series = current_frame[column]
-        if not (
-            str(column_name).lower().startswith("link_to_")
-            or str(column_name).lower().endswith("_id")
-            or _column_is_record_id_like(series)
-        ):
+        if not (_is_id_like_column(column_name) or _column_is_record_id_like(series)):
             continue
 
         values = _column_nonempty_values(series)
-        if not values or not any(_looks_like_record_id(value) for value in values):
+        if not values:
             continue
 
         best_match = _match_context_identifier(
@@ -2289,6 +2324,8 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         score = 0
         if column_name.lower() in lowered_question:
             score += 50
+        elif _is_id_like_column(column_name) and not _question_asks_for_identifier(question):
+            continue
         score += 10 * len(aliases & tokens)
         if any(alias in compact_question for alias in aliases if len(alias) > 3):
             score += 20
@@ -2340,15 +2377,28 @@ def _numeric_columns(frame: pd.DataFrame) -> list[str]:
     return columns
 
 
-def _best_numeric_column(columns: list[str], preferred_terms: tuple[str, ...]) -> str | None:
+def _best_numeric_column(
+    columns: list[str],
+    preferred_terms: tuple[str, ...],
+    *,
+    require_match: bool = False,
+) -> str | None:
     for term in preferred_terms:
         for column in columns:
             if term in column.lower():
                 return column
+    if require_match:
+        return None
     return columns[0] if columns else None
 
 
-def _question_matched_numeric_column(columns: list[str], question: str, *, exclude: str | None = None) -> str | None:
+def _question_matched_numeric_column(
+    columns: list[str],
+    question: str,
+    *,
+    exclude: str | None = None,
+    require_match: bool = False,
+) -> str | None:
     lowered_question = question.lower()
     tokens = _normalized_question_tokens(question)
     scored: list[tuple[int, str]] = []
@@ -2365,6 +2415,8 @@ def _question_matched_numeric_column(columns: list[str], question: str, *, exclu
     if scored:
         scored.sort(reverse=True)
         return scored[0][1]
+    if require_match:
+        return None
     return next((column for column in columns if column != exclude), None)
 
 
@@ -2381,8 +2433,17 @@ def apply_aggregate_ratio_verifier(
         return frame, []
 
     if "percentage" in question or "percent" in question:
-        denominator = _best_numeric_column(numeric_columns, ("total", "all", "count"))
-        numerator = _question_matched_numeric_column(numeric_columns, question, exclude=denominator)
+        denominator = _best_numeric_column(
+            numeric_columns,
+            ("total", "all", "count", "denominator"),
+            require_match=True,
+        )
+        numerator = _question_matched_numeric_column(
+            numeric_columns,
+            question,
+            exclude=denominator,
+            require_match=True,
+        )
         if numerator is None or denominator is None:
             return frame, []
         denominator_value = pd.to_numeric(frame[denominator], errors="coerce").iloc[0]
@@ -2390,6 +2451,8 @@ def apply_aggregate_ratio_verifier(
         if pd.isna(denominator_value) or float(denominator_value) == 0 or pd.isna(numerator_value):
             return frame, []
         value = float(numerator_value) * 100 / float(denominator_value)
+        if value == 0:
+            return frame, []
         output = pd.DataFrame({"percentage": [value]})
         return output, [
             {
@@ -2401,9 +2464,13 @@ def apply_aggregate_ratio_verifier(
         ]
 
     if "compared to" in question or "how many times" in question or "ratio" in question:
-        numerator = _question_matched_numeric_column(numeric_columns, question)
+        numerator = _question_matched_numeric_column(numeric_columns, question, require_match=True)
         denominator_candidates = [column for column in numeric_columns if column != numerator]
-        denominator = _best_numeric_column(denominator_candidates, ("total", "all", "count"))
+        denominator = _best_numeric_column(
+            denominator_candidates,
+            ("total", "all", "count", "denominator"),
+            require_match=True,
+        )
         if numerator is None or denominator is None:
             return frame, []
         denominator_value = pd.to_numeric(frame[denominator], errors="coerce").iloc[0]
@@ -3106,7 +3173,9 @@ def build_task_context(
 
 
 def _normalized_question_tokens(question: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9]+", question.lower()) if len(token) > 1}
+    tokens = {token for token in re.findall(r"[a-z0-9]+", question.lower()) if len(token) > 1}
+    singulars = {token[:-1] for token in tokens if len(token) > 3 and token.endswith("s")}
+    return tokens | singulars
 
 
 def _column_question_aliases(column_name: str) -> set[str]:
@@ -3122,6 +3191,10 @@ def _column_question_aliases(column_name: str) -> set[str]:
         aliases.add("time")
     if "name" in parts or lowered.endswith("name"):
         aliases.add("name")
+    if "url" in parts or "link" in parts or "website" in parts:
+        aliases.update({"url", "link", "website"})
+    if "count" in parts or lowered.endswith("count"):
+        aliases.add("count")
     return {alias for alias in aliases if alias}
 
 
@@ -3133,6 +3206,12 @@ def _question_referenced_columns(question: str, context_tables: list[ContextTabl
         for column in table.frame.columns:
             column_name = str(column)
             aliases = _column_question_aliases(column_name)
+            if (
+                _is_id_like_column(column_name)
+                and not _question_asks_for_identifier(question)
+                and column_name.lower() not in question
+            ):
+                continue
             if column_name.lower() in question or aliases & tokens or any(alias in compact_question for alias in aliases if len(alias) > 3):
                 matches.append(column_name)
     return tuple(dict.fromkeys(matches))
@@ -3147,22 +3226,29 @@ def _infer_generic_target_entity(question: str) -> str | None:
 
 
 def _question_looks_single_answer(question: str) -> bool:
+    lowered = question.lower()
+    if _superlative_direction(lowered) is not None:
+        return True
     return bool(
-        re.search(r"\b(?:what|which|who|when|where)\b", question)
-        and not re.search(r"\b(?:list|all|each|every|rows|records)\b", question)
+        re.search(
+            r"\b(?:single|only|exactly one|one row|one record|top\s+1|top\s+one|first row|last row)\b",
+            lowered,
+        )
+    )
+
+
+def _question_mentions_attribute_pair(question: str) -> bool:
+    lowered = question.lower()
+    return bool(
+        re.search(r"\b(?:and|plus)\b", lowered)
+        or re.search(r"\bwith\s+(?:their|its|the)\b", lowered)
     )
 
 
 def _display_like_columns(frame: pd.DataFrame) -> list[str]:
     columns: list[str] = []
     for column in frame.columns:
-        lowered = str(column).lower()
-        aliases = _column_question_aliases(str(column))
-        if (
-            lowered in DISPLAY_COLUMN_PRIORITY
-            or lowered.endswith("_name")
-            or aliases & {"name", "title", "label", "description", "status", "category"}
-        ):
+        if _is_display_like_column(str(column)):
             columns.append(str(column))
     return columns
 
@@ -3302,6 +3388,15 @@ def _question_mentions_multiple_attributes(question: str) -> bool:
     return bool(
         re.search(r"\b(?:and|along with|including|with their|with its)\b", lowered)
         and re.search(r"\b(?:return|list|show|provide|give)\b", lowered)
+    )
+
+
+def _question_asks_count_metric(question: str) -> bool:
+    lowered = question.lower()
+    return bool(
+        re.search(r"\bhow many\b", lowered)
+        or re.search(r"\bnumber of\b", lowered)
+        or re.search(r"\bcount\s+(?:of|the|all|rows|records|entries)\b", lowered)
     )
 
 
@@ -3485,6 +3580,7 @@ def should_run_planner_rescue(
 
 def infer_task_intent(task_context: TaskContext) -> TaskIntent:
     question = task_context.task.question.lower()
+    target_columns = _question_referenced_columns(question, task_context.context_tables)
     operation: str | None = None
     if "percentage" in question or "percent" in question:
         operation = "percentage"
@@ -3492,7 +3588,7 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
         operation = "ratio"
     elif "average" in question or "avg" in question or "mean" in question:
         operation = "average"
-    elif "how many" in question or "count" in question:
+    elif _question_asks_count_metric(question):
         operation = "count"
     elif "sum" in question or "total" in question:
         operation = "sum"
@@ -3501,7 +3597,6 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
     else:
         operation = "filter_select"
 
-    target_columns = _question_referenced_columns(question, task_context.context_tables)
     target_entity = _infer_generic_target_entity(question)
     answer_kind = "scalar" if operation in {"average", "count", "sum", "ratio", "percentage"} else "table"
     return TaskIntent(
@@ -3526,10 +3621,15 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
         )
 
     if intent.target_columns:
-        max_columns = max(1, min(len(intent.target_columns), 4))
-        kind = "two_attribute" if len(intent.target_columns) == 2 else "multi_attribute"
+        expected_column_count = len(intent.target_columns)
+        if expected_column_count == 1 and _question_mentions_attribute_pair(question):
+            max_columns = 2
+            kind = "two_attribute"
+        else:
+            max_columns = max(1, min(expected_column_count, 6))
+            kind = "two_attribute" if expected_column_count == 2 else "multi_attribute"
         return AnswerContract(
-            kind=kind if len(intent.target_columns) > 1 else "attribute_lookup",
+            kind=kind if expected_column_count > 1 or max_columns > 1 else "attribute_lookup",
             expected_columns=intent.target_columns,
             max_rows=1 if _question_looks_single_answer(question) else None,
             max_columns=max_columns,
@@ -3688,6 +3788,18 @@ def _question_matched_columns(frame: pd.DataFrame, question: str) -> list[str]:
     return list(_question_target_columns(question, frame))
 
 
+def _aggregate_candidate_value_is_suspicious(frame: pd.DataFrame, question: str) -> bool:
+    lowered = question.lower()
+    if not ("percentage" in lowered or "percent" in lowered or "ratio" in lowered or "rate" in lowered):
+        return False
+    if len(frame) != 1 or len(frame.columns) != 1:
+        return True
+    value = pd.to_numeric(frame.iloc[:, 0], errors="coerce").iloc[0]
+    if pd.isna(value):
+        return True
+    return float(value) == 0
+
+
 def _select_columns_by_priority(
     frame: pd.DataFrame,
     *,
@@ -3705,20 +3817,16 @@ def _select_columns_by_priority(
     for column in _question_matched_columns(frame, question):
         if column not in selected:
             selected.append(column)
-    priority_terms = (
-        "display_name",
-        "name",
-        "title",
-        "label",
-        "value",
+    priority_terms = list(DISPLAY_COLUMN_PRIORITY) + [
         "amount",
         "cost",
         "price",
         "score",
         "total",
         "count",
-        "id",
-    )
+    ]
+    if _question_asks_for_identifier(question):
+        priority_terms.append("id")
     lowered_to_original = {column.lower(): column for column in existing_columns}
     for term in priority_terms:
         column = lowered_to_original.get(term)
@@ -3731,7 +3839,14 @@ def _select_columns_by_priority(
 
 
 def _question_looks_list_answer(question: str) -> bool:
-    return bool(re.search(r"\b(?:list|show|return|which|what)\b", question.lower())) and not _question_looks_single_answer(question)
+    lowered = question.lower()
+    if _question_looks_single_answer(lowered):
+        return False
+    return bool(
+        re.search(r"\b(?:list|show|return|all|each|every|rows|records|entries|matching|matched)\b", lowered)
+        or re.search(r"\b(?:what|which|who)\s+are\b", lowered)
+        or re.search(r"\b(?:what|which|who)\s+(?:[a-z0-9_ -]+s|rows|records|entries)\b", lowered)
+    )
 
 
 def final_answer_shape_guard(
@@ -3745,6 +3860,8 @@ def final_answer_shape_guard(
     input_column_count = len(frame.columns)
     current = frame.copy()
     transformations: list[dict[str, Any]] = []
+    removed_columns: list[str] = []
+    removed_rows = 0
     contract_before = validate_answer_contract(
         contract,
         current,
@@ -3754,14 +3871,35 @@ def final_answer_shape_guard(
     metadata_columns = _metadata_debug_columns(current)
     if metadata_columns:
         current = current.drop(columns=metadata_columns)
+        removed_columns.extend(metadata_columns)
         transformations.append(
             {
                 "kind": "metadata_column_removal",
                 "removed_columns": metadata_columns,
+                "reason": "debug_metadata_columns",
             }
         )
 
     if len(current.columns) > 0:
+        if not _question_asks_for_identifier(task.question):
+            id_helper_columns = [
+                str(column)
+                for column in current.columns
+                if _is_id_like_column(str(column)) and str(column) not in contract.expected_columns
+            ]
+            has_display_answer = any(_is_display_like_column(str(column)) for column in current.columns)
+            if id_helper_columns and has_display_answer and len(id_helper_columns) < len(current.columns):
+                current = current.drop(columns=id_helper_columns)
+                removed_columns.extend(id_helper_columns)
+                transformations.append(
+                    {
+                        "kind": "final_answer_shape_guard",
+                        "action": "drop_id_helper_columns",
+                        "removed_columns": id_helper_columns,
+                        "reason": "display_answer_present_without_identifier_request",
+                    }
+                )
+
         max_rows = contract.max_rows
         max_columns = contract.max_columns
         if contract.kind == "scalar":
@@ -3777,23 +3915,31 @@ def final_answer_shape_guard(
                 contract=contract,
                 max_columns=max_columns,
             )
+            pruned_columns = [str(column) for column in current.columns if str(column) not in selected_columns]
             current = current.loc[:, selected_columns]
+            removed_columns.extend(pruned_columns)
             transformations.append(
                 {
                     "kind": "final_answer_shape_guard",
                     "action": "prune_columns",
                     "selected_columns": selected_columns,
+                    "removed_columns": pruned_columns,
                     "max_columns": max_columns,
+                    "reason": f"{contract.kind}_max_columns",
                 }
             )
 
         if max_rows is not None and len(current) > max_rows:
+            original_rows = len(current)
             current = current.head(max_rows).reset_index(drop=True)
+            removed_rows += max(0, original_rows - len(current))
             transformations.append(
                 {
                     "kind": "final_answer_shape_guard",
                     "action": "limit_rows",
                     "max_rows": max_rows,
+                    "removed_rows": max(0, original_rows - len(current)),
+                    "reason": f"{contract.kind}_max_rows",
                 }
             )
 
@@ -3808,6 +3954,8 @@ def final_answer_shape_guard(
         input_column_count=input_column_count,
         output_row_count=len(current),
         output_column_count=len(current.columns),
+        removed_rows=removed_rows,
+        removed_columns=tuple(dict.fromkeys(removed_columns)),
         contract_before=contract_before,
         contract_after=contract_after,
     )
@@ -3833,6 +3981,7 @@ def rank_candidates(
         report = validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source)
         reasons: list[str] = []
         score = int(candidate.confidence * 10)
+        question_expects_multirow = _question_looks_list_answer(question)
         if report.valid:
             score += 40
             reasons.append("contract_valid")
@@ -3840,13 +3989,24 @@ def rank_candidates(
             score -= 60
             reasons.append(f"contract_invalid:{report.reason}")
         if contract.max_columns is None or len(candidate.frame.columns) <= contract.max_columns:
-            score += 20
+            score += 15 if contract.max_columns is not None else 5
             reasons.append("column_count_ok")
         else:
             score -= 40
             reasons.append("extra_columns")
-        if contract.max_rows is None or len(candidate.frame) <= contract.max_rows:
-            score += 20
+        if contract.max_rows is None:
+            if len(candidate.frame) > 0:
+                score += 5
+                reasons.append("non_empty_rows")
+            if question_expects_multirow:
+                if len(candidate.frame) > 1:
+                    score += 15
+                    reasons.append("multirow_list_candidate")
+                else:
+                    score -= 15
+                    reasons.append("single_row_for_multirow_question")
+        elif len(candidate.frame) <= contract.max_rows:
+            score += 15
             reasons.append("row_count_ok")
         else:
             score -= 30
@@ -3865,19 +4025,65 @@ def rank_candidates(
         if candidate_columns & relevant_columns:
             score += 15
             reasons.append("uses_retrieved_column")
+        id_like_columns = [str(column) for column in candidate.frame.columns if _is_id_like_column(str(column))]
+        display_like_columns = [
+            str(column) for column in candidate.frame.columns if _is_display_like_column(str(column))
+        ]
+        if id_like_columns and not _question_asks_for_identifier(question):
+            if len(id_like_columns) == len(candidate.frame.columns):
+                score -= 30
+                reasons.append("id_only_without_id_request")
+            else:
+                score -= 10
+                reasons.append("id_helper_column_without_id_request")
+        if display_like_columns and contract.kind in {"entity_list", "table", "attribute_lookup", "two_attribute", "multi_attribute"}:
+            score += 10
+            reasons.append("display_column_present")
+        if _question_asks_for_url(question):
+            if any("url" in str(column).lower() or "link" in str(column).lower() for column in candidate.frame.columns):
+                score += 20
+                reasons.append("url_column_present")
+            else:
+                score -= 20
+                reasons.append("url_question_without_url_column")
+        if _question_asks_count_metric(question):
+            count_like_columns = [
+                str(column)
+                for column in candidate.frame.columns
+                if any(term in str(column).lower() for term in ("answer", "count", "total", "number"))
+            ]
+            if not count_like_columns:
+                score -= 20
+                reasons.append("count_question_without_count_like_column")
         if any(transform.get("kind") == "identifier_resolution" for transform in candidate.transformations):
             score += 10
             reasons.append("identifier_resolved")
         if any("aggregate" in str(transform.get("kind", "")) for transform in candidate.transformations):
             score += 5
             reasons.append("aggregation_verified")
+        if any(str(transform.get("kind", "")) == "aggregate_ratio_verification" for transform in candidate.transformations):
+            if _aggregate_candidate_value_is_suspicious(candidate.frame, question):
+                score -= 40
+                reasons.append("aggregate_ratio_sanity_failed")
+            if not report.valid:
+                score -= 20
+                reasons.append("aggregate_ratio_contract_invalid")
         if any("verification" in str(transform.get("kind", "")) for transform in candidate.transformations):
+            score -= 10
+            reasons.append("verifier_candidate_discount")
             if not report.valid:
                 score -= 20
                 reasons.append("verifier_contract_invalid")
             if not _question_matched_columns(candidate.frame, question) and not (candidate_columns & relevant_columns):
                 score -= 10
                 reasons.append("verifier_without_explicit_column_evidence")
+            if any(
+                str(transform.get("kind", ""))
+                in {"context_superlative_verification", "aggregate_ratio_verification"}
+                for transform in candidate.transformations
+            ):
+                score -= 10
+                reasons.append("high_risk_verifier_discount")
         if len(candidate.frame) == 0 and not contract.allow_empty:
             score -= 100
             reasons.append("empty_required_answer")
@@ -4298,6 +4504,7 @@ def _build_question_prompt(task: PublicTask) -> str:
         "Return only the final answer table.\n"
         "Do not include explanation, evidence, source, confidence, intermediate columns, or debug metadata.\n"
         "If the question asks for one value, return exactly one row and one column.\n"
+        "If the question asks for matching records or a list, preserve all matching rows.\n"
         "If the question asks for a list of entities, return exactly one column.\n"
         "If the question asks for a table with multiple attributes, return only the explicitly requested attributes.\n"
         "Prefer display, name, title, or label columns for entity answers unless the question explicitly asks for ID or code.\n"
@@ -4741,6 +4948,17 @@ def _prediction_csv_status(path: Path) -> tuple[bool, bool, int | None, int | No
     return True, len(frame.columns) > 0, len(frame), len(frame.columns)
 
 
+def _read_task_progress(logs_dir: Path, task_id: str) -> dict[str, Any] | None:
+    progress_path = logs_dir / f"{task_id}.progress.json"
+    if not progress_path.exists():
+        return None
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _write_task_log(
     log_path: Path,
     *,
@@ -4823,6 +5041,7 @@ def _timeout_task_artifact(
     timings = {"total": round(elapsed_seconds, 3), "task_timeout_seconds": timeout_seconds}
     prediction_path = task_output_dir / "prediction.csv"
     prediction_written, scorable, row_count, column_count = _prediction_csv_status(prediction_path)
+    progress = _read_task_progress(logs_dir, task.task_id)
     _write_task_log(
         log_path,
         task=task,
@@ -4839,6 +5058,7 @@ def _timeout_task_artifact(
                 "enabled_by": _heuristic_level(),
             }
         ],
+        timeout_budget={"active_progress": progress},
         failure_reason=failure_reason,
     )
     traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
@@ -5347,7 +5567,7 @@ def run_databao_task(
                 remaining = _remaining_seconds(deadline_at)
                 if remaining is not None and remaining <= 90:
                     planner_skipped_reason = (
-                        "Structured planner rescue skipped because remaining task budget "
+                        "Structured planner skipped because remaining task budget "
                         f"({remaining:.1f}s) is below 90s."
                     )
                 elif not complexity_profile.planner_payload_within_limit:
@@ -5695,6 +5915,7 @@ def _run_databao_task_with_timeout(
         elapsed_seconds = round(elapsed_seconds, 3)
         prediction_path = output_root / task.task_id / "prediction.csv"
         prediction_written, scorable, row_count, column_count = _prediction_csv_status(prediction_path)
+        progress = _read_task_progress(logs_dir, task.task_id)
         _write_task_log(
             logs_dir / f"{task.task_id}.json",
             task=task,
@@ -5703,6 +5924,7 @@ def _run_databao_task_with_timeout(
             scorable=scorable,
             elapsed_seconds=elapsed_seconds,
             timings={"total": elapsed_seconds},
+            timeout_budget={"active_progress": progress},
             failure_reason=failure_reason,
         )
         return DatabaoTaskArtifacts(

@@ -15,6 +15,9 @@ class PublicTaskEval:
     task_id: str
     prediction_written: bool
     artifact_succeeded: bool | None
+    selected_candidate_source: str | None
+    final_guard_removed_columns: tuple[str, ...]
+    postprocess_transformations: tuple[str, ...]
     matched_columns: int
     gold_columns: int
     extra_columns: int
@@ -42,6 +45,9 @@ class PublicTaskEval:
             "task_id": self.task_id,
             "prediction_written": self.prediction_written,
             "artifact_succeeded": self.artifact_succeeded,
+            "selected_candidate_source": self.selected_candidate_source,
+            "final_guard_removed_columns": list(self.final_guard_removed_columns),
+            "postprocess_transformations": list(self.postprocess_transformations),
             "matched_columns": self.matched_columns,
             "gold_columns": self.gold_columns,
             "coverage": self.coverage,
@@ -141,6 +147,35 @@ def column_signatures(frame: pd.DataFrame) -> Counter[tuple[str, ...]]:
     )
 
 
+def _artifact_selected_source(artifact_info: dict[str, Any]) -> str | None:
+    source = artifact_info.get("selected_candidate_source") or artifact_info.get("candidate_source")
+    return str(source) if source else None
+
+
+def _artifact_final_guard_removed_columns(artifact_info: dict[str, Any]) -> tuple[str, ...]:
+    guard = artifact_info.get("final_answer_guard")
+    if not isinstance(guard, dict):
+        return ()
+    removed: list[str] = []
+    for transform in guard.get("transformations", []):
+        if not isinstance(transform, dict):
+            continue
+        for column in transform.get("removed_columns", []):
+            removed.append(str(column))
+    return tuple(dict.fromkeys(removed))
+
+
+def _artifact_postprocess_transformations(artifact_info: dict[str, Any]) -> tuple[str, ...]:
+    postprocessing = artifact_info.get("postprocessing")
+    if not isinstance(postprocessing, dict):
+        return ()
+    kinds: list[str] = []
+    for transform in postprocessing.get("transformations", []):
+        if isinstance(transform, dict) and transform.get("kind"):
+            kinds.append(str(transform["kind"]))
+    return tuple(kinds)
+
+
 def evaluate_public_task(
     prediction_path: Path,
     gold_path: Path,
@@ -151,11 +186,17 @@ def evaluate_public_task(
     gold = pd.read_csv(gold_path, dtype=str, keep_default_na=False)
     prediction_written = prediction_path.exists()
     artifact_info = artifact_info or {}
+    selected_source = _artifact_selected_source(artifact_info)
+    final_guard_removed_columns = _artifact_final_guard_removed_columns(artifact_info)
+    postprocess_transformations = _artifact_postprocess_transformations(artifact_info)
     if not prediction_written:
         return PublicTaskEval(
             task_id=task_id,
             prediction_written=False,
             artifact_succeeded=artifact_info.get("succeeded"),
+            selected_candidate_source=selected_source,
+            final_guard_removed_columns=final_guard_removed_columns,
+            postprocess_transformations=postprocess_transformations,
             matched_columns=0,
             gold_columns=gold.shape[1],
             extra_columns=0,
@@ -177,6 +218,9 @@ def evaluate_public_task(
         task_id=task_id,
         prediction_written=True,
         artifact_succeeded=artifact_info.get("succeeded"),
+        selected_candidate_source=selected_source,
+        final_guard_removed_columns=final_guard_removed_columns,
+        postprocess_transformations=postprocess_transformations,
         matched_columns=matched_columns,
         gold_columns=gold.shape[1],
         extra_columns=extra_columns,

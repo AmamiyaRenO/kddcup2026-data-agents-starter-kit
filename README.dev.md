@@ -79,9 +79,28 @@ A Databao DataFrame is no longer considered fully correct by itself, but it is g
 a provisional prediction. Ordinary extra rows/columns are handled by cheap repair, ranking, and the
 final shape guard. The planner is not started for ordinary suspicious output.
 
-The ranker favors contract-valid, compact, metadata-free candidates that use question-matched or
-retrieved columns. It penalizes extra rows/columns, debug metadata, answer-shape mismatch, empty
-required answers, invalid frames, and weak verifier candidates without clear evidence.
+Answer contracts should avoid over-scalarizing. Plain `what`, `which`, or `who` questions are not
+single-row requests by themselves. Row limiting is reserved for scalar metrics or explicit top-one
+language such as single/only/top-one/first-row/last-row/superlative wording. List/table contracts
+preserve all candidate rows and only prune columns according to the contract.
+
+Display/entity resolution is generic and schema-driven. Entity answers prefer display/name/title/
+label/url/link/text/value columns; id-like and `link_to_*` columns are treated as join helpers unless
+the question explicitly asks for an id, identifier, code, or reference. URL/link questions prefer
+URL-like columns over ids or numeric helper columns.
+
+Identifier suppression now covers `id`, `*_id`, `link_to_*`, camelCase `*Id`, `identifier`, `code`,
+and `reference`. If a final candidate exposes one of these columns and the question did not ask for
+an identifier, postprocess tries to resolve it through context tables to a display column. If display
+columns are already present, the final guard removes ID helper columns before writing CSV.
+
+The ranker favors contract-valid, metadata-free candidates that use question-matched or retrieved
+columns. It no longer treats smaller row count as inherently better when the answer contract allows
+multiple rows; list-like questions receive a bonus for multi-row candidates. It penalizes extra
+columns, debug metadata, answer-shape mismatch, empty required answers, invalid frames, and weak
+verifier candidates without clear evidence. Count questions penalize non-count-like output columns.
+Ratio/percentage verifier candidates require explicit numerator and denominator components and are
+not emitted for zero/undefined percentages.
 
 ## Context And Documents
 
@@ -124,6 +143,10 @@ Timeout controls:
 - `DATABAO_STRUCTURED_PLANNER_MODE` supports `fallback` (default), legacy `first` (kept
   Databao-first by the adapter), and `off`.
 - `DATABAO_FINALIZER_MODE` supports `off` (default) and `always`.
+
+Timeout diagnostics preserve any already-written provisional CSV. Timeout logs include the latest
+task progress payload under `timeout_budget.active_progress`, so missing-prediction tasks can be
+triaged by active stage before changing model or context budgets.
 
 ## Diagnostics
 
@@ -170,11 +193,13 @@ uv run dabench evaluate-public-run artifacts/databao-demo/<run_id>
 
 The evaluator now prints per-task diagnostics including whether a prediction was written, artifact
 success, matched/gold/predicted/extra columns, row counts, exact-no-extra status, and an estimated
-per-task score. Aggregate coverage is kept as debugging context rather than the only score signal.
+per-task score. It also surfaces selected candidate source, final-guard removed columns, and
+postprocess transformation names so shape/semantic failures can be traced without reading every task
+log. Aggregate coverage is kept as debugging context rather than the only score signal.
 
 ## Latest Verification
 
-- `uv run python -m unittest discover tests`: 48 tests OK.
+- `uv run python -m unittest discover tests`: 59 tests OK.
 - `uv run --extra dev ruff check src tests`: passed.
 - `uv run python -m compileall src`: passed.
 - `src/` banned public-domain memory term scan: no violations.

@@ -1234,6 +1234,44 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertFalse(report.valid)
             self.assertTrue(report.should_repair)
 
+    def test_answer_contract_does_not_scalarize_ordinary_which_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which id and name values match the condition?")
+            csv_dir = input_root / "task_1" / "context" / "csv"
+            csv_dir.mkdir(parents=True)
+            (csv_dir / "records.csv").write_text(
+                "id,name,status\n1,A,ok\n2,B,ok\n",
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            task_context = build_task_context(task)
+            contract = infer_answer_contract(task_context, infer_task_intent(task_context))
+
+            self.assertIn(contract.kind, {"two_attribute", "multi_attribute"})
+            self.assertIsNone(contract.max_rows)
+            self.assertEqual(contract.max_columns, 2)
+
+    def test_answer_contract_treats_view_count_as_attribute_not_count_metric(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Return display name and view count for matching rows.")
+            csv_dir = input_root / "task_1" / "context" / "csv"
+            csv_dir.mkdir(parents=True)
+            (csv_dir / "records.csv").write_text(
+                "DisplayName,ViewCount,status\nA,12,ok\nB,10,ok\n",
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            task_context = build_task_context(task)
+            contract = infer_answer_contract(task_context, infer_task_intent(task_context))
+
+            self.assertIn(contract.kind, {"two_attribute", "multi_attribute"})
+            self.assertIsNone(contract.max_rows)
+            self.assertGreaterEqual(contract.max_columns or 0, 2)
+
     def test_final_answer_shape_guard_removes_metadata_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1346,6 +1384,92 @@ class DatabaoDemoTests(unittest.TestCase):
 
             self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A"], "status": ["active"]})
 
+    def test_final_answer_shape_guard_preserves_multirow_attribute_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which id and name values match the condition?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="two_attribute",
+                expected_columns=("id", "name"),
+                max_rows=None,
+                max_columns=2,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, _ = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame(
+                    {
+                        "id": [1, 2],
+                        "name": ["A", "B"],
+                        "status": ["ok", "ok"],
+                    }
+                ),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
+
+            self.assertEqual(guarded.to_dict(orient="list"), {"id": [1, 2], "name": ["A", "B"]})
+
+    def test_final_answer_shape_guard_prefers_url_for_url_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which url should be returned?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="entity_list",
+                expected_columns=(),
+                max_rows=None,
+                max_columns=1,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, report = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame(
+                    {
+                        "record_id": ["r1", "r2"],
+                        "url": ["https://a.example", "https://b.example"],
+                    }
+                ),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
+
+            self.assertEqual(guarded.to_dict(orient="list"), {"url": ["https://a.example", "https://b.example"]})
+            self.assertEqual(report.removed_rows, 0)
+            self.assertEqual(report.removed_columns, ("record_id",))
+
+    def test_final_answer_shape_guard_drops_id_helper_when_display_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which names match?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="entity_list",
+                expected_columns=(),
+                max_rows=None,
+                max_columns=None,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, report = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame({"rowId": [1, 2], "name": ["A", "B"]}),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
+
+            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A", "B"]})
+            self.assertIn("rowId", report.removed_columns)
+
     def test_candidate_ranking_prefers_contract_valid_clean_candidate(self) -> None:
         contract = AnswerContract(
             kind="scalar",
@@ -1378,6 +1502,144 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(selected.source, "structured_planner")
         self.assertEqual(report.selected_source, "structured_planner")
+
+    def test_candidate_ranking_prefers_multirow_candidate_for_list_question(self) -> None:
+        contract = AnswerContract(
+            kind="entity_list",
+            expected_columns=(),
+            max_rows=None,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        single = Candidate(
+            frame=pd.DataFrame({"name": ["A"]}),
+            source="databao_single",
+            confidence=0.9,
+            diagnostics={},
+        )
+        multi = Candidate(
+            frame=pd.DataFrame({"name": ["A", "B", "C"]}),
+            source="databao_multi",
+            confidence=0.8,
+            diagnostics={},
+        )
+
+        selected, report = rank_candidates(
+            candidates=[single, multi],
+            contract=contract,
+            question="List matching names.",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_multi")
+        self.assertEqual(report.selected_source, "databao_multi")
+
+    def test_candidate_ranking_penalizes_id_only_entity_answer(self) -> None:
+        contract = AnswerContract(
+            kind="entity_list",
+            expected_columns=(),
+            max_rows=None,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        id_only = Candidate(
+            frame=pd.DataFrame({"record_id": ["r1", "r2"]}),
+            source="id_only",
+            confidence=0.9,
+            diagnostics={},
+        )
+        display = Candidate(
+            frame=pd.DataFrame({"name": ["A", "B"]}),
+            source="display",
+            confidence=0.8,
+            diagnostics={},
+        )
+
+        selected, report = rank_candidates(
+            candidates=[id_only, display],
+            contract=contract,
+            question="Which names match?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "display")
+        self.assertEqual(report.selected_source, "display")
+
+    def test_aggregate_ratio_verifier_requires_explicit_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="What percentage matches the condition?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            unchanged, transforms = apply_aggregate_ratio_verifier(
+                task,
+                pd.DataFrame({"score": [3], "points": [10]}),
+            )
+
+            self.assertEqual(transforms, [])
+            self.assertEqual(unchanged.to_dict(orient="list"), {"score": [3], "points": [10]})
+
+    def test_postprocess_resolves_numeric_id_to_display_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which name matches?")
+            csv_dir = input_root / "task_1" / "context" / "csv"
+            csv_dir.mkdir(parents=True)
+            (csv_dir / "lookup.csv").write_text("raceId,name\n1,Alpha\n2,Beta\n", encoding="utf-8")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            frame = pd.DataFrame({"raceId": [1, 2]})
+            frame.attrs["context_dir"] = task.context_dir
+            resolved, report = postprocess_answer_table(task, frame)
+
+            self.assertEqual(resolved.to_dict(orient="list"), {"name": ["Alpha", "Beta"]})
+            self.assertTrue(any(transform["kind"] == "identifier_resolution" for transform in report.transformations))
+
+    def test_candidate_ranking_penalizes_zero_percentage_verifier_candidate(self) -> None:
+        contract = AnswerContract(
+            kind="scalar",
+            expected_columns=("answer",),
+            max_rows=1,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        zero_percentage = Candidate(
+            frame=pd.DataFrame({"percentage": [0]}),
+            source="verifier",
+            confidence=0.9,
+            diagnostics={},
+            transformations=(
+                {
+                    "kind": "aggregate_ratio_verification",
+                    "numerator_column": "matched_count",
+                    "denominator_column": "total_count",
+                },
+            ),
+        )
+        raw_answer = Candidate(
+            frame=pd.DataFrame({"answer": [42]}),
+            source="databao_raw",
+            confidence=0.6,
+            diagnostics={},
+        )
+
+        selected, report = rank_candidates(
+            candidates=[zero_percentage, raw_answer],
+            contract=contract,
+            question="What percentage matches?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw")
+        self.assertEqual(report.selected_source, "databao_raw")
 
     def test_metadata_columns_never_reach_prediction_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1639,6 +1901,41 @@ class DatabaoDemoTests(unittest.TestCase):
 
             self.assertEqual(result.matched_columns, 2)
             self.assertTrue(result.exact_no_extra)
+
+    def test_public_eval_reports_candidate_and_shape_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prediction_path = root / "prediction.csv"
+            gold_path = root / "gold.csv"
+            prediction_path.write_text("answer\nA\n", encoding="utf-8")
+            gold_path.write_text("answer\nA\n", encoding="utf-8")
+
+            result = evaluate_public_task(
+                prediction_path,
+                gold_path,
+                "task_1",
+                artifact_info={
+                    "succeeded": True,
+                    "selected_candidate_source": "databao_raw_postprocessed",
+                    "postprocessing": {
+                        "transformations": [
+                            {"kind": "answer_column_verification"},
+                        ],
+                    },
+                    "final_answer_guard": {
+                        "transformations": [
+                            {
+                                "kind": "metadata_column_removal",
+                                "removed_columns": ["source_doc"],
+                            },
+                        ],
+                    },
+                },
+            )
+
+            self.assertEqual(result.selected_candidate_source, "databao_raw_postprocessed")
+            self.assertEqual(result.final_guard_removed_columns, ("source_doc",))
+            self.assertEqual(result.postprocess_transformations, ("answer_column_verification",))
 
 
 if __name__ == "__main__":
