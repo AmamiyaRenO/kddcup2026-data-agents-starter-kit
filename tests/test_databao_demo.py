@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from time import perf_counter
 from unittest.mock import patch
 
 import pandas as pd
@@ -19,11 +21,15 @@ from data_agent_baseline.run.databao_demo import (
     Candidate,
     DatabaoEnvironment,
     DATABAO_DEBUG_LOG_RAW_ENV,
+    DATABAO_DATABAO_TIMEOUT_SECONDS_ENV,
     DATABAO_TASK_TIMEOUT_SECONDS_ENV,
     StructuredPlanError,
     StructuredPlannerReport,
     TaskDiagnostics,
     _candidate_table_payload,
+    _databao_timeout_seconds,
+    _run_databao_task_with_timeout,
+    _structured_planner_mode,
     _timeout_task_artifact,
     apply_aggregate_ratio_verifier,
     apply_answer_finalizer_decision,
@@ -151,6 +157,19 @@ def write_task(
 
 
 class DatabaoDemoTests(unittest.TestCase):
+    def test_structured_planner_mode_defaults_to_off(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_structured_planner_mode(), "off")
+
+    def test_databao_timeout_defaults_and_respects_task_deadline(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_databao_timeout_seconds(None), 100)
+
+        deadline_at = perf_counter() + 150
+        with patch.dict(os.environ, {DATABAO_DATABAO_TIMEOUT_SECONDS_ENV: "180"}):
+            self.assertLessEqual(_databao_timeout_seconds(deadline_at), 130)
+            self.assertGreaterEqual(_databao_timeout_seconds(deadline_at), 1)
+
     def test_load_databao_environment_requires_endpoint_and_model(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "MODEL_API_URL"):
             load_databao_environment({})
@@ -540,6 +559,9 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertIn("context_load", log_payload["timings"])
             self.assertIn("databao_ask", log_payload["timings"])
             self.assertEqual(log_payload["llm_calls"], [])
+            progress_payload = json.loads((logs_dir / "task_1.progress.json").read_text(encoding="utf-8"))
+            self.assertEqual(progress_payload["active_stage"], "artifact_ready")
+            self.assertEqual(progress_payload["metadata"]["prediction_written"], True)
 
     def test_prediction_csv_writes_integer_like_floats_as_ints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -550,6 +572,73 @@ class DatabaoDemoTests(unittest.TestCase):
             _write_prediction_csv(pd.DataFrame({"ID": [163109.0, 2803470.0]}), path)
 
             self.assertEqual(path.read_text(encoding="utf-8"), "ID\n163109\n2803470\n")
+
+    def test_databao_dataframe_writes_provisional_before_postprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root)
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            def failing_postprocessor(task, frame):
+                del task, frame
+                raise RuntimeError("postprocess failed")
+
+            artifact = run_databao_task(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=make_agent_builder(pd.DataFrame({"answer": ["raw"]})),
+                answer_finalizer=no_answer_finalizer,
+                answer_postprocessor=failing_postprocessor,
+                structured_planner=no_structured_planner,
+            )
+
+            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
+            self.assertTrue(artifact.prediction_written)
+            self.assertTrue(artifact.scorable)
+            self.assertEqual(log_payload["provisional_written_stage"], "databao_raw_provisional")
+            self.assertEqual(
+                (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
+                "answer\nraw\n",
+            )
+
+    def test_raw_provisional_survives_final_guard_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root)
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            with patch(
+                "data_agent_baseline.run.databao_demo.final_answer_shape_guard",
+                side_effect=RuntimeError("guard failed"),
+            ):
+                artifact = run_databao_task(
+                    task=task,
+                    output_root=output_root,
+                    logs_dir=logs_dir,
+                    databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                    agent_builder=make_agent_builder(pd.DataFrame({"answer": ["raw"]})),
+                    answer_finalizer=no_answer_finalizer,
+                    structured_planner=no_structured_planner,
+                )
+
+            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
+            self.assertFalse(artifact.succeeded)
+            self.assertTrue(artifact.prediction_written)
+            self.assertTrue(artifact.scorable)
+            self.assertEqual(log_payload["provisional_written_stage"], "databao_raw_provisional")
+            self.assertIn("guard failed", log_payload["failure_reason"])
+            self.assertEqual(
+                (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
+                "answer\nraw\n",
+            )
 
     def test_runner_prioritizes_databao_before_structured_planner_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -628,60 +717,81 @@ class DatabaoDemoTests(unittest.TestCase):
                 "answer\ndatabao\n",
             )
 
-    def test_runner_uses_structured_planner_rescue_after_complex_databao_failure(self) -> None:
+    def test_databao_failure_count_question_uses_narrow_count_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
             output_root = root / "output"
             logs_dir = root / "logs"
-            write_task(input_root)
+            write_task(input_root, question="How many records are there?")
             context_dir = input_root / "task_1" / "context"
             csv_dir = context_dir / "csv"
-            json_dir = context_dir / "json"
             csv_dir.mkdir()
-            json_dir.mkdir()
-            (csv_dir / "left.csv").write_text("id,value\n1,A\n", encoding="utf-8")
-            (csv_dir / "right.csv").write_text("left_id,amount\n1,10\n", encoding="utf-8")
-            (json_dir / "extra.json").write_text(
-                json.dumps({"table": "extra", "records": [{"id": 1, "status": "ok"}]}),
-                encoding="utf-8",
-            )
+            (csv_dir / "records.csv").write_text("id,value\n1,A\n2,B\n", encoding="utf-8")
             task = DABenchPublicDataset(input_root).get_task("task_1")
 
             def planner(task, databao_env):
                 del task, databao_env
-                frame = pd.DataFrame({"answer": ["planner"]})
-                return frame, StructuredPlannerReport(
-                    attempted=True,
-                    succeeded=True,
-                    attempts=1,
-                    failure_reason=None,
-                    plan={"steps": [], "output": "answer"},
-                    output_row_count=1,
-                    output_column_count=1,
-                    attempt_details=[],
-                )
+                raise AssertionError("planner should not rescue Databao failure")
+
+            def failing_agent_builder(task, databao_env):
+                del task, databao_env
+                raise TimeoutError("Databao timed out")
 
             artifact = run_databao_task(
                 task=task,
                 output_root=output_root,
                 logs_dir=logs_dir,
                 databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
-                agent_builder=make_agent_builder(None),
+                agent_builder=failing_agent_builder,
                 answer_finalizer=no_answer_finalizer,
                 structured_planner=planner,
-                structured_planner_mode="fallback",
+                structured_planner_mode="off",
             )
 
             log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
             self.assertTrue(artifact.succeeded)
-            self.assertEqual(artifact.candidate_source, "structured_planner_rescue")
-            self.assertEqual(log_payload["candidate_source"], "structured_planner_rescue")
-            self.assertTrue(log_payload["structured_planner"]["succeeded"])
+            self.assertEqual(artifact.candidate_source, "cheap_count_fallback")
+            self.assertEqual(log_payload["candidate_source"], "cheap_count_fallback")
+            self.assertFalse(log_payload["structured_planner"]["attempted"])
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
-                "answer\nplanner\n",
+                "count\n2\n",
             )
+
+    def test_databao_failure_non_count_question_does_not_write_whole_table_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, question="Which names match?")
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            csv_dir.mkdir()
+            (csv_dir / "records.csv").write_text("id,name\n1,A\n2,B\n", encoding="utf-8")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            def failing_agent_builder(task, databao_env):
+                del task, databao_env
+                raise TimeoutError("Databao timed out")
+
+            artifact = run_databao_task(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=failing_agent_builder,
+                answer_finalizer=no_answer_finalizer,
+                structured_planner=no_structured_planner,
+                structured_planner_mode="off",
+            )
+
+            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
+            self.assertFalse(artifact.succeeded)
+            self.assertFalse(artifact.prediction_written)
+            self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
+            self.assertIn("cheap count fallback", log_payload["missing_prediction_reason"])
 
     def test_run_databao_tasks_can_filter_task_ids_inline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -734,6 +844,88 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertTrue((output_root / "task_330" / "prediction.csv").exists())
             self.assertTrue((output_root / "task_344" / "prediction.csv").exists())
             self.assertFalse((output_root / "task_418" / "prediction.csv").exists())
+
+    def test_timeout_wrapper_returns_queued_artifact_before_killing_live_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root)
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            log_path = logs_dir / "task_1.json"
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text('{"succeeded": true}\n', encoding="utf-8")
+            queued_artifact = type(
+                "QueuedArtifact",
+                (),
+                {
+                    "task_id": "task_1",
+                    "succeeded": True,
+                    "prediction_written": True,
+                    "scorable": True,
+                },
+            )()
+
+            class FakeQueue:
+                def __init__(self, *args, **kwargs):
+                    del args, kwargs
+                    self._returned = False
+
+                def get(self, timeout=None):
+                    del timeout
+                    if self._returned:
+                        raise queue.Empty
+                    self._returned = True
+                    return queued_artifact
+
+                def get_nowait(self):
+                    raise queue.Empty
+
+            class FakeProcess:
+                terminated = False
+                killed = False
+
+                def __init__(self, *args, **kwargs):
+                    del args, kwargs
+                    self.exitcode = None
+
+                def start(self):
+                    return None
+
+                def join(self, timeout=None):
+                    del timeout
+                    return None
+
+                def is_alive(self):
+                    return not self.terminated
+
+                def terminate(self):
+                    self.terminated = True
+                    type(self).terminated = True
+
+                def kill(self):
+                    self.killed = True
+                    type(self).killed = True
+
+            class FakeContext:
+                Queue = FakeQueue
+                Process = FakeProcess
+
+            with patch("data_agent_baseline.run.databao_demo.multiprocessing.get_context", return_value=FakeContext()):
+                artifact = _run_databao_task_with_timeout(
+                    task=task,
+                    output_root=output_root,
+                    logs_dir=logs_dir,
+                    databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                    timeout_seconds=1,
+                    structured_planner_mode="off",
+                    finalizer_mode="off",
+                )
+
+            self.assertIs(artifact, queued_artifact)
+            self.assertTrue(FakeProcess.terminated)
+            self.assertEqual(json.loads(log_path.read_text(encoding="utf-8")), {"succeeded": True})
 
     def test_run_databao_demo_cli_passes_difficulty_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -797,6 +989,13 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertIsNone(captured["task_ids"])
             self.assertEqual(captured["task_timeout_seconds"], 150)
 
+    def test_run_databao_demo_cli_help_documents_planner_default_off(self) -> None:
+        result = CliRunner().invoke(app, ["run-databao-demo", "--help"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("Default is", result.output)
+        self.assertIn("off.", result.output)
+
     def test_timeout_artifact_writes_failure_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -805,6 +1004,11 @@ class DatabaoDemoTests(unittest.TestCase):
             logs_dir = root / "logs"
             write_task(input_root)
             task = DABenchPublicDataset(input_root).get_task("task_1")
+            logs_dir.mkdir()
+            (logs_dir / "task_1.progress.json").write_text(
+                json.dumps({"active_stage": "databao_ask"}),
+                encoding="utf-8",
+            )
 
             artifact = _timeout_task_artifact(
                 task=task,
@@ -818,7 +1022,29 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertFalse(artifact.succeeded)
             self.assertIn("TimeoutError", artifact.failure_reason)
             self.assertEqual(log_payload["timings"]["task_timeout_seconds"], 1)
+            self.assertEqual(log_payload["active_progress"]["active_stage"], "databao_ask")
+            self.assertIn("prediction.csv", log_payload["missing_prediction_reason"])
             self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
+
+    def test_task_diagnostics_checkpoint_records_intermediate_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            logs_dir = root / "logs"
+            write_task(input_root)
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            diagnostics = TaskDiagnostics(
+                task=task,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+            )
+
+            diagnostics.checkpoint("databao_frame_received", row_count=2, column_count=1)
+            payload = json.loads((logs_dir / "task_1.progress.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["event"], "checkpoint")
+            self.assertEqual(payload["active_stage"], "databao_frame_received")
+            self.assertEqual(payload["metadata"], {"row_count": 2, "column_count": 1})
 
     def test_non_dataframe_result_does_not_write_prediction_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1272,6 +1498,25 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertIsNone(contract.max_rows)
             self.assertGreaterEqual(contract.max_columns or 0, 2)
 
+    def test_answer_contract_allows_entity_plus_metric_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which person has the highest total cost?")
+            csv_dir = input_root / "task_1" / "context" / "csv"
+            csv_dir.mkdir(parents=True)
+            (csv_dir / "records.csv").write_text(
+                "first_name,last_name,total_cost\nA,B,10\n",
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            task_context = build_task_context(task)
+            contract = infer_answer_contract(task_context, infer_task_intent(task_context))
+
+            self.assertEqual(contract.kind, "multi_attribute")
+            self.assertEqual(contract.max_rows, 1)
+            self.assertGreaterEqual(contract.max_columns or 0, 3)
+
     def test_final_answer_shape_guard_removes_metadata_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1383,6 +1628,40 @@ class DatabaoDemoTests(unittest.TestCase):
             )
 
             self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A"], "status": ["active"]})
+
+    def test_final_answer_shape_guard_preserves_display_and_metric_for_multi_attribute(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which person has the highest total cost?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="multi_attribute",
+                expected_columns=("total_cost",),
+                max_rows=1,
+                max_columns=3,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, _ = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame(
+                    {
+                        "first_name": ["A"],
+                        "last_name": ["B"],
+                        "total_cost": [10],
+                        "helper_id": [1],
+                    }
+                ),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
+
+            self.assertEqual(
+                guarded.to_dict(orient="list"),
+                {"total_cost": [10], "first_name": ["A"], "last_name": ["B"]},
+            )
 
     def test_final_answer_shape_guard_preserves_multirow_attribute_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1569,6 +1848,47 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertEqual(selected.source, "display")
         self.assertEqual(report.selected_source, "display")
 
+    def test_candidate_ranking_penalizes_raw_table_row_explosion(self) -> None:
+        contract = AnswerContract(
+            kind="entity_list",
+            expected_columns=(),
+            max_rows=None,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        raw_table = Candidate(
+            frame=pd.DataFrame(
+                {
+                    "row_id": range(1200),
+                    "related_id": range(1200),
+                    "name": [f"Name {index}" for index in range(1200)],
+                    "helper_metric": range(1200),
+                }
+            ),
+            source="databao_raw",
+            confidence=0.9,
+            diagnostics={},
+        )
+        compact = Candidate(
+            frame=pd.DataFrame({"name": ["Name 1", "Name 2"]}),
+            source="databao_raw_postprocessed",
+            confidence=0.55,
+            diagnostics={},
+        )
+
+        selected, report = rank_candidates(
+            candidates=[raw_table, compact],
+            contract=contract,
+            question="Which names match?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw_postprocessed")
+        raw_score = next(score for score in report.candidate_scores if score.source == "databao_raw")
+        self.assertIn("large_raw_table_candidate", raw_score.reasons)
+
     def test_aggregate_ratio_verifier_requires_explicit_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1640,6 +1960,48 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertIsNotNone(selected)
         self.assertEqual(selected.source, "databao_raw")
         self.assertEqual(report.selected_source, "databao_raw")
+
+    def test_candidate_ranking_does_not_overreward_valid_ratio_verifier(self) -> None:
+        contract = AnswerContract(
+            kind="scalar",
+            expected_columns=("answer",),
+            max_rows=1,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        verifier = Candidate(
+            frame=pd.DataFrame({"percentage": [50]}),
+            source="databao_raw_verifier",
+            confidence=0.95,
+            diagnostics={},
+            transformations=(
+                {
+                    "kind": "aggregate_ratio_verification",
+                    "numerator_column": "matched_count",
+                    "denominator_column": "total_count",
+                },
+            ),
+        )
+        raw_answer = Candidate(
+            frame=pd.DataFrame({"answer": [42]}),
+            source="databao_raw",
+            confidence=0.6,
+            diagnostics={},
+        )
+
+        selected, report = rank_candidates(
+            candidates=[verifier, raw_answer],
+            contract=contract,
+            question="What percentage matches?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw")
+        verifier_score = next(score for score in report.candidate_scores if score.source == "databao_raw_verifier")
+        self.assertIn("high_risk_verifier_discount", verifier_score.reasons)
+        self.assertIn("valid_non_verifier_candidate_available", verifier_score.reasons)
 
     def test_metadata_columns_never_reach_prediction_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

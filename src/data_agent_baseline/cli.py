@@ -280,7 +280,7 @@ def run_databao_demo_command(
     ),
     planner_mode: str | None = typer.Option(
         None,
-        help="Structured planner mode: fallback, first, or off. Default is Databao-first fallback.",
+        help="Structured planner mode: off, fallback, or first. Default is off.",
     ),
     finalizer_mode: str | None = typer.Option(
         None,

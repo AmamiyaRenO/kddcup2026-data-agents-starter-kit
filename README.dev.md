@@ -39,10 +39,10 @@ The current execution flow is:
    paths. Retrieval is a soft priority signal, not access control: Databao still receives registered
    structured sources, while descriptions and planner payloads are focused by retrieval.
 5. Infer an `AnswerContract` from the question and schema.
-6. Run Databao first. As soon as Databao returns any DataFrame, apply cheap postprocess plus the
-   final shape guard and write a provisional `prediction.csv`.
-7. Generate additional candidates from cheap repair/verifiers and, only under feature-based rescue
-   gates, the structured planner.
+6. Run Databao first. As soon as Databao returns any DataFrame, write a raw provisional
+   `prediction.csv` before postprocess, ranking, verifier, finalizer, or final guard work can fail.
+7. Generate additional candidates from cheap repair/verifiers. Structured planner rescue is default
+   off and should remain off for stability ablations unless explicitly enabled.
 8. Validate and rank candidates with a generic evaluator.
 9. Apply `final_answer_shape_guard()` again before the final CSV write.
 10. Write diagnostics, candidate scores, selected route, scorable status, timings, and safe ablation
@@ -65,8 +65,10 @@ validation, fallback, ranking, and output shape:
 - `databao_raw`: the raw DataFrame returned by Databao.
 - `databao_raw_postprocessed`: a deterministic repair candidate when generic postprocessing changes
   the raw DataFrame.
-- `structured_planner_rescue`: a safe JSON-plan candidate only when feature-based complexity and
-  uncertainty gates are high enough and task budget remains.
+- `cheap_count_fallback`: a narrow missing-prediction fallback used only after Databao failure when
+  the question explicitly asks for a count and a single high-confidence table can be selected.
+- `structured_planner_rescue`: optional safe JSON-plan candidate only when planner mode is explicitly
+  enabled and feature-based complexity/uncertainty gates are high enough.
 - verifier candidates: generic superlative, context superlative, and aggregate/ratio checks. These
   are ranked like any other candidate and no longer directly override Databao.
 - `*_finalizer`: optional LLM finalizer candidates only when `DATABAO_FINALIZER_MODE=always`.
@@ -74,10 +76,13 @@ validation, fallback, ranking, and output shape:
 `succeeded` means the internal pipeline completed; `scorable` means a `prediction.csv` exists for
 the evaluator. These are intentionally separate. Timeout and exception artifacts now inspect the
 task output directory and preserve any provisional prediction that was already written.
+The process wrapper returns a queued artifact as soon as the child reports one; lingering model
+client/background threads may then be terminated without rewriting the task log as a timeout.
 
 A Databao DataFrame is no longer considered fully correct by itself, but it is good enough to write
-a provisional prediction. Ordinary extra rows/columns are handled by cheap repair, ranking, and the
-final shape guard. The planner is not started for ordinary suspicious output.
+a raw provisional prediction immediately. Ordinary extra rows/columns are handled by cheap repair,
+ranking, and the final shape guard. The planner is not started for ordinary suspicious output, and
+it is not used as missing-prediction recovery in the default path.
 
 Answer contracts should avoid over-scalarizing. Plain `what`, `which`, or `who` questions are not
 single-row requests by themselves. Row limiting is reserved for scalar metrics or explicit top-one
@@ -100,7 +105,12 @@ multiple rows; list-like questions receive a bonus for multi-row candidates. It 
 columns, debug metadata, answer-shape mismatch, empty required answers, invalid frames, and weak
 verifier candidates without clear evidence. Count questions penalize non-count-like output columns.
 Ratio/percentage verifier candidates require explicit numerator and denominator components and are
-not emitted for zero/undefined percentages.
+not emitted for zero/undefined percentages. High-risk verifier candidates are deliberately
+discounted and no longer get a generic aggregation bonus.
+
+Questions that ask for an entity plus a metric, such as a display/name answer with a total, cost,
+average, count, score, or value, use a multi-attribute contract. The final guard preserves display
+and metric columns for these answers instead of shrinking them to a single scalar column.
 
 ## Context And Documents
 
@@ -120,7 +130,8 @@ context by file stem or domain name, and it does not hide unretrieved tables fro
 
 ## Planner And Deadlines
 
-The structured planner remains a bounded feature-based rescue:
+The structured planner is now default off. It remains available only as an explicit bounded
+feature-based rescue for ablation:
 
 - Allowed operations: `source`, `filter`, `join`, `select`, `distinct`, `sort`, `top_k`, `limit`,
   `date_filter`, `aggregate`, `count_distinct`, `derive`, `ratio`, and `percentage`.
@@ -128,25 +139,28 @@ The structured planner remains a bounded feature-based rescue:
 - No arbitrary Python, SQL strings, task-id branches, filename-specific parsers, or domain-specific
   operations are allowed.
 - Planner attempts are capped at one.
-- Planner rescue is considered only when remaining budget is above 90 seconds, current candidate
-  uncertainty is high, observable task complexity is high, and the planner payload stays under the
-  configured size limit.
+- Planner rescue is considered only when `DATABAO_STRUCTURED_PLANNER_MODE` is explicitly set away
+  from `off`, remaining budget is above 90 seconds, current candidate uncertainty is high,
+  observable task complexity is high, and the planner payload stays under the configured size limit.
 - If budget is low or the feature gates do not pass, the current best candidate is passed to the
   final answer guard.
 
 Timeout controls:
 
 - `run-databao-demo --task-timeout-seconds N` sets a per-task process timeout.
-- `DATABAO_DATABAO_TIMEOUT_SECONDS` controls the Databao/LangChain model timeout, default `180`.
+- `DATABAO_DATABAO_TIMEOUT_SECONDS` controls the Databao/LangChain model timeout, default `100`.
+  The effective Databao timeout is also capped dynamically at `remaining_task_seconds - 20`.
 - `DATABAO_AUX_TIMEOUT_SECONDS` controls direct planner/finalizer OpenAI client timeout, default
   `30`.
-- `DATABAO_STRUCTURED_PLANNER_MODE` supports `fallback` (default), legacy `first` (kept
-  Databao-first by the adapter), and `off`.
+- `DATABAO_STRUCTURED_PLANNER_MODE` supports `off` (default), `fallback`, and legacy `first`
+  (kept Databao-first by the adapter).
 - `DATABAO_FINALIZER_MODE` supports `off` (default) and `always`.
 
 Timeout diagnostics preserve any already-written provisional CSV. Timeout logs include the latest
 task progress payload under `timeout_budget.active_progress`, so missing-prediction tasks can be
 triaged by active stage before changing model or context budgets.
+Progress checkpoints now include `databao_frame_received`, `raw_provisional_csv_write`, and
+`artifact_ready`, which separates model latency, CSV write failures, and child-process teardown.
 
 ## Diagnostics
 

@@ -105,6 +105,10 @@ class PublicRunEval:
     def scorable_task_count(self) -> int:
         return sum(1 for task in self.tasks if task.prediction_written and task.gold_columns > 0)
 
+    @property
+    def missing_prediction_count(self) -> int:
+        return len(self.tasks) - self.prediction_written_count
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_dir": str(self.run_dir),
@@ -118,7 +122,7 @@ class PublicRunEval:
             "exact_no_extra_rate": self.exact_no_extra_rate,
             "prediction_written_count": self.prediction_written_count,
             "scorable_task_count": self.scorable_task_count,
-            "missing_prediction_count": len(self.tasks) - self.prediction_written_count,
+            "missing_prediction_count": self.missing_prediction_count,
             "tasks": [task.to_dict() for task in self.tasks],
         }
 

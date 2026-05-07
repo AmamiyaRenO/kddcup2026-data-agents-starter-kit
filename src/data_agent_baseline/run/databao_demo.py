@@ -45,7 +45,7 @@ MAX_FINALIZER_TOKENS = 512
 MAX_STRUCTURED_PLANNER_TOKENS = 768
 STRUCTURED_PLANNER_ATTEMPTS = 1
 OPENAI_AUX_CALL_TIMEOUT_SECONDS = 30
-DATABAO_AGENT_TIMEOUT_SECONDS = 180
+DATABAO_AGENT_TIMEOUT_SECONDS = 100
 MIN_SECONDS_FOR_PLANNER = 45
 MAX_FAILURE_REASON_CHARS = 1000
 MAX_CONTEXT_ENRICHMENT_ROWS = 80
@@ -61,6 +61,10 @@ _CURRENT_DIAGNOSTICS: ContextVar["TaskDiagnostics | None"] = ContextVar(
 )
 _CURRENT_RETRIEVED_CONTEXT: ContextVar["RetrievedContext | None"] = ContextVar(
     "databao_retrieved_context",
+    default=None,
+)
+_CURRENT_TASK_DEADLINE: ContextVar[float | None] = ContextVar(
+    "databao_task_deadline",
     default=None,
 )
 
@@ -714,6 +718,17 @@ def _planner_skip_reason_for_deadline(deadline_at: float | None) -> str | None:
     return None
 
 
+def _databao_timeout_seconds(deadline_at: float | None = None) -> int:
+    configured = _env_int(DATABAO_DATABAO_TIMEOUT_SECONDS_ENV, DATABAO_AGENT_TIMEOUT_SECONDS)
+    if deadline_at is None:
+        deadline_at = _CURRENT_TASK_DEADLINE.get()
+    remaining = _remaining_seconds(deadline_at)
+    if remaining is None:
+        return max(1, configured)
+    budgeted = max(1, int(remaining - 20))
+    return max(1, min(configured, budgeted))
+
+
 def _normalize_mode(
     value: str | None,
     *,
@@ -733,7 +748,7 @@ def _normalize_mode(
 def _structured_planner_mode(value: str | None = None) -> str:
     return _normalize_mode(
         value if value is not None else os.environ.get(DATABAO_STRUCTURED_PLANNER_MODE_ENV),
-        default="fallback",
+        default="off",
         allowed=STRUCTURED_PLANNER_MODES,
         aliases={
             "0": "off",
@@ -850,7 +865,13 @@ class TaskDiagnostics:
     def add_timing(self, name: str, elapsed_seconds: float) -> None:
         self.timings[name] = round(self.timings.get(name, 0.0) + elapsed_seconds, 3)
 
-    def write_progress(self, *, active_stage: str | None, event: str) -> None:
+    def write_progress(
+        self,
+        *,
+        active_stage: str | None,
+        event: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
         self.progress_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "task_id": self.task.task_id,
@@ -859,11 +880,16 @@ class TaskDiagnostics:
             "timings": self.timings,
             "llm_call_count": len(self.llm_calls),
         }
+        if metadata:
+            payload["metadata"] = _safe_log_value(dict(metadata), self.secrets)
         self.progress_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
             errors="replace",
         )
+
+    def checkpoint(self, name: str, **metadata: Any) -> None:
+        self.write_progress(active_stage=name, event="checkpoint", metadata=metadata)
 
     def write_raw(self, label: str, payload: Any) -> str | None:
         if not self.raw_enabled:
@@ -3245,6 +3271,50 @@ def _question_mentions_attribute_pair(question: str) -> bool:
     )
 
 
+def _question_mentions_metric_answer(question: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:average|avg|mean|sum|total|count|number|ratio|percentage|percent|rate|"
+            r"amount|cost|price|score|value|view count)\b",
+            question.lower(),
+        )
+    )
+
+
+def _question_mentions_multiple_metrics(question: str) -> bool:
+    lowered = question.lower()
+    metric_matches = re.findall(
+        r"\b(?:average|avg|mean|sum|total|count|number|ratio|percentage|percent|rate|"
+        r"amount|cost|price|score|value|view count)\b",
+        lowered,
+    )
+    return len(set(metric_matches)) >= 2 or bool(
+        re.search(
+            r"\b(?:average|avg|mean|sum|total|count|number|amount|cost|price|score|value)"
+            r"\b[^?.]{0,80}\band\b[^?.]{0,80}\b"
+            r"(?:average|avg|mean|sum|total|count|number|amount|cost|price|score|value)\b",
+            lowered,
+        )
+    )
+
+
+def _question_mentions_entity_plus_metric(question: str) -> bool:
+    lowered = question.lower()
+    asks_for_entity_or_table = bool(
+        re.search(r"\b(?:which|who|list|show|return|provide|give)\b", lowered)
+        or re.search(r"\bwhat\s+(?:are|names|records|rows|entries)\b", lowered)
+        or re.search(r"\bwith\s+(?:their|its|the)\b", lowered)
+    )
+    scalar_lead = bool(
+        re.search(
+            r"\bwhat\s+is\s+(?:the\s+)?(?:average|avg|mean|sum|total|count|number|ratio|percentage|percent|rate)\b",
+            lowered,
+        )
+        or re.search(r"\bhow many\b", lowered)
+    )
+    return asks_for_entity_or_table and _question_mentions_metric_answer(question) and not scalar_lead
+
+
 def _display_like_columns(frame: pd.DataFrame) -> list[str]:
     columns: list[str] = []
     for column in frame.columns:
@@ -3386,8 +3456,12 @@ def _question_mentions_filter_or_condition(question: str) -> bool:
 def _question_mentions_multiple_attributes(question: str) -> bool:
     lowered = question.lower()
     return bool(
-        re.search(r"\b(?:and|along with|including|with their|with its)\b", lowered)
-        and re.search(r"\b(?:return|list|show|provide|give)\b", lowered)
+        (
+            re.search(r"\b(?:and|plus|along with|including|with their|with its|with the)\b", lowered)
+            and re.search(r"\b(?:return|list|show|provide|give|which|who|what)\b", lowered)
+        )
+        or _question_mentions_multiple_metrics(lowered)
+        or _question_mentions_entity_plus_metric(lowered)
     )
 
 
@@ -3412,6 +3486,65 @@ def _retrieval_confidence(retrieved_context: RetrievedContext | None) -> float:
     if not scores:
         return 0.0
     return min(max(scores) / 100.0, 1.0)
+
+
+def _cheap_count_fallback_candidate(
+    task_context: TaskContext,
+    retrieved_context: RetrievedContext | None,
+) -> tuple[pd.DataFrame, dict[str, Any]] | None:
+    question = task_context.task.question
+    if not _question_asks_count_metric(question):
+        return None
+
+    table_lookup = task_context.table_lookup()
+    selected_table: ContextTable | None = None
+    reason = ""
+    score = 0.0
+
+    table_scores = (
+        retrieved_context.retrieval_diagnostics.get("table_scores", [])
+        if retrieved_context is not None
+        else []
+    )
+    scored_tables: list[tuple[float, str]] = []
+    for item in table_scores:
+        if not isinstance(item, Mapping):
+            continue
+        table_name = _text_value(item.get("table"))
+        if not table_name or table_name not in table_lookup:
+            continue
+        scored_tables.append((float(item.get("score", 0) or 0), table_name))
+
+    scored_tables.sort(key=lambda item: item[0], reverse=True)
+    if scored_tables:
+        top_score, top_name = scored_tables[0]
+        second_score = scored_tables[1][0] if len(scored_tables) > 1 else 0.0
+        if top_score >= 10 and (
+            second_score <= 0
+            or top_score >= second_score + 5
+            or top_score >= second_score * 1.5
+        ):
+            selected_table = table_lookup[top_name]
+            score = top_score
+            reason = "single_high_retrieval_score"
+
+    if selected_table is None and len(task_context.context_tables) == 1:
+        selected_table = task_context.context_tables[0]
+        reason = "single_context_table"
+
+    if selected_table is None:
+        return None
+
+    diagnostics = {
+        "kind": "cheap_count_fallback",
+        "operation": "count",
+        "table": selected_table.name,
+        "path": selected_table.path,
+        "row_count": len(selected_table.frame),
+        "retrieval_score": score,
+        "reason": reason,
+    }
+    return pd.DataFrame({"count": [len(selected_table.frame)]}), diagnostics
 
 
 def _candidate_shape_mismatch(contract: AnswerContract, candidate: Candidate | None) -> bool | None:
@@ -3590,15 +3723,21 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
         operation = "average"
     elif _question_asks_count_metric(question):
         operation = "count"
-    elif "sum" in question or "total" in question:
-        operation = "sum"
     elif _superlative_direction(question) is not None:
         operation = "superlative"
+    elif "sum" in question or "total" in question:
+        operation = "sum"
     else:
         operation = "filter_select"
 
     target_entity = _infer_generic_target_entity(question)
-    answer_kind = "scalar" if operation in {"average", "count", "sum", "ratio", "percentage"} else "table"
+    answer_kind = (
+        "scalar"
+        if operation in {"average", "count", "sum", "ratio", "percentage"}
+        and not _question_mentions_entity_plus_metric(question)
+        and not _question_mentions_multiple_attributes(question)
+        else "table"
+    )
     return TaskIntent(
         domain=None,
         operation=operation,
@@ -3622,7 +3761,10 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
 
     if intent.target_columns:
         expected_column_count = len(intent.target_columns)
-        if expected_column_count == 1 and _question_mentions_attribute_pair(question):
+        if _question_mentions_entity_plus_metric(question) or _question_mentions_multiple_metrics(question):
+            max_columns = max(2, min(expected_column_count + 2, 4))
+            kind = "multi_attribute"
+        elif expected_column_count == 1 and _question_mentions_attribute_pair(question):
             max_columns = 2
             kind = "two_attribute"
         else:
@@ -3635,6 +3777,16 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
             max_columns=max_columns,
             allow_empty=False,
             reason="Question references answer-shaped context columns.",
+        )
+
+    if _question_mentions_entity_plus_metric(question) or _question_mentions_multiple_metrics(question):
+        return AnswerContract(
+            kind="multi_attribute",
+            expected_columns=(),
+            max_rows=1 if _question_looks_single_answer(question) else None,
+            max_columns=3,
+            allow_empty=False,
+            reason="Question asks for an entity/table answer with metric attributes.",
         )
 
     if _question_looks_list_answer(question):
@@ -3797,7 +3949,14 @@ def _aggregate_candidate_value_is_suspicious(frame: pd.DataFrame, question: str)
     value = pd.to_numeric(frame.iloc[:, 0], errors="coerce").iloc[0]
     if pd.isna(value):
         return True
-    return float(value) == 0
+    numeric_value = float(value)
+    if numeric_value == 0:
+        return True
+    if ("percentage" in lowered or "percent" in lowered) and not 0 <= numeric_value <= 100:
+        return True
+    if ("ratio" in lowered or "rate" in lowered) and numeric_value < 0:
+        return True
+    return False
 
 
 def _select_columns_by_priority(
@@ -3905,7 +4064,12 @@ def final_answer_shape_guard(
         if contract.kind == "scalar":
             max_rows = 1
             max_columns = 1
-        elif _question_looks_list_answer(task.question) and not contract.expected_columns:
+        elif (
+            _question_looks_list_answer(task.question)
+            and not contract.expected_columns
+            and not _question_mentions_multiple_attributes(task.question)
+            and not _question_mentions_entity_plus_metric(task.question)
+        ):
             max_columns = 1
 
         if max_columns is not None and len(current.columns) > max_columns:
@@ -3974,6 +4138,13 @@ def rank_candidates(
         for columns in (retrieved_context.relevant_columns.values() if retrieved_context else [])
         for column in columns
     }
+    has_valid_non_verifier_candidate = any(
+        isinstance(candidate.frame, pd.DataFrame)
+        and len(candidate.frame.columns) > 0
+        and not any("verification" in str(transform.get("kind", "")) for transform in candidate.transformations)
+        and validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source).valid
+        for candidate in candidates
+    )
     for candidate in candidates:
         if not isinstance(candidate.frame, pd.DataFrame) or len(candidate.frame.columns) == 0:
             scored.append((-100, candidate, ["invalid dataframe"]))
@@ -4058,32 +4229,60 @@ def rank_candidates(
         if any(transform.get("kind") == "identifier_resolution" for transform in candidate.transformations):
             score += 10
             reasons.append("identifier_resolved")
-        if any("aggregate" in str(transform.get("kind", "")) for transform in candidate.transformations):
-            score += 5
-            reasons.append("aggregation_verified")
         if any(str(transform.get("kind", "")) == "aggregate_ratio_verification" for transform in candidate.transformations):
+            aggregate_transforms = [
+                transform
+                for transform in candidate.transformations
+                if str(transform.get("kind", "")) == "aggregate_ratio_verification"
+            ]
             if _aggregate_candidate_value_is_suspicious(candidate.frame, question):
-                score -= 40
+                score -= 80
                 reasons.append("aggregate_ratio_sanity_failed")
+            if any(
+                not transform.get("numerator_column") or not transform.get("denominator_column")
+                for transform in aggregate_transforms
+            ):
+                score -= 40
+                reasons.append("aggregate_ratio_components_unclear")
             if not report.valid:
-                score -= 20
+                score -= 30
                 reasons.append("aggregate_ratio_contract_invalid")
         if any("verification" in str(transform.get("kind", "")) for transform in candidate.transformations):
-            score -= 10
+            score -= 15
             reasons.append("verifier_candidate_discount")
             if not report.valid:
                 score -= 20
                 reasons.append("verifier_contract_invalid")
             if not _question_matched_columns(candidate.frame, question) and not (candidate_columns & relevant_columns):
-                score -= 10
+                score -= 20
                 reasons.append("verifier_without_explicit_column_evidence")
-            if any(
-                str(transform.get("kind", ""))
-                in {"context_superlative_verification", "aggregate_ratio_verification"}
-                for transform in candidate.transformations
-            ):
-                score -= 10
-                reasons.append("high_risk_verifier_discount")
+            if has_valid_non_verifier_candidate:
+                score -= 15
+                reasons.append("valid_non_verifier_candidate_available")
+        if any(
+            str(transform.get("kind", ""))
+            in {"context_superlative_verification", "aggregate_ratio_verification"}
+            for transform in candidate.transformations
+        ):
+            score -= 50
+            reasons.append("high_risk_verifier_discount")
+        row_count = len(candidate.frame)
+        column_count = len(candidate.frame.columns)
+        if row_count > 1000:
+            score -= 40
+            reasons.append("large_raw_table_candidate")
+        if row_count > 5000:
+            score -= 30
+            reasons.append("very_large_candidate")
+        if column_count > max(contract.max_columns or 6, 6):
+            score -= 15
+            reasons.append("wide_candidate")
+        if len(id_like_columns) >= 2 and not _question_asks_for_identifier(question):
+            score -= 20
+            reasons.append("many_id_helper_columns")
+        if candidate.source == "cheap_count_fallback" and not _question_asks_count_metric(question):
+            score -= 100
+            reasons.append("count_fallback_without_count_question")
         if len(candidate.frame) == 0 and not contract.allow_empty:
             score -= 100
             reasons.append("empty_required_answer")
@@ -4483,7 +4682,7 @@ def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> An
         api_base_url=databao_env.model_api_url,
         temperature=0.0,
         max_tokens=MAX_DATABAO_TOKENS,
-        timeout=_env_int(DATABAO_DATABAO_TIMEOUT_SECONDS_ENV, DATABAO_AGENT_TIMEOUT_SECONDS),
+        timeout=_databao_timeout_seconds(),
         use_responses_api=False,
         model_kwargs=model_kwargs,
     )
@@ -4987,6 +5186,9 @@ def _write_task_log(
     selected_candidate_source: str | None = None,
     final_answer_guard: dict[str, Any] | None = None,
     planner_skipped_reason: str | None = None,
+    provisional_written_stage: str | None = None,
+    missing_prediction_reason: str | None = None,
+    active_progress: dict[str, Any] | None = None,
     timeout_budget: dict[str, Any] | None = None,
     failure_reason: str | None = None,
 ) -> None:
@@ -5018,6 +5220,9 @@ def _write_task_log(
         "selected_candidate_source": selected_candidate_source,
         "final_answer_guard": final_answer_guard,
         "planner_skipped_reason": planner_skipped_reason,
+        "provisional_written_stage": provisional_written_stage,
+        "missing_prediction_reason": missing_prediction_reason,
+        "active_progress": active_progress,
         "timeout_budget": timeout_budget,
         "failure_reason": failure_reason,
     }
@@ -5042,6 +5247,7 @@ def _timeout_task_artifact(
     prediction_path = task_output_dir / "prediction.csv"
     prediction_written, scorable, row_count, column_count = _prediction_csv_status(prediction_path)
     progress = _read_task_progress(logs_dir, task.task_id)
+    missing_prediction_reason = None if prediction_written else "task timed out before prediction.csv was written"
     _write_task_log(
         log_path,
         task=task,
@@ -5059,6 +5265,8 @@ def _timeout_task_artifact(
             }
         ],
         timeout_budget={"active_progress": progress},
+        missing_prediction_reason=missing_prediction_reason,
+        active_progress=progress,
         failure_reason=failure_reason,
     )
     traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
@@ -5122,6 +5330,12 @@ def _ask_databao_candidate(
         frame = thread.ask(_build_question_prompt(task), stream=False).df()
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("Databao did not return a dataframe.")
+    diagnostics.checkpoint(
+        "databao_frame_received",
+        row_count=len(frame),
+        column_count=len(frame.columns),
+        columns=[str(column) for column in frame.columns[:20]],
+    )
     return frame
 
 
@@ -5186,6 +5400,9 @@ def run_databao_task(
     ranking_report: CandidateRankingReport | None = None
     final_guard_report: FinalAnswerShapeReport | None = None
     planner_skipped_reason: str | None = None
+    provisional_written_stage: str | None = None
+    missing_prediction_reason: str | None = None
+    databao_failed = False
     effective_heuristic_level = _heuristic_level()
     enabled_strategies: list[dict[str, Any]] = []
     applied_strategies: list[dict[str, Any]] = []
@@ -5193,6 +5410,7 @@ def run_databao_task(
     candidates: list[Candidate] = []
     diagnostics = TaskDiagnostics(task=task, logs_dir=logs_dir, databao_env=databao_env)
     diagnostics_token = _CURRENT_DIAGNOSTICS.set(diagnostics)
+    deadline_token = _CURRENT_TASK_DEADLINE.set(deadline_at)
 
     def timeout_budget_payload() -> dict[str, Any]:
         timeout_seconds = _env_int(DATABAO_TASK_TIMEOUT_SECONDS_ENV, 0)
@@ -5204,7 +5422,13 @@ def run_databao_task(
                 if deadline_at is not None
                 else None
             ),
+            "databao_timeout_seconds": _databao_timeout_seconds(deadline_at),
+            "configured_databao_timeout_seconds": _env_int(
+                DATABAO_DATABAO_TIMEOUT_SECONDS_ENV,
+                DATABAO_AGENT_TIMEOUT_SECONDS,
+            ),
             "planner_min_remaining_seconds": MIN_SECONDS_FOR_PLANNER,
+            "active_progress": _read_task_progress(logs_dir, task.task_id),
         }
 
     def candidate_payloads() -> list[dict[str, Any]]:
@@ -5360,6 +5584,22 @@ def run_databao_task(
         diagnostics.add_timing(f"{stage}_prediction_write", 0.0)
         return guarded_frame, guard_report
 
+    def write_raw_provisional(frame: pd.DataFrame, *, stage: str) -> None:
+        nonlocal provisional_written_stage
+        _write_prediction_csv(frame, prediction_csv_path)
+        provisional_written_stage = stage
+        applied_strategies.append(
+            {
+                "strategy_name": "raw_provisional_prediction",
+                "strategy_kind": "generic",
+                "stage": stage,
+                "row_count": len(frame),
+                "column_count": len(frame.columns),
+                "applied_to_final_answer": True,
+            }
+        )
+        diagnostics.add_timing(f"{stage}_prediction_write", 0.0)
+
     try:
         effective_structured_planner_mode = _structured_planner_mode(structured_planner_mode)
         effective_finalizer_mode = _finalizer_mode(finalizer_mode)
@@ -5484,33 +5724,50 @@ def run_databao_task(
                 retrieved_token = _CURRENT_RETRIEVED_CONTEXT.set(retrieved_context)
                 try:
                     databao_frame = _ask_databao_candidate(task, databao_env, agent_builder, diagnostics)
+                    with diagnostics.stage("raw_provisional_csv_write"):
+                        write_raw_provisional(databao_frame, stage="databao_raw_provisional")
                 except Exception as exc:
+                    databao_failed = True
                     databao_failure_reason = _safe_exception_summary(exc, (databao_env.model_api_key,))
                     complexity_profile = build_complexity_profile(
                         task_context,
                         retrieved_context,
                         best_candidate=None,
                     )
-                    if effective_structured_planner_mode != "off" and should_run_planner_rescue(
-                        complexity_profile,
-                        _remaining_seconds(deadline_at),
-                        None,
-                    ):
-                        run_structured_planner_candidate("structured_planner_rescue")
-                    else:
-                        planner_skipped_reason = (
-                            "Structured planner rescue skipped after Databao failure because "
-                            "feature-based complexity/uncertainty/budget gates were not met."
+                    planner_skipped_reason = (
+                        "Structured planner rescue skipped after Databao failure; "
+                        "planner fallback is disabled for missing-prediction recovery."
+                    )
+                    fallback = _cheap_count_fallback_candidate(task_context, retrieved_context)
+                    if fallback is not None:
+                        fallback_frame, fallback_transform = fallback
+                        fallback_candidate = record_candidate(
+                            build_candidate_from_frame(
+                                fallback_frame,
+                                source="cheap_count_fallback",
+                                confidence=0.31,
+                                diagnostics_payload={
+                                    "databao_failure_reason": databao_failure_reason,
+                                    "fallback": fallback_transform,
+                                },
+                                transformations=(fallback_transform,),
+                            )
                         )
+                        if fallback_candidate is not None:
+                            applied_strategies.append(
+                                {
+                                    "strategy_name": "cheap_count_fallback",
+                                    "strategy_kind": "generic",
+                                    "result": fallback_transform,
+                                    "applied_to_final_answer": False,
+                                }
+                            )
                     if not candidates:
-                        planner_failure_reason = (
-                            structured_planner_report.failure_reason
-                            if structured_planner_report is not None
-                            else "structured planner did not return a dataframe"
+                        missing_prediction_reason = (
+                            "Databao failed and cheap count fallback did not produce a dataframe."
                         )
                         raise RuntimeError(
-                            "Databao failed and structured planner fallback did not produce a dataframe. "
-                            f"Databao: {databao_failure_reason}; planner: {planner_failure_reason}"
+                            f"{missing_prediction_reason} Databao: {databao_failure_reason}"
                         ) from exc
                 finally:
                     _CURRENT_RETRIEVED_CONTEXT.reset(retrieved_token)
@@ -5556,7 +5813,7 @@ def run_databao_task(
                 complexity_profile,
                 _remaining_seconds(deadline_at),
                 selected_candidate,
-            )
+            ) and not databao_failed
             if (
                 not rescue_allowed
                 and planner_skipped_reason is None
@@ -5694,6 +5951,14 @@ def run_databao_task(
 
         elapsed_seconds = round(perf_counter() - started_at, 3)
         diagnostics.timings["total"] = elapsed_seconds
+        diagnostics.checkpoint(
+            "artifact_ready",
+            prediction_written=True,
+            row_count=len(frame),
+            column_count=len(frame.columns),
+            candidate_source=candidate_source,
+            elapsed_seconds=elapsed_seconds,
+        )
         _write_task_log(
             log_path,
             task=task,
@@ -5721,6 +5986,9 @@ def run_databao_task(
             selected_candidate_source=candidate_source,
             final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
             planner_skipped_reason=planner_skipped_reason,
+            provisional_written_stage=provisional_written_stage,
+            missing_prediction_reason=missing_prediction_reason,
+            active_progress=_read_task_progress(logs_dir, task.task_id),
             timeout_budget=timeout_budget_payload(),
         )
         return DatabaoTaskArtifacts(
@@ -5783,6 +6051,9 @@ def run_databao_task(
             selected_candidate_source=candidate_source,
             final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
             planner_skipped_reason=planner_skipped_reason,
+            provisional_written_stage=provisional_written_stage,
+            missing_prediction_reason=missing_prediction_reason,
+            active_progress=_read_task_progress(logs_dir, task.task_id),
             timeout_budget=timeout_budget_payload(),
             failure_reason=failure_reason,
         )
@@ -5825,6 +6096,7 @@ def run_databao_task(
         )
     finally:
         _CURRENT_DIAGNOSTICS.reset(diagnostics_token)
+        _CURRENT_TASK_DEADLINE.reset(deadline_token)
 
 
 def create_databao_local_run_dir(output_base: Path, *, run_id: str | None = None) -> tuple[str, Path]:
@@ -5891,22 +6163,38 @@ def _run_databao_task_with_timeout(
     )
     started_at = perf_counter()
     process.start()
-    process.join(timeout_seconds)
-    elapsed_seconds = perf_counter() - started_at
+    deadline_at = started_at + timeout_seconds
+    while True:
+        try:
+            artifact = result_queue.get(timeout=0.2)
+        except queue.Empty:
+            artifact = None
+        if artifact is not None:
+            process.join(2)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(5)
+            return artifact
 
-    if process.is_alive():
-        process.terminate()
-        process.join(10)
-        if process.is_alive():
-            process.kill()
+        elapsed_seconds = perf_counter() - started_at
+        if not process.is_alive():
+            break
+        if perf_counter() >= deadline_at:
+            process.terminate()
             process.join(10)
-        return _timeout_task_artifact(
-            task=task,
-            output_root=output_root,
-            logs_dir=logs_dir,
-            elapsed_seconds=elapsed_seconds,
-            timeout_seconds=timeout_seconds,
-        )
+            if process.is_alive():
+                process.kill()
+                process.join(10)
+            return _timeout_task_artifact(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                elapsed_seconds=elapsed_seconds,
+                timeout_seconds=timeout_seconds,
+            )
 
     try:
         return result_queue.get_nowait()
@@ -5925,6 +6213,12 @@ def _run_databao_task_with_timeout(
             elapsed_seconds=elapsed_seconds,
             timings={"total": elapsed_seconds},
             timeout_budget={"active_progress": progress},
+            missing_prediction_reason=(
+                None
+                if prediction_written
+                else "task process exited before prediction.csv was written"
+            ),
+            active_progress=progress,
             failure_reason=failure_reason,
         )
         return DatabaoTaskArtifacts(
