@@ -3665,7 +3665,8 @@ def query_context_retriever(task_context: TaskContext, question: str) -> Retriev
 def _question_mentions_filter_or_condition(question: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:where|with|whose|having|under|over|above|below|less than|greater than|between|before|after|equals?|condition|match|matching|selected)\b",
+            r"\b(?:where|with|whose|having|under|over|above|below|less than|greater than|between|"
+            r"before|after|equals?|group|grouped|distinct|per|by|for|condition|match|matching|selected)\b",
             question.lower(),
         )
     )
@@ -3700,12 +3701,17 @@ def _cheap_count_fallback_candidate(
     retrieved_context: RetrievedContext | None,
 ) -> tuple[pd.DataFrame, dict[str, Any]] | None:
     question = task_context.task.question
+    lowered_question = question.lower()
     features = extract_question_features(question, task_context.context_tables)
     strong_count_evidence = any(term in features.strong_terms for term in ("how many", "count"))
     if not (features.asks_aggregation or features.asks_scalar_metric) or not strong_count_evidence:
         return None
     if _question_mentions_filter_or_condition(question):
         return None
+    plain_row_count_request = bool(
+        re.search(r"\bhow many\s+(?:rows|records|entries)\b", lowered_question)
+        or re.search(r"\bcount\s+(?:of\s+)?(?:rows|records|entries)\b", lowered_question)
+    )
 
     table_lookup = task_context.table_lookup()
     selected_table: ContextTable | None = None
@@ -3745,6 +3751,12 @@ def _cheap_count_fallback_candidate(
 
     if selected_table is None:
         return None
+    if not plain_row_count_request and reason != "single_context_table":
+        return None
+
+    confidence = 0.22 if reason == "single_context_table" else 0.26
+    if plain_row_count_request:
+        confidence += 0.04
 
     diagnostics = {
         "kind": "cheap_count_fallback",
@@ -3756,7 +3768,8 @@ def _cheap_count_fallback_candidate(
         "reason": reason,
         "question_features": features.to_dict(),
         "executed_filter": False,
-        "confidence": 0.2 if reason == "single_context_table" else 0.25,
+        "plain_row_count_request": plain_row_count_request,
+        "confidence": round(confidence, 3),
     }
     return pd.DataFrame({"count": [len(selected_table.frame)]}), diagnostics
 
@@ -3981,6 +3994,19 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
         (target_display_columns or display_schema_columns)
         and (target_metric_columns or metric_schema_columns)
     )
+    requested_column_count = len(intent.target_columns)
+    if features.asks_entity_plus_metric and has_entity_metric_schema_evidence:
+        display_evidence_count = len(target_display_columns) or min(len(display_schema_columns), 2)
+        metric_evidence_count = len(target_metric_columns) or min(len(metric_schema_columns), 1)
+        evidence_count = display_evidence_count + metric_evidence_count
+        if evidence_count < 2 and requested_column_count >= 2:
+            evidence_count = requested_column_count
+        requested_column_count = max(requested_column_count, evidence_count)
+
+    def requested_max_columns(default: int | None = None) -> int | None:
+        if requested_column_count > 0:
+            return requested_column_count
+        return default
 
     if (
         intent.answer_kind == "scalar"
@@ -4003,16 +4029,16 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
             features.asks_entity_plus_metric
             and has_entity_metric_schema_evidence
         ) or (features.asks_aggregation and expected_column_count >= 2):
-            max_columns = max(2, min(expected_column_count + 2, 4))
+            max_columns = requested_max_columns()
             kind = "multi_attribute"
         elif expected_column_count >= 2 and features.asks_multi_attribute:
-            max_columns = 2
+            max_columns = requested_max_columns()
             kind = "two_attribute"
         else:
-            max_columns = max(1, min(expected_column_count, 6))
+            max_columns = requested_max_columns()
             kind = "two_attribute" if expected_column_count == 2 else "multi_attribute"
         return AnswerContract(
-            kind=kind if expected_column_count > 1 or max_columns > 1 else "attribute_lookup",
+            kind=kind if expected_column_count > 1 or (max_columns is not None and max_columns > 1) else "attribute_lookup",
             expected_columns=intent.target_columns,
             max_rows=1 if (features.asks_superlative and not features.asks_entity_or_list) else None,
             max_columns=max_columns,
@@ -4025,19 +4051,23 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
             kind="multi_attribute",
             expected_columns=(),
             max_rows=1 if (features.asks_superlative and not features.asks_entity_or_list) else None,
-            max_columns=3,
+            max_columns=requested_max_columns(),
             allow_empty=False,
             reason="Question features and schema evidence indicate entity plus metric attributes.",
         )
 
-    if features.asks_entity_or_list and features.confidence >= 0.12:
+    if (
+        features.asks_entity_or_list
+        and features.confidence >= 0.12
+        and (display_schema_columns or intent.target_columns)
+    ):
         return AnswerContract(
             kind="entity_list",
-            expected_columns=(),
+            expected_columns=intent.target_columns,
             max_rows=None,
-            max_columns=1,
+            max_columns=requested_max_columns(),
             allow_empty=False,
-            reason="Question features indicate an entity/list answer.",
+            reason="Question features indicate an entity/list answer with schema evidence.",
         )
 
     return AnswerContract(
@@ -4482,13 +4512,16 @@ def rank_candidates(
             )
             if any(term in features.strong_terms for term in ("how many", "count")) and not fallback.get("executed_filter"):
                 if _question_mentions_filter_or_condition(question):
-                    score -= 80
+                    score -= 120
                     reasons.append("count_fallback_without_required_filter")
-                else:
-                    score += 5
+                elif fallback.get("plain_row_count_request") or fallback.get("reason") == "single_context_table":
+                    score += 2
                     reasons.append("count_operation_evidence")
+                else:
+                    score -= 30
+                    reasons.append("weak_count_fallback_evidence")
             else:
-                score -= 40
+                score -= 60
                 reasons.append("weak_count_fallback_evidence")
         if any(str(transform.get("kind", "")) == "aggregate_ratio_verification" for transform in candidate.transformations):
             aggregate_transforms = [
@@ -6017,7 +6050,7 @@ def run_databao_task(
                             build_candidate_from_frame(
                                 fallback_frame,
                                 source="cheap_count_fallback",
-                                confidence=0.31,
+                                confidence=float(fallback_transform.get("confidence", 0.2) or 0.2),
                                 diagnostics_payload={
                                     "databao_failure_reason": databao_failure_reason,
                                     "fallback": fallback_transform,

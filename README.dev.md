@@ -54,6 +54,9 @@ metric, and superlative signals. Weak words such as `number`, `rate`, `value`, a
 gain real confidence when schema columns support them. `AnswerContract`, candidate ranking, and
 cheap fallback decisions combine these question signals with schema evidence and candidate evidence
 instead of letting a single regex change row or column limits.
+List/entity and entity-plus-metric signals do not by themselves fix `max_columns`; column limits are
+set only when requested columns can be inferred from question/schema evidence. If evidence is weak,
+the contract stays open and the final guard only removes metadata/debug and safe helper columns.
 
 This is intentionally not a benchmark-memory path. The runner no longer keeps production parsers or
 routes for concrete public-set domains, entity names, category values, file stems, or task ids.
@@ -72,8 +75,10 @@ validation, fallback, ranking, and output shape:
 - `databao_raw`: the raw DataFrame returned by Databao.
 - `databao_raw_postprocessed`: a deterministic repair candidate when generic postprocessing changes
   the raw DataFrame.
-- `cheap_count_fallback`: a narrow missing-prediction fallback used only after Databao failure when
-  the question explicitly asks for a count and a single high-confidence table can be selected.
+- `cheap_count_fallback`: a low-confidence missing-prediction fallback used only after Databao
+  failure when the question explicitly asks for plain row/record/entry count and a single
+  high-confidence table can be selected. It is skipped for unexecuted filters, grouping, distinct,
+  per/by/for clauses, temporal constraints, or other conditions.
 - `structured_planner_rescue`: optional safe JSON-plan candidate only when planner mode is explicitly
   enabled and feature-based complexity/uncertainty gates are high enough.
 - verifier candidates: generic superlative, context superlative, and aggregate/ratio checks. These
@@ -94,7 +99,8 @@ it is not used as missing-prediction recovery in the default path.
 Answer contracts should avoid over-scalarizing. Plain `what`, `which`, or `who` questions are not
 single-row requests by themselves. Row limiting is reserved for scalar metrics or explicit top-one
 language such as single/only/top-one/first-row/last-row/superlative wording. List/table contracts
-preserve all candidate rows and only prune columns according to the contract.
+preserve all candidate rows and only prune columns when the contract has explicit schema-backed
+column evidence.
 
 Display/entity resolution is generic and schema-driven. Entity answers prefer display/name/title/
 label/url/link/text/value columns; id-like and `link_to_*` columns are treated as join helpers unless
@@ -222,7 +228,7 @@ log. Aggregate coverage is kept as debugging context rather than the only score 
 
 ## Latest Verification
 
-- `uv run python -m unittest discover tests`: 76 tests OK.
+- `uv run python -m unittest discover tests`: 78 tests OK.
 - `uv run --extra dev ruff check src tests`: passed.
 - `uv run python -m compileall src`: passed.
 - `src/` banned public-domain memory term scan: no violations.

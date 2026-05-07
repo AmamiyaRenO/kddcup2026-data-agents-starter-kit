@@ -794,6 +794,38 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
             self.assertIn("cheap count fallback", log_payload["missing_prediction_reason"])
 
+    def test_databao_failure_grouped_count_question_does_not_use_unexecuted_count_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, question="How many records per category should be returned?")
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            csv_dir.mkdir()
+            (csv_dir / "records.csv").write_text("id,category\n1,A\n2,B\n", encoding="utf-8")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            def failing_agent_builder(task, databao_env):
+                del task, databao_env
+                raise TimeoutError("Databao timed out")
+
+            artifact = run_databao_task(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=failing_agent_builder,
+                answer_finalizer=no_answer_finalizer,
+                structured_planner=no_structured_planner,
+                structured_planner_mode="off",
+            )
+
+            self.assertFalse(artifact.succeeded)
+            self.assertFalse(artifact.prediction_written)
+            self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
+
     def test_databao_failure_non_count_question_does_not_write_whole_table_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1162,7 +1194,7 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertTrue(artifact.succeeded)
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
-                "answer\nA\n",
+                "answer,extra\nA,1\n",
             )
             self.assertFalse(log_payload["finalization"]["applied"])
             self.assertIn("bad finalizer", log_payload["finalization"]["failure_reason"])
@@ -1485,6 +1517,7 @@ class DatabaoDemoTests(unittest.TestCase):
         banned_terms = [
             "official scoring",
             "extra columns are penalized",
+            "column names ignored",
             "gold",
         ]
 
@@ -1507,6 +1540,9 @@ class DatabaoDemoTests(unittest.TestCase):
             "elif task.difficulty ==",
             "difficulty ==",
             "difficulty !=",
+            "doc_name ==",
+            "file_stem ==",
+            "materializers[",
         ]
 
         violations = [snippet for snippet in banned_snippets if snippet in text]
@@ -1615,6 +1651,25 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertEqual(contract.kind, "multi_attribute")
             self.assertIsNone(contract.max_rows)
             self.assertGreaterEqual(contract.max_columns or 0, 3)
+
+    def test_answer_contract_does_not_fix_entity_list_columns_without_requested_column_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which records match?")
+            csv_dir = input_root / "task_1" / "context" / "csv"
+            csv_dir.mkdir(parents=True)
+            (csv_dir / "records.csv").write_text(
+                "id,name,status\n1,A,ok\n2,B,ok\n",
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            task_context = build_task_context(task)
+            contract = infer_answer_contract(task_context, infer_task_intent(task_context))
+
+            self.assertEqual(contract.kind, "entity_list")
+            self.assertIsNone(contract.max_rows)
+            self.assertIsNone(contract.max_columns)
 
     def test_final_answer_shape_guard_removes_metadata_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

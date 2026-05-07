@@ -310,7 +310,7 @@ def run_databao_demo_command(
     console.print(f"Logs: {logs_dir}")
     console.print(f"Task timeout: {effective_task_timeout_seconds}s")
     console.print(f"Difficulty: {difficulty or 'all'}")
-    console.print(f"Planner mode: {planner_mode or 'fallback'}")
+    console.print(f"Planner mode: {planner_mode or 'off'}")
     console.print(f"Finalizer mode: {finalizer_mode or 'off'}")
 
     artifacts = run_databao_tasks(
