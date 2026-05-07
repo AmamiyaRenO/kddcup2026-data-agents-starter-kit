@@ -48,6 +48,13 @@ The current execution flow is:
 10. Write diagnostics, candidate scores, selected route, scorable status, timings, and safe ablation
    metadata.
 
+Question parsing is now a signal layer rather than a decision layer. `extract_question_features()`
+collects evidence such as aggregation, ratio/percentage, list/entity, multi-attribute, entity-plus-
+metric, and superlative signals. Weak words such as `number`, `rate`, `value`, and `view count` only
+gain real confidence when schema columns support them. `AnswerContract`, candidate ranking, and
+cheap fallback decisions combine these question signals with schema evidence and candidate evidence
+instead of letting a single regex change row or column limits.
+
 This is intentionally not a benchmark-memory path. The runner no longer keeps production parsers or
 routes for concrete public-set domains, entity names, category values, file stems, or task ids.
 The only heuristic modes are:
@@ -99,14 +106,16 @@ and `reference`. If a final candidate exposes one of these columns and the quest
 an identifier, postprocess tries to resolve it through context tables to a display column. If display
 columns are already present, the final guard removes ID helper columns before writing CSV.
 
-The ranker favors contract-valid, metadata-free candidates that use question-matched or retrieved
-columns. It no longer treats smaller row count as inherently better when the answer contract allows
-multiple rows; list-like questions receive a bonus for multi-row candidates. It penalizes extra
-columns, debug metadata, answer-shape mismatch, empty required answers, invalid frames, and weak
-verifier candidates without clear evidence. Count questions penalize non-count-like output columns.
-Ratio/percentage verifier candidates require explicit numerator and denominator components and are
-not emitted for zero/undefined percentages. High-risk verifier candidates are deliberately
-discounted and no longer get a generic aggregation bonus.
+The ranker favors candidates with evidence: contract validity, schema-matched columns, retrieved
+columns, display/id resolution, explicit aggregation components, and transformations that actually
+performed the operation implied by the question. It no longer treats smaller row count as inherently
+better when the answer contract allows multiple rows; list-like questions receive a bonus for
+multi-row candidates. It penalizes debug metadata, answer-shape mismatch, empty required answers,
+invalid frames, raw-table explosions, and weak verifier candidates without clear evidence. Count
+questions penalize non-count-like output columns. Ratio/percentage verifier candidates require
+explicit numerator and denominator components and are not emitted for zero/undefined percentages.
+High-risk verifier candidates are deliberately discounted and no longer get a generic aggregation
+bonus.
 
 Questions that ask for an entity plus a metric, such as a display/name answer with a total, cost,
 average, count, score, or value, use a multi-attribute contract. The final guard preserves display
@@ -213,7 +222,7 @@ log. Aggregate coverage is kept as debugging context rather than the only score 
 
 ## Latest Verification
 
-- `uv run python -m unittest discover tests`: 59 tests OK.
+- `uv run python -m unittest discover tests`: 76 tests OK.
 - `uv run --extra dev ruff check src tests`: passed.
 - `uv run python -m compileall src`: passed.
 - `src/` banned public-domain memory term scan: no violations.

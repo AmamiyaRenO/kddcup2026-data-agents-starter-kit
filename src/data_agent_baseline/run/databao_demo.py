@@ -177,6 +177,7 @@ class DatabaoTaskArtifacts:
     timings: dict[str, float] | None = None
     llm_calls: list[dict[str, Any]] | None = None
     route_policy: dict[str, Any] | None = None
+    question_features: dict[str, Any] | None = None
     answer_contract: dict[str, Any] | None = None
     heuristic_level: str | None = None
     enabled_strategies: list[dict[str, Any]] | None = None
@@ -208,6 +209,7 @@ class DatabaoTaskArtifacts:
             "timings": self.timings,
             "llm_calls": self.llm_calls,
             "route_policy": self.route_policy,
+            "question_features": self.question_features,
             "answer_contract": self.answer_contract,
             "heuristic_level": self.heuristic_level,
             "enabled_strategies": self.enabled_strategies or [],
@@ -334,6 +336,38 @@ class TaskIntent:
     answer_kind: str
     target_entity: str | None
     target_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionFeatures:
+    asks_scalar_metric: bool
+    asks_entity_or_list: bool
+    asks_multi_attribute: bool
+    asks_entity_plus_metric: bool
+    asks_aggregation: bool
+    asks_ratio_or_percentage: bool
+    asks_superlative: bool
+    matched_phrases: tuple[str, ...]
+    strong_terms: tuple[str, ...]
+    weak_terms: tuple[str, ...]
+    confidence: float
+    evidence: tuple[dict[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "asks_scalar_metric": self.asks_scalar_metric,
+            "asks_entity_or_list": self.asks_entity_or_list,
+            "asks_multi_attribute": self.asks_multi_attribute,
+            "asks_entity_plus_metric": self.asks_entity_plus_metric,
+            "asks_aggregation": self.asks_aggregation,
+            "asks_ratio_or_percentage": self.asks_ratio_or_percentage,
+            "asks_superlative": self.asks_superlative,
+            "matched_phrases": list(self.matched_phrases),
+            "strong_terms": list(self.strong_terms),
+            "weak_terms": list(self.weak_terms),
+            "confidence": self.confidence,
+            "evidence": list(self.evidence),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -3251,6 +3285,57 @@ def _infer_generic_target_entity(question: str) -> str | None:
     return entity or None
 
 
+STRONG_AGGREGATION_TERMS = ("average", "avg", "mean", "sum", "total", "count", "how many")
+RATIO_TERMS = ("ratio", "percentage", "percent", "proportion", "share")
+VALUE_METRIC_TERMS = ("amount", "cost", "price", "score", "points")
+WEAK_METRIC_TERMS = ("number", "rate", "value", "view count")
+
+
+def _schema_columns_matching_phrase(phrase: str, context_tables: list[ContextTable] | None) -> tuple[str, ...]:
+    if not context_tables:
+        return ()
+    compact_phrase = re.sub(r"[^a-z0-9]+", "", phrase.lower())
+    phrase_tokens = _normalized_question_tokens(phrase)
+    matches: list[str] = []
+    for table in context_tables:
+        for column in table.frame.columns:
+            column_name = str(column)
+            aliases = _column_question_aliases(column_name)
+            compact_aliases = {re.sub(r"[^a-z0-9]+", "", alias) for alias in aliases}
+            if compact_phrase in compact_aliases or aliases & phrase_tokens:
+                matches.append(column_name)
+    return tuple(dict.fromkeys(matches))
+
+
+def _add_question_evidence(
+    *,
+    evidence: list[dict[str, Any]],
+    matched_phrases: list[str],
+    strong_terms: list[str],
+    weak_terms: list[str],
+    phrase: str,
+    kind: str,
+    strength: str,
+    confidence_delta: float,
+    schema_columns: tuple[str, ...] = (),
+) -> float:
+    matched_phrases.append(phrase)
+    if strength == "weak":
+        weak_terms.append(phrase)
+    else:
+        strong_terms.append(phrase)
+    evidence.append(
+        {
+            "kind": kind,
+            "phrase": phrase,
+            "strength": strength,
+            "confidence_delta": confidence_delta,
+            "schema_columns": list(schema_columns),
+        }
+    )
+    return confidence_delta
+
+
 def _question_looks_single_answer(question: str) -> bool:
     lowered = question.lower()
     if _superlative_direction(lowered) is not None:
@@ -3263,56 +3348,189 @@ def _question_looks_single_answer(question: str) -> bool:
     )
 
 
-def _question_mentions_attribute_pair(question: str) -> bool:
+def extract_question_features(
+    question: str,
+    context_tables: list[ContextTable] | None = None,
+) -> QuestionFeatures:
     lowered = question.lower()
-    return bool(
-        re.search(r"\b(?:and|plus)\b", lowered)
-        or re.search(r"\bwith\s+(?:their|its|the)\b", lowered)
-    )
+    evidence: list[dict[str, Any]] = []
+    matched_phrases: list[str] = []
+    strong_terms: list[str] = []
+    weak_terms: list[str] = []
+    confidence = 0.0
+    asks_aggregation = False
+    asks_ratio_or_percentage = False
+    asks_entity_or_list = False
+    asks_multi_attribute = False
+    asks_superlative = _superlative_direction(lowered) is not None
 
-
-def _question_mentions_metric_answer(question: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(?:average|avg|mean|sum|total|count|number|ratio|percentage|percent|rate|"
-            r"amount|cost|price|score|value|view count)\b",
-            question.lower(),
+    if asks_superlative:
+        confidence += _add_question_evidence(
+            evidence=evidence,
+            matched_phrases=matched_phrases,
+            strong_terms=strong_terms,
+            weak_terms=weak_terms,
+            phrase="superlative",
+            kind="superlative",
+            strength="strong",
+            confidence_delta=0.25,
         )
-    )
 
+    for phrase in STRONG_AGGREGATION_TERMS:
+        pattern = r"\bhow many\b" if phrase == "how many" else rf"\b{re.escape(phrase)}\b"
+        if re.search(pattern, lowered):
+            asks_aggregation = True
+            confidence += _add_question_evidence(
+                evidence=evidence,
+                matched_phrases=matched_phrases,
+                strong_terms=strong_terms,
+                weak_terms=weak_terms,
+                phrase=phrase,
+                kind="aggregation",
+                strength="strong",
+                confidence_delta=0.25,
+                schema_columns=_schema_columns_matching_phrase(phrase, context_tables),
+            )
 
-def _question_mentions_multiple_metrics(question: str) -> bool:
-    lowered = question.lower()
-    metric_matches = re.findall(
-        r"\b(?:average|avg|mean|sum|total|count|number|ratio|percentage|percent|rate|"
-        r"amount|cost|price|score|value|view count)\b",
-        lowered,
+    for phrase in RATIO_TERMS:
+        if re.search(rf"\b{re.escape(phrase)}\b", lowered):
+            asks_ratio_or_percentage = True
+            confidence += _add_question_evidence(
+                evidence=evidence,
+                matched_phrases=matched_phrases,
+                strong_terms=strong_terms,
+                weak_terms=weak_terms,
+                phrase=phrase,
+                kind="ratio_or_percentage",
+                strength="strong",
+                confidence_delta=0.25,
+                schema_columns=_schema_columns_matching_phrase(phrase, context_tables),
+            )
+
+    for phrase in VALUE_METRIC_TERMS:
+        if re.search(rf"\b{re.escape(phrase)}\b", lowered):
+            confidence += _add_question_evidence(
+                evidence=evidence,
+                matched_phrases=matched_phrases,
+                strong_terms=strong_terms,
+                weak_terms=weak_terms,
+                phrase=phrase,
+                kind="metric_value",
+                strength="medium",
+                confidence_delta=0.12,
+                schema_columns=_schema_columns_matching_phrase(phrase, context_tables),
+            )
+
+    for phrase in WEAK_METRIC_TERMS:
+        if re.search(rf"\b{re.escape(phrase)}\b", lowered):
+            schema_columns = _schema_columns_matching_phrase(phrase, context_tables)
+            confidence += _add_question_evidence(
+                evidence=evidence,
+                matched_phrases=matched_phrases,
+                strong_terms=strong_terms,
+                weak_terms=weak_terms,
+                phrase=phrase,
+                kind="weak_metric",
+                strength="weak",
+                confidence_delta=0.08 if schema_columns else 0.02,
+                schema_columns=schema_columns,
+            )
+
+    entity_patterns = (
+        r"\b(?:list|show|return|all|each|every|rows|records|entries|matching|matched)\b",
+        r"\b(?:what|which|who)\s+are\b",
+        r"\b(?:what|which|who)\s+(?:[a-z0-9_ -]+s|rows|records|entries)\b",
     )
-    return len(set(metric_matches)) >= 2 or bool(
-        re.search(
-            r"\b(?:average|avg|mean|sum|total|count|number|amount|cost|price|score|value)"
-            r"\b[^?.]{0,80}\band\b[^?.]{0,80}\b"
-            r"(?:average|avg|mean|sum|total|count|number|amount|cost|price|score|value)\b",
-            lowered,
+    if any(re.search(pattern, lowered) for pattern in entity_patterns):
+        asks_entity_or_list = True
+        confidence += _add_question_evidence(
+            evidence=evidence,
+            matched_phrases=matched_phrases,
+            strong_terms=strong_terms,
+            weak_terms=weak_terms,
+            phrase="entity_or_list",
+            kind="answer_shape",
+            strength="medium",
+            confidence_delta=0.12,
         )
+
+    if re.search(r"\b(?:and|plus)\b", lowered) or re.search(r"\bwith\s+(?:their|its|the)\b", lowered):
+        asks_multi_attribute = True
+        confidence += _add_question_evidence(
+            evidence=evidence,
+            matched_phrases=matched_phrases,
+            strong_terms=strong_terms,
+            weak_terms=weak_terms,
+            phrase="multi_attribute_connector",
+            kind="answer_shape",
+            strength="weak",
+            confidence_delta=0.04,
+        )
+
+    has_strong_metric_signal = asks_aggregation or asks_ratio_or_percentage or any(
+        entry.get("kind") == "metric_value" for entry in evidence
     )
-
-
-def _question_mentions_entity_plus_metric(question: str) -> bool:
-    lowered = question.lower()
-    asks_for_entity_or_table = bool(
-        re.search(r"\b(?:which|who|list|show|return|provide|give)\b", lowered)
-        or re.search(r"\bwhat\s+(?:are|names|records|rows|entries)\b", lowered)
-        or re.search(r"\bwith\s+(?:their|its|the)\b", lowered)
+    has_schema_backed_weak_metric = any(
+        entry.get("kind") == "weak_metric" and entry.get("schema_columns")
+        for entry in evidence
     )
     scalar_lead = bool(
         re.search(
-            r"\bwhat\s+is\s+(?:the\s+)?(?:average|avg|mean|sum|total|count|number|ratio|percentage|percent|rate)\b",
+            r"\bwhat\s+is\s+(?:the\s+)?(?:average|avg|mean|sum|total|count|ratio|percentage|percent)\b",
             lowered,
         )
         or re.search(r"\bhow many\b", lowered)
     )
-    return asks_for_entity_or_table and _question_mentions_metric_answer(question) and not scalar_lead
+    asks_entity_plus_metric = (
+        asks_entity_or_list
+        and (has_strong_metric_signal or has_schema_backed_weak_metric)
+        and not scalar_lead
+    )
+    asks_scalar_metric = (
+        ((asks_aggregation or asks_ratio_or_percentage) and not asks_entity_or_list)
+        or (scalar_lead and not asks_multi_attribute)
+    )
+    if asks_superlative and not asks_entity_or_list:
+        asks_scalar_metric = True
+
+    return QuestionFeatures(
+        asks_scalar_metric=asks_scalar_metric,
+        asks_entity_or_list=asks_entity_or_list,
+        asks_multi_attribute=asks_multi_attribute,
+        asks_entity_plus_metric=asks_entity_plus_metric,
+        asks_aggregation=asks_aggregation,
+        asks_ratio_or_percentage=asks_ratio_or_percentage,
+        asks_superlative=asks_superlative,
+        matched_phrases=tuple(dict.fromkeys(matched_phrases)),
+        strong_terms=tuple(dict.fromkeys(strong_terms)),
+        weak_terms=tuple(dict.fromkeys(weak_terms)),
+        confidence=round(min(confidence, 1.0), 3),
+        evidence=tuple(evidence),
+    )
+
+
+def _question_mentions_attribute_pair(question: str) -> bool:
+    return extract_question_features(question).asks_multi_attribute
+
+
+def _question_mentions_metric_answer(question: str) -> bool:
+    features = extract_question_features(question)
+    return bool(features.strong_terms or features.weak_terms)
+
+
+def _question_mentions_multiple_metrics(question: str) -> bool:
+    features = extract_question_features(question)
+    metric_terms = [
+        entry["phrase"]
+        for entry in features.evidence
+        if entry.get("kind") in {"aggregation", "ratio_or_percentage", "metric_value", "weak_metric"}
+        and (entry.get("strength") != "weak" or entry.get("schema_columns"))
+    ]
+    return len(set(metric_terms)) >= 2
+
+
+def _question_mentions_entity_plus_metric(question: str) -> bool:
+    return extract_question_features(question).asks_entity_plus_metric
 
 
 def _display_like_columns(frame: pd.DataFrame) -> list[str]:
@@ -3447,31 +3665,20 @@ def query_context_retriever(task_context: TaskContext, question: str) -> Retriev
 def _question_mentions_filter_or_condition(question: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:where|with|whose|having|under|over|above|below|less than|greater than|between|before|after|equals?)\b",
+            r"\b(?:where|with|whose|having|under|over|above|below|less than|greater than|between|before|after|equals?|condition|match|matching|selected)\b",
             question.lower(),
         )
     )
 
 
 def _question_mentions_multiple_attributes(question: str) -> bool:
-    lowered = question.lower()
-    return bool(
-        (
-            re.search(r"\b(?:and|plus|along with|including|with their|with its|with the)\b", lowered)
-            and re.search(r"\b(?:return|list|show|provide|give|which|who|what)\b", lowered)
-        )
-        or _question_mentions_multiple_metrics(lowered)
-        or _question_mentions_entity_plus_metric(lowered)
-    )
+    features = extract_question_features(question)
+    return features.asks_multi_attribute or features.asks_entity_plus_metric
 
 
 def _question_asks_count_metric(question: str) -> bool:
-    lowered = question.lower()
-    return bool(
-        re.search(r"\bhow many\b", lowered)
-        or re.search(r"\bnumber of\b", lowered)
-        or re.search(r"\bcount\s+(?:of|the|all|rows|records|entries)\b", lowered)
-    )
+    features = extract_question_features(question)
+    return any(term in features.strong_terms for term in ("how many", "count"))
 
 
 def _retrieval_confidence(retrieved_context: RetrievedContext | None) -> float:
@@ -3493,7 +3700,11 @@ def _cheap_count_fallback_candidate(
     retrieved_context: RetrievedContext | None,
 ) -> tuple[pd.DataFrame, dict[str, Any]] | None:
     question = task_context.task.question
-    if not _question_asks_count_metric(question):
+    features = extract_question_features(question, task_context.context_tables)
+    strong_count_evidence = any(term in features.strong_terms for term in ("how many", "count"))
+    if not (features.asks_aggregation or features.asks_scalar_metric) or not strong_count_evidence:
+        return None
+    if _question_mentions_filter_or_condition(question):
         return None
 
     table_lookup = task_context.table_lookup()
@@ -3519,7 +3730,7 @@ def _cheap_count_fallback_candidate(
     if scored_tables:
         top_score, top_name = scored_tables[0]
         second_score = scored_tables[1][0] if len(scored_tables) > 1 else 0.0
-        if top_score >= 10 and (
+        if top_score >= 20 and (
             second_score <= 0
             or top_score >= second_score + 5
             or top_score >= second_score * 1.5
@@ -3543,6 +3754,9 @@ def _cheap_count_fallback_candidate(
         "row_count": len(selected_table.frame),
         "retrieval_score": score,
         "reason": reason,
+        "question_features": features.to_dict(),
+        "executed_filter": False,
+        "confidence": 0.2 if reason == "single_context_table" else 0.25,
     }
     return pd.DataFrame({"count": [len(selected_table.frame)]}), diagnostics
 
@@ -3713,19 +3927,20 @@ def should_run_planner_rescue(
 
 def infer_task_intent(task_context: TaskContext) -> TaskIntent:
     question = task_context.task.question.lower()
+    features = extract_question_features(task_context.task.question, task_context.context_tables)
     target_columns = _question_referenced_columns(question, task_context.context_tables)
     operation: str | None = None
-    if "percentage" in question or "percent" in question:
+    if features.asks_ratio_or_percentage and ("percentage" in features.matched_phrases or "percent" in features.matched_phrases):
         operation = "percentage"
-    elif "ratio" in question or "proportion" in question:
+    elif features.asks_ratio_or_percentage:
         operation = "ratio"
-    elif "average" in question or "avg" in question or "mean" in question:
+    elif any(term in features.strong_terms for term in ("average", "avg", "mean")):
         operation = "average"
-    elif _question_asks_count_metric(question):
+    elif any(term in features.strong_terms for term in ("count", "how many")):
         operation = "count"
-    elif _superlative_direction(question) is not None:
+    elif features.asks_superlative:
         operation = "superlative"
-    elif "sum" in question or "total" in question:
+    elif any(term in features.strong_terms for term in ("sum", "total")):
         operation = "sum"
     else:
         operation = "filter_select"
@@ -3734,8 +3949,10 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
     answer_kind = (
         "scalar"
         if operation in {"average", "count", "sum", "ratio", "percentage"}
-        and not _question_mentions_entity_plus_metric(question)
-        and not _question_mentions_multiple_attributes(question)
+        and features.asks_scalar_metric
+        and features.confidence >= 0.45
+        and not features.asks_entity_plus_metric
+        and not features.asks_multi_attribute
         else "table"
     )
     return TaskIntent(
@@ -3748,23 +3965,47 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
 
 
 def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> AnswerContract:
-    question = task_context.task.question.lower()
-    if intent.answer_kind == "scalar":
+    question = task_context.task.question
+    features = extract_question_features(question, task_context.context_tables)
+    schema_columns = [str(column) for table in task_context.context_tables for column in table.frame.columns]
+    display_schema_columns = [column for column in schema_columns if _is_display_like_column(column)]
+    metric_schema_columns = [
+        column
+        for table in task_context.context_tables
+        for column in table.frame.columns
+        if str(column) in _metric_like_columns(table.frame)
+    ]
+    target_display_columns = [column for column in intent.target_columns if _is_display_like_column(column)]
+    target_metric_columns = [column for column in intent.target_columns if column in metric_schema_columns]
+    has_entity_metric_schema_evidence = bool(
+        (target_display_columns or display_schema_columns)
+        and (target_metric_columns or metric_schema_columns)
+    )
+
+    if (
+        intent.answer_kind == "scalar"
+        and features.asks_scalar_metric
+        and features.confidence >= 0.45
+        and not features.asks_entity_or_list
+    ):
         return AnswerContract(
             kind="scalar",
             expected_columns=("answer",),
             max_rows=1,
             max_columns=1,
             allow_empty=False,
-            reason="Question asks for a scalar metric.",
+            reason="Question features and schema evidence indicate a scalar metric.",
         )
 
     if intent.target_columns:
         expected_column_count = len(intent.target_columns)
-        if _question_mentions_entity_plus_metric(question) or _question_mentions_multiple_metrics(question):
+        if (
+            features.asks_entity_plus_metric
+            and has_entity_metric_schema_evidence
+        ) or (features.asks_aggregation and expected_column_count >= 2):
             max_columns = max(2, min(expected_column_count + 2, 4))
             kind = "multi_attribute"
-        elif expected_column_count == 1 and _question_mentions_attribute_pair(question):
+        elif expected_column_count >= 2 and features.asks_multi_attribute:
             max_columns = 2
             kind = "two_attribute"
         else:
@@ -3773,30 +4014,30 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
         return AnswerContract(
             kind=kind if expected_column_count > 1 or max_columns > 1 else "attribute_lookup",
             expected_columns=intent.target_columns,
-            max_rows=1 if _question_looks_single_answer(question) else None,
+            max_rows=1 if (features.asks_superlative and not features.asks_entity_or_list) else None,
             max_columns=max_columns,
             allow_empty=False,
-            reason="Question references answer-shaped context columns.",
+            reason="Question features are backed by matched schema columns.",
         )
 
-    if _question_mentions_entity_plus_metric(question) or _question_mentions_multiple_metrics(question):
+    if features.asks_entity_plus_metric and has_entity_metric_schema_evidence:
         return AnswerContract(
             kind="multi_attribute",
             expected_columns=(),
-            max_rows=1 if _question_looks_single_answer(question) else None,
+            max_rows=1 if (features.asks_superlative and not features.asks_entity_or_list) else None,
             max_columns=3,
             allow_empty=False,
-            reason="Question asks for an entity/table answer with metric attributes.",
+            reason="Question features and schema evidence indicate entity plus metric attributes.",
         )
 
-    if _question_looks_list_answer(question):
+    if features.asks_entity_or_list and features.confidence >= 0.12:
         return AnswerContract(
             kind="entity_list",
             expected_columns=(),
             max_rows=None,
             max_columns=1,
             allow_empty=False,
-            reason="Question asks for a list of entities.",
+            reason="Question features indicate an entity/list answer.",
         )
 
     return AnswerContract(
@@ -3998,14 +4239,9 @@ def _select_columns_by_priority(
 
 
 def _question_looks_list_answer(question: str) -> bool:
-    lowered = question.lower()
-    if _question_looks_single_answer(lowered):
+    if _question_looks_single_answer(question):
         return False
-    return bool(
-        re.search(r"\b(?:list|show|return|all|each|every|rows|records|entries|matching|matched)\b", lowered)
-        or re.search(r"\b(?:what|which|who)\s+are\b", lowered)
-        or re.search(r"\b(?:what|which|who)\s+(?:[a-z0-9_ -]+s|rows|records|entries)\b", lowered)
-    )
+    return extract_question_features(question).asks_entity_or_list
 
 
 def final_answer_shape_guard(
@@ -4063,13 +4299,6 @@ def final_answer_shape_guard(
         max_columns = contract.max_columns
         if contract.kind == "scalar":
             max_rows = 1
-            max_columns = 1
-        elif (
-            _question_looks_list_answer(task.question)
-            and not contract.expected_columns
-            and not _question_mentions_multiple_attributes(task.question)
-            and not _question_mentions_entity_plus_metric(task.question)
-        ):
             max_columns = 1
 
         if max_columns is not None and len(current.columns) > max_columns:
@@ -4133,6 +4362,7 @@ def rank_candidates(
     retrieved_context: RetrievedContext | None,
 ) -> tuple[Candidate | None, CandidateRankingReport]:
     scored: list[tuple[int, Candidate, list[str]]] = []
+    features = extract_question_features(question)
     relevant_columns = {
         column.lower()
         for columns in (retrieved_context.relevant_columns.values() if retrieved_context else [])
@@ -4152,19 +4382,32 @@ def rank_candidates(
         report = validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source)
         reasons: list[str] = []
         score = int(candidate.confidence * 10)
-        question_expects_multirow = _question_looks_list_answer(question)
+        question_expects_multirow = (
+            features.asks_entity_or_list
+            and contract.kind in {"entity_list", "table", "multi_attribute", "grouped_aggregation"}
+            and contract.max_rows is None
+        )
         if report.valid:
             score += 40
             reasons.append("contract_valid")
         else:
             score -= 60
             reasons.append(f"contract_invalid:{report.reason}")
-        if contract.max_columns is None or len(candidate.frame.columns) <= contract.max_columns:
-            score += 15 if contract.max_columns is not None else 5
-            reasons.append("column_count_ok")
+        if contract.max_columns is not None:
+            if len(candidate.frame.columns) <= contract.max_columns:
+                if contract.kind in {"scalar", "entity_list", "attribute_lookup"}:
+                    score += 15
+                    reasons.append("contract_column_shape_ok")
+                else:
+                    score += 5
+                    reasons.append("contract_column_shape_compatible")
+            else:
+                penalty = 40 if contract.kind in {"scalar", "entity_list", "attribute_lookup"} else 10
+                score -= penalty
+                reasons.append("contract_column_shape_mismatch")
         else:
-            score -= 40
-            reasons.append("extra_columns")
+            score += 5
+            reasons.append("open_column_contract")
         if contract.max_rows is None:
             if len(candidate.frame) > 0:
                 score += 5
@@ -4177,11 +4420,15 @@ def rank_candidates(
                     score -= 15
                     reasons.append("single_row_for_multirow_question")
         elif len(candidate.frame) <= contract.max_rows:
-            score += 15
-            reasons.append("row_count_ok")
+            if contract.kind == "scalar" or features.asks_superlative:
+                score += 15
+                reasons.append("contract_row_shape_ok")
+            else:
+                score += 5
+                reasons.append("contract_row_shape_compatible")
         else:
             score -= 30
-            reasons.append("too_many_rows")
+            reasons.append("contract_row_shape_mismatch")
         metadata_columns = _metadata_debug_columns(candidate.frame)
         if metadata_columns:
             score -= 50
@@ -4191,7 +4438,7 @@ def rank_candidates(
             reasons.append("no_metadata_columns")
         if _question_matched_columns(candidate.frame, question):
             score += 15
-            reasons.append("question_matched_column")
+            reasons.append("matched_schema_columns")
         candidate_columns = {str(column).lower() for column in candidate.frame.columns}
         if candidate_columns & relevant_columns:
             score += 15
@@ -4228,7 +4475,21 @@ def rank_candidates(
                 reasons.append("count_question_without_count_like_column")
         if any(transform.get("kind") == "identifier_resolution" for transform in candidate.transformations):
             score += 10
-            reasons.append("identifier_resolved")
+            reasons.append("display_id_resolution_evidence")
+        if any(transform.get("kind") == "cheap_count_fallback" for transform in candidate.transformations):
+            fallback = next(
+                transform for transform in candidate.transformations if transform.get("kind") == "cheap_count_fallback"
+            )
+            if any(term in features.strong_terms for term in ("how many", "count")) and not fallback.get("executed_filter"):
+                if _question_mentions_filter_or_condition(question):
+                    score -= 80
+                    reasons.append("count_fallback_without_required_filter")
+                else:
+                    score += 5
+                    reasons.append("count_operation_evidence")
+            else:
+                score -= 40
+                reasons.append("weak_count_fallback_evidence")
         if any(str(transform.get("kind", "")) == "aggregate_ratio_verification" for transform in candidate.transformations):
             aggregate_transforms = [
                 transform
@@ -4280,9 +4541,9 @@ def rank_candidates(
         if len(id_like_columns) >= 2 and not _question_asks_for_identifier(question):
             score -= 20
             reasons.append("many_id_helper_columns")
-        if candidate.source == "cheap_count_fallback" and not _question_asks_count_metric(question):
+        if candidate.source == "cheap_count_fallback" and not any(term in features.strong_terms for term in ("how many", "count")):
             score -= 100
-            reasons.append("count_fallback_without_count_question")
+            reasons.append("count_fallback_without_strong_count_evidence")
         if len(candidate.frame) == 0 and not contract.allow_empty:
             score -= 100
             reasons.append("empty_required_answer")
@@ -4779,7 +5040,7 @@ def _build_finalizer_messages(
     validation_error: str | None,
 ) -> list[dict[str, str]]:
     system_prompt = (
-        "You are a strict DataAgent benchmark answer-table finalizer. "
+        "You are a strict DataAgent answer-table finalizer. "
         "Use only the question and candidate table. Return one JSON object and no prose."
     )
     correction = ""
@@ -4790,8 +5051,7 @@ def _build_finalizer_messages(
         )
 
     user_prompt = (
-        "Choose the smallest final answer table needed to answer the question.\n"
-        "Official scoring ignores column names and row order, but extra columns are penalized.\n"
+        "Choose the final answer table needed to answer the question.\n"
         "Prefer selecting rows and columns from the candidate table because that preserves source values.\n"
         "Use rewrite only when a count, sum, average, ratio, percentage, or other scalar answer must be "
         "computed from the candidate.\n\n"
@@ -5174,6 +5434,7 @@ def _write_task_log(
     timings: dict[str, float] | None = None,
     llm_calls: list[dict[str, Any]] | None = None,
     route_policy: dict[str, Any] | None = None,
+    question_features: dict[str, Any] | None = None,
     answer_contract: dict[str, Any] | None = None,
     heuristic_level: str | None = None,
     enabled_strategies: list[dict[str, Any]] | None = None,
@@ -5208,6 +5469,7 @@ def _write_task_log(
         "timings": timings,
         "llm_calls": llm_calls or [],
         "route_policy": route_policy,
+        "question_features": question_features,
         "answer_contract": answer_contract,
         "heuristic_level": heuristic_level,
         "enabled_strategies": enabled_strategies or [],
@@ -5393,6 +5655,7 @@ def run_databao_task(
     finalization_report: AnswerFinalizationReport | None = None
     postprocess_report_payload: dict[str, Any] | None = None
     route_policy: RouteDecision | None = None
+    question_features: QuestionFeatures | None = None
     answer_contract: AnswerContract | None = None
     answer_contract_report: AnswerContractReport | None = None
     retrieved_context: RetrievedContext | None = None
@@ -5668,6 +5931,7 @@ def run_databao_task(
                 context_summary=context_summary,
                 heuristic_level=effective_heuristic_level,
             )
+            question_features = extract_question_features(task.question, task_context.context_tables)
             task_intent = infer_task_intent(task_context)
             answer_contract = infer_answer_contract(task_context, task_intent)
             retrieved_context = query_context_retriever(task_context, task.question)
@@ -5685,6 +5949,14 @@ def run_databao_task(
                         "applied_to_final_answer": False,
                     }
                 )
+            applied_strategies.append(
+                {
+                    "strategy_name": "question_feature_extraction",
+                    "strategy_kind": "generic",
+                    "result": question_features.to_dict(),
+                    "applied_to_final_answer": False,
+                }
+            )
             applied_strategies.append(
                 {
                     "strategy_name": "query_context_retriever",
@@ -5974,6 +6246,7 @@ def run_databao_task(
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            question_features=question_features.to_dict() if question_features else None,
             answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
             heuristic_level=effective_heuristic_level,
             enabled_strategies=enabled_strategies,
@@ -6010,6 +6283,7 @@ def run_databao_task(
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            question_features=question_features.to_dict() if question_features else None,
             answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
             heuristic_level=effective_heuristic_level,
             enabled_strategies=enabled_strategies,
@@ -6039,6 +6313,7 @@ def run_databao_task(
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            question_features=question_features.to_dict() if question_features else None,
             answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
             heuristic_level=effective_heuristic_level,
             enabled_strategies=enabled_strategies,
@@ -6083,6 +6358,7 @@ def run_databao_task(
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
             route_policy=route_policy.to_dict() if route_policy else None,
+            question_features=question_features.to_dict() if question_features else None,
             answer_contract=answer_contract_report.to_dict() if answer_contract_report else None,
             heuristic_level=effective_heuristic_level,
             enabled_strategies=enabled_strategies,

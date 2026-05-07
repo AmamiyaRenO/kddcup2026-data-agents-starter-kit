@@ -40,6 +40,7 @@ from data_agent_baseline.run.databao_demo import (
     choose_route_policy,
     document_records_for_reasoning,
     execute_structured_plan,
+    extract_question_features,
     final_answer_shape_guard,
     generate_verifier_candidate_frames,
     generic_document_tables,
@@ -759,6 +760,40 @@ class DatabaoDemoTests(unittest.TestCase):
                 "count\n2\n",
             )
 
+    def test_databao_failure_filtered_count_question_does_not_use_unfiltered_count_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            output_root = root / "output"
+            logs_dir = root / "logs"
+            write_task(input_root, question="How many records match the selected condition?")
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            csv_dir.mkdir()
+            (csv_dir / "records.csv").write_text("id,value\n1,A\n2,B\n", encoding="utf-8")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            def failing_agent_builder(task, databao_env):
+                del task, databao_env
+                raise TimeoutError("Databao timed out")
+
+            artifact = run_databao_task(
+                task=task,
+                output_root=output_root,
+                logs_dir=logs_dir,
+                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
+                agent_builder=failing_agent_builder,
+                answer_finalizer=no_answer_finalizer,
+                structured_planner=no_structured_planner,
+                structured_planner_mode="off",
+            )
+
+            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
+            self.assertFalse(artifact.succeeded)
+            self.assertFalse(artifact.prediction_written)
+            self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
+            self.assertIn("cheap count fallback", log_payload["missing_prediction_reason"])
+
     def test_databao_failure_non_count_question_does_not_write_whole_table_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1441,6 +1476,70 @@ class DatabaoDemoTests(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
+    def test_runner_prompt_has_no_scoring_aware_terms(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / "src" / "data_agent_baseline" / "run" / "databao_demo.py").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        banned_terms = [
+            "official scoring",
+            "extra columns are penalized",
+            "gold",
+        ]
+
+        violations = [term for term in banned_terms if term in text.lower()]
+
+        self.assertEqual(violations, [])
+
+    def test_runner_has_no_task_or_difficulty_specific_branches(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        text = (repo_root / "src" / "data_agent_baseline" / "run" / "databao_demo.py").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        banned_snippets = [
+            "if task.task_id ==",
+            "elif task.task_id ==",
+            "if task_id ==",
+            "elif task_id ==",
+            "if task.difficulty ==",
+            "elif task.difficulty ==",
+            "difficulty ==",
+            "difficulty !=",
+        ]
+
+        violations = [snippet for snippet in banned_snippets if snippet in text]
+
+        self.assertEqual(violations, [])
+
+    def test_question_features_treat_weak_metric_terms_as_schema_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Return display name and view count for matching rows.")
+            csv_dir = input_root / "task_1" / "context" / "csv"
+            csv_dir.mkdir(parents=True)
+            (csv_dir / "records.csv").write_text(
+                "DisplayName,ViewCount,status\nA,12,ok\nB,10,ok\n",
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            task_context = build_task_context(task)
+
+            weak_without_schema = extract_question_features("What is the number?")
+            with_schema = extract_question_features(task.question, task_context.context_tables)
+
+            self.assertFalse(weak_without_schema.asks_aggregation)
+            self.assertIn("view count", with_schema.weak_terms)
+            self.assertTrue(
+                any(
+                    evidence["phrase"] == "view count" and evidence["schema_columns"]
+                    for evidence in with_schema.evidence
+                )
+            )
+            self.assertTrue(with_schema.asks_multi_attribute)
+
     def test_answer_contract_rejects_source_name_singleton(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1514,7 +1613,7 @@ class DatabaoDemoTests(unittest.TestCase):
             contract = infer_answer_contract(task_context, infer_task_intent(task_context))
 
             self.assertEqual(contract.kind, "multi_attribute")
-            self.assertEqual(contract.max_rows, 1)
+            self.assertIsNone(contract.max_rows)
             self.assertGreaterEqual(contract.max_columns or 0, 3)
 
     def test_final_answer_shape_guard_removes_metadata_columns(self) -> None:
@@ -1574,7 +1673,7 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertEqual(guarded.shape, (1, 1))
             self.assertEqual(guarded.to_dict(orient="list"), {"answer": [3]})
 
-    def test_final_answer_shape_guard_enforces_entity_list_shape(self) -> None:
+    def test_final_answer_shape_guard_does_not_infer_list_shape_without_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             input_root = root / "input"
@@ -1596,7 +1695,10 @@ class DatabaoDemoTests(unittest.TestCase):
                 candidate_source="databao_raw",
             )
 
-            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A", "B"]})
+            self.assertEqual(
+                guarded.to_dict(orient="list"),
+                {"name": ["A", "B"], "score": [1, 2], "source": ["x", "y"]},
+            )
 
     def test_final_answer_shape_guard_preserves_explicit_table_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1746,8 +1848,35 @@ class DatabaoDemoTests(unittest.TestCase):
                 candidate_source="databao_raw",
             )
 
-            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A", "B"]})
+            self.assertEqual(
+                guarded.to_dict(orient="list"),
+                {"name": ["A", "B"]},
+            )
             self.assertIn("rowId", report.removed_columns)
+
+    def test_final_answer_shape_guard_uses_explicit_entity_list_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="List matching names.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="entity_list",
+                expected_columns=("name",),
+                max_rows=None,
+                max_columns=1,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, _ = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame({"name": ["A", "B"], "score": [1, 2], "source_doc": ["x", "y"]}),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
+
+            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["A", "B"]})
 
     def test_candidate_ranking_prefers_contract_valid_clean_candidate(self) -> None:
         contract = AnswerContract(
