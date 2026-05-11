@@ -30,30 +30,21 @@ OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DATABAO_DEBUG_LOG_RAW_ENV = "DATABAO_DEBUG_LOG_RAW"
 DATABAO_TASK_TIMEOUT_SECONDS_ENV = "DATABAO_TASK_TIMEOUT_SECONDS"
 DATABAO_DATABAO_TIMEOUT_SECONDS_ENV = "DATABAO_DATABAO_TIMEOUT_SECONDS"
-DATABAO_AUX_TIMEOUT_SECONDS_ENV = "DATABAO_AUX_TIMEOUT_SECONDS"
-DATABAO_STRUCTURED_PLANNER_MODE_ENV = "DATABAO_STRUCTURED_PLANNER_MODE"
-DATABAO_FINALIZER_MODE_ENV = "DATABAO_FINALIZER_MODE"
 DATABAO_HEURISTIC_LEVEL_ENV = "DATABAO_HEURISTIC_LEVEL"
 
 SOURCE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 MAX_DESCRIPTION_CHARS = 20000
-MAX_FINALIZER_ROWS = 120
-MAX_FINALIZER_CELL_CHARS = 500
-MAX_FINALIZER_PAYLOAD_CHARS = 45000
+MAX_CANDIDATE_PAYLOAD_ROWS = 120
+MAX_CANDIDATE_CELL_CHARS = 500
+MAX_CANDIDATE_PAYLOAD_CHARS = 45000
 MAX_DATABAO_TOKENS = 2048
-MAX_FINALIZER_TOKENS = 512
-MAX_STRUCTURED_PLANNER_TOKENS = 768
-STRUCTURED_PLANNER_ATTEMPTS = 1
-OPENAI_AUX_CALL_TIMEOUT_SECONDS = 30
 DATABAO_AGENT_TIMEOUT_SECONDS = 100
-MIN_SECONDS_FOR_PLANNER = 45
 MAX_FAILURE_REASON_CHARS = 1000
 MAX_CONTEXT_ENRICHMENT_ROWS = 80
 MAX_CONTEXT_METRIC_SUMMARIES = 8
-MAX_PLANNER_SAMPLE_ROWS = 3
+MAX_SCHEMA_SAMPLE_ROWS = 3
+MAX_SCHEMA_PROFILE_SAMPLE_ROWS = 512
 RECORD_ID_PATTERN = re.compile(r"^rec[A-Za-z0-9]+$")
-STRUCTURED_PLANNER_MODES = {"off", "fallback", "first"}
-FINALIZER_MODES = {"off", "always"}
 HEURISTIC_LEVELS = {"generic", "experimental_generic"}
 _CURRENT_DIAGNOSTICS: ContextVar["TaskDiagnostics | None"] = ContextVar(
     "databao_task_diagnostics",
@@ -93,6 +84,12 @@ DEBUG_METADATA_COLUMNS = {
     "record_id_kind",
     "debug",
     "trace",
+}
+
+HIGH_RISK_VERIFIER_KINDS = {
+    "context_superlative_verification",
+    "aggregate_ratio_verification",
+    "superlative_verification",
 }
 
 DOCUMENT_AGENT_SAFE_BASE_COLUMNS = {
@@ -171,8 +168,6 @@ class DatabaoTaskArtifacts:
     row_count: int | None = None
     column_count: int | None = None
     candidate_source: str | None = None
-    structured_planner: dict[str, Any] | None = None
-    finalization: dict[str, Any] | None = None
     postprocessing: dict[str, Any] | None = None
     timings: dict[str, float] | None = None
     llm_calls: list[dict[str, Any]] | None = None
@@ -188,6 +183,8 @@ class DatabaoTaskArtifacts:
     candidate_scores: list[dict[str, Any]] | None = None
     selected_candidate_source: str | None = None
     final_answer_guard: dict[str, Any] | None = None
+    context_payload_profile: dict[str, Any] | None = None
+    databao_failure_type: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -203,8 +200,6 @@ class DatabaoTaskArtifacts:
             "row_count": self.row_count,
             "column_count": self.column_count,
             "candidate_source": self.candidate_source,
-            "structured_planner": self.structured_planner,
-            "finalization": self.finalization,
             "postprocessing": self.postprocessing,
             "timings": self.timings,
             "llm_calls": self.llm_calls,
@@ -220,46 +215,12 @@ class DatabaoTaskArtifacts:
             "candidate_scores": self.candidate_scores or [],
             "selected_candidate_source": self.selected_candidate_source,
             "final_answer_guard": self.final_answer_guard,
+            "context_payload_profile": self.context_payload_profile,
+            "databao_failure_type": self.databao_failure_type,
         }
 
 
 AgentBuilder = Callable[[PublicTask, DatabaoEnvironment], Any]
-
-
-@dataclass(frozen=True, slots=True)
-class AnswerFinalizationReport:
-    attempted: bool
-    applied: bool
-    mode: str | None
-    attempts: int
-    failure_reason: str | None
-    input_row_count: int
-    input_column_count: int
-    output_row_count: int
-    output_column_count: int
-    all_rows_included: bool
-    attempt_details: list[dict[str, Any]] | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "attempted": self.attempted,
-            "applied": self.applied,
-            "mode": self.mode,
-            "attempts": self.attempts,
-            "failure_reason": self.failure_reason,
-            "input_row_count": self.input_row_count,
-            "input_column_count": self.input_column_count,
-            "output_row_count": self.output_row_count,
-            "output_column_count": self.output_column_count,
-            "all_rows_included": self.all_rows_included,
-            "attempt_details": self.attempt_details or [],
-        }
-
-
-AnswerFinalizer = Callable[
-    [PublicTask, pd.DataFrame, DatabaoEnvironment],
-    tuple[pd.DataFrame, AnswerFinalizationReport],
-]
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,7 +362,6 @@ class TaskComplexityProfile:
     best_candidate_shape_mismatch: bool | None
     complexity_score: int
     uncertainty_score: int
-    planner_payload_within_limit: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -434,7 +394,6 @@ class TaskComplexityProfile:
             "best_candidate_shape_mismatch": self.best_candidate_shape_mismatch,
             "complexity_score": self.complexity_score,
             "uncertainty_score": self.uncertainty_score,
-            "planner_payload_within_limit": self.planner_payload_within_limit,
         }
 
 
@@ -587,46 +546,6 @@ class AnswerContractReport:
 
 
 @dataclass(frozen=True, slots=True)
-class StructuredPlannerReport:
-    attempted: bool
-    succeeded: bool
-    attempts: int
-    failure_reason: str | None
-    plan: dict[str, Any] | None
-    output_row_count: int | None
-    output_column_count: int | None
-    attempt_details: list[dict[str, Any]]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "attempted": self.attempted,
-            "succeeded": self.succeeded,
-            "attempts": self.attempts,
-            "failure_reason": self.failure_reason,
-            "plan": self.plan,
-            "output_row_count": self.output_row_count,
-            "output_column_count": self.output_column_count,
-            "attempt_details": self.attempt_details,
-        }
-
-
-StructuredPlanner = Callable[
-    [PublicTask, DatabaoEnvironment],
-    tuple[pd.DataFrame | None, StructuredPlannerReport],
-]
-
-
-@dataclass(frozen=True, slots=True)
-class ChatModelResult:
-    text: str
-    response_format_used: bool
-    fallback_used: bool
-    elapsed_seconds: float
-    response_chars: int
-    fallback_error: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class ContextIdentifierMatch:
     score: float
     table: ContextTable
@@ -740,18 +659,6 @@ def _remaining_seconds(deadline_at: float | None) -> float | None:
     return max(0.0, deadline_at - perf_counter())
 
 
-def _planner_skip_reason_for_deadline(deadline_at: float | None) -> str | None:
-    remaining = _remaining_seconds(deadline_at)
-    if remaining is None:
-        return None
-    if remaining < MIN_SECONDS_FOR_PLANNER:
-        return (
-            "Structured planner skipped because remaining task budget "
-            f"({remaining:.1f}s) is below {MIN_SECONDS_FOR_PLANNER}s."
-        )
-    return None
-
-
 def _databao_timeout_seconds(deadline_at: float | None = None) -> int:
     configured = _env_int(DATABAO_DATABAO_TIMEOUT_SECONDS_ENV, DATABAO_AGENT_TIMEOUT_SECONDS)
     if deadline_at is None:
@@ -777,49 +684,6 @@ def _normalize_mode(
         allowed_values = ", ".join(sorted(allowed))
         raise ValueError(f"Unsupported mode {value!r}. Expected one of: {allowed_values}.")
     return mode
-
-
-def _structured_planner_mode(value: str | None = None) -> str:
-    return _normalize_mode(
-        value if value is not None else os.environ.get(DATABAO_STRUCTURED_PLANNER_MODE_ENV),
-        default="off",
-        allowed=STRUCTURED_PLANNER_MODES,
-        aliases={
-            "0": "off",
-            "false": "off",
-            "no": "off",
-            "disabled": "off",
-            "disable": "off",
-            "1": "first",
-            "true": "first",
-            "yes": "first",
-            "on": "first",
-            "planner-first": "first",
-            "databao-first": "fallback",
-            "fallback-on-failure": "fallback",
-        },
-    )
-
-
-def _finalizer_mode(value: str | None = None) -> str:
-    return _normalize_mode(
-        value if value is not None else os.environ.get(DATABAO_FINALIZER_MODE_ENV),
-        default="off",
-        allowed=FINALIZER_MODES,
-        aliases={
-            "0": "off",
-            "false": "off",
-            "no": "off",
-            "disabled": "off",
-            "disable": "off",
-            "1": "always",
-            "true": "always",
-            "yes": "always",
-            "on": "always",
-            "enabled": "always",
-            "enable": "always",
-        },
-    )
 
 
 def _heuristic_level(value: str | None = None) -> str:
@@ -885,6 +749,7 @@ class TaskDiagnostics:
         self.raw_dir = logs_dir / "raw" / task.task_id
         self.progress_path = logs_dir / f"{task.task_id}.progress.json"
         self._raw_counter = 0
+        self.checkpoints: dict[str, Any] = {}
 
     @contextmanager
     def stage(self, name: str):
@@ -913,6 +778,7 @@ class TaskDiagnostics:
             "active_stage": active_stage,
             "timings": self.timings,
             "llm_call_count": len(self.llm_calls),
+            "checkpoints": _safe_log_value(self.checkpoints, self.secrets),
         }
         if metadata:
             payload["metadata"] = _safe_log_value(dict(metadata), self.secrets)
@@ -923,6 +789,7 @@ class TaskDiagnostics:
         )
 
     def checkpoint(self, name: str, **metadata: Any) -> None:
+        self.checkpoints[name] = dict(metadata)
         self.write_progress(active_stage=name, event="checkpoint", metadata=metadata)
 
     def write_raw(self, label: str, payload: Any) -> str | None:
@@ -1027,10 +894,10 @@ def _relative_posix(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _description_from_file(path: Path, root: Path) -> str:
+def _description_from_file(path: Path, root: Path, *, max_chars: int = MAX_DESCRIPTION_CHARS) -> str:
     text = path.read_text(encoding="utf-8", errors="replace")
-    if len(text) > MAX_DESCRIPTION_CHARS:
-        text = text[:MAX_DESCRIPTION_CHARS] + "\n...[truncated]"
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[truncated]"
     return f"Document file {_relative_posix(path, root)}:\n{text}"
 
 
@@ -1354,7 +1221,9 @@ def _retrieved_context_allows_table(
     return table_key in relevant or path_key in relevant or stem_key in relevant
 
 
-def _retrieved_document_description(retrieved_context: RetrievedContext | None) -> str | None:
+def _retrieved_document_description(
+    retrieved_context: RetrievedContext | None,
+) -> str | None:
     if retrieved_context is None or not retrieved_context.document_snippets:
         return None
     lines = ["Retrieved document snippets for this question:"]
@@ -1372,8 +1241,11 @@ def register_context_sources(
     *,
     heuristic_level: str | None = None,
     retrieved_context: RetrievedContext | None = None,
+    question: str | None = None,
 ) -> dict[str, Any]:
+    del question
     effective_heuristic_level = _heuristic_level(heuristic_level)
+    description_max_chars = MAX_DESCRIPTION_CHARS
     used_names: set[str] = set()
     summary: dict[str, Any] = {
         "csv_files": [],
@@ -1392,13 +1264,15 @@ def register_context_sources(
 
     knowledge_path = context_dir / "knowledge.md"
     if retrieved_context is None and knowledge_path.exists():
-        domain.add_description(_description_from_file(knowledge_path, context_dir))
+        domain.add_description(
+            _description_from_file(knowledge_path, context_dir, max_chars=description_max_chars)
+        )
         summary["document_files"].append(_relative_posix(knowledge_path, context_dir))
 
     doc_dir = context_dir / "doc"
     if retrieved_context is None and doc_dir.is_dir():
         for path in sorted(item for item in doc_dir.rglob("*") if item.is_file()):
-            domain.add_description(_description_from_file(path, context_dir))
+            domain.add_description(_description_from_file(path, context_dir, max_chars=description_max_chars))
             summary["document_files"].append(_relative_posix(path, context_dir))
 
     for path in _context_file_paths(context_dir, "csv", {".csv"}):
@@ -1423,13 +1297,14 @@ def register_context_sources(
                 summary["registered_sources"].append({"name": name, "kind": "json", "rows": len(frame)})
         else:
             if retrieved_context is None:
-                domain.add_description(_description_from_file(path, context_dir))
+                domain.add_description(_description_from_file(path, context_dir, max_chars=description_max_chars))
         summary["json_files"].append(_relative_posix(path, context_dir))
 
     for table in generic_document_tables(context_dir, heuristic_level=effective_heuristic_level):
+        agent_frame = table.frame
         name = _safe_source_name(f"doc_{table.name}", used_names)
         domain.add_df(
-            table.frame,
+            agent_frame,
             name=name,
             description=f"Materialized document table {table.path}",
         )
@@ -1438,7 +1313,8 @@ def register_context_sources(
             {
                 "name": table.name,
                 "path": table.path,
-                "rows": len(table.frame),
+                "rows": len(agent_frame),
+                "source_rows": len(table.frame),
                 "columns": [str(column) for column in table.frame.columns],
                 "strategy_name": metadata.get("strategy_name", "generic_document_tables"),
                 "strategy_kind": metadata.get("strategy_kind", "generic"),
@@ -1450,7 +1326,14 @@ def register_context_sources(
                 ),
             }
         )
-        summary["registered_sources"].append({"name": name, "kind": "document_table", "rows": len(table.frame)})
+        summary["registered_sources"].append(
+            {
+                "name": name,
+                "kind": "document_table",
+                "rows": len(agent_frame),
+                "source_rows": len(table.frame),
+            }
+        )
 
     for path in _context_file_paths(context_dir, "db", {".db", ".sqlite"}):
         if not _sqlite_has_tables(path):
@@ -1468,7 +1351,13 @@ def register_context_sources(
     return summary
 
 
-def load_context_tables(context_dir: Path, *, heuristic_level: str | None = None) -> list[ContextTable]:
+def load_context_tables(
+    context_dir: Path,
+    *,
+    heuristic_level: str | None = None,
+    question: str | None = None,
+) -> list[ContextTable]:
+    del question
     effective_heuristic_level = _heuristic_level(heuristic_level)
     tables: list[ContextTable] = []
 
@@ -1491,7 +1380,8 @@ def load_context_tables(context_dir: Path, *, heuristic_level: str | None = None
                 )
             )
 
-    tables.extend(generic_document_tables(context_dir, heuristic_level=effective_heuristic_level))
+    for table in generic_document_tables(context_dir, heuristic_level=effective_heuristic_level):
+        tables.append(table)
 
     for path in _context_file_paths(context_dir, "db", {".db", ".sqlite"}):
         if not _sqlite_has_tables(path):
@@ -1622,6 +1512,14 @@ def _display_series(table: ContextTable) -> tuple[str, pd.Series] | None:
         lowered = str(column).lower()
         if lowered.endswith("_name") or lowered.endswith(" name"):
             return str(column), frame[column]
+
+    display_like_columns = [
+        str(column)
+        for column in frame.columns
+        if _is_display_like_column(str(column)) and not _is_id_like_column(str(column))
+    ]
+    if display_like_columns:
+        return display_like_columns[0], frame[display_like_columns[0]]
 
     return None
 
@@ -1999,7 +1897,7 @@ def _context_enrichment_payload(task: PublicTask, frame: pd.DataFrame) -> list[d
         return []
 
     enrichments: list[dict[str, Any]] = []
-    row_indices = list(range(min(len(frame), MAX_FINALIZER_ROWS)))
+    row_indices = list(range(min(len(frame), MAX_CANDIDATE_PAYLOAD_ROWS)))
     for column_index, column in enumerate(frame.columns):
         column_name = str(column)
         row_value_pairs = [
@@ -2377,24 +2275,108 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         "url",
         "text",
     }
+    asks_identifier = _question_asks_for_identifier(question)
+    asks_textual_answer = bool(re.search(r"\b(?:comment|text|body|content)\b", lowered_question))
+    asks_name_answer = bool(re.search(r"\b(?:name|user|author|owner|editor|person|people)\b", lowered_question))
+    asks_count_answer = _question_asks_count_metric(question)
+    superlative_direction = _superlative_direction(question)
+    metric_sort_terms = {"score", "cost", "price", "amount", "count", "total", "value", "views", "view"}
     scored: list[tuple[int, str]] = []
     for index, column in enumerate(frame.columns):
         column_name = str(column)
+        column_lower = column_name.lower()
         aliases = _column_question_aliases(column_name)
         score = 0
-        if column_name.lower() in lowered_question:
+        if column_lower in lowered_question:
             score += 50
-        elif _is_id_like_column(column_name) and not _question_asks_for_identifier(question):
+        elif _is_id_like_column(column_name) and not asks_identifier:
             continue
         score += 10 * len(aliases & tokens)
         if any(alias in compact_question for alias in aliases if len(alias) > 3):
             score += 20
         if aliases & generic_answer_terms & tokens:
             score += 15
+        if asks_identifier and _is_id_like_column(column_name):
+            score += 40
+        if asks_count_answer:
+            count_aliases = aliases & {"answer", "count", "total"}
+            if count_aliases or column_lower.endswith("count") or column_lower.endswith("_count"):
+                score += 120
+            elif _is_display_like_column(column_name) or aliases & {"name", "title", "label", "status", "type"}:
+                score -= 80
+        if asks_textual_answer and (
+            aliases & {"comment", "text", "body", "content", "description"}
+            or column_lower in {"comment", "text", "body", "content"}
+        ):
+            score += 80
+        if asks_name_answer and (
+            _is_display_like_column(column_name)
+            or aliases & {"display", "displayname", "userdisplayname", "name", "owner", "editor", "author"}
+        ):
+            score += 35
+        if (
+            superlative_direction is not None
+            and asks_textual_answer
+            and aliases & metric_sort_terms
+            and not (aliases & {"comment", "text", "body", "content"})
+        ):
+            score -= 60
         if score > 0:
             scored.append((score * 1000 - index, column_name))
     scored.sort(reverse=True)
-    return tuple(dict.fromkeys(column for _, column in scored[:3]))
+    ordered = tuple(dict.fromkeys(column for _, column in scored[:3]))
+    if asks_identifier and not asks_name_answer:
+        id_columns = [column for _, column in scored if _is_id_like_column(column)]
+        if id_columns:
+            return (id_columns[0],)
+    if asks_count_answer:
+        count_columns = [
+            column
+            for _, column in scored
+            if (
+                _column_question_aliases(column) & {"answer", "count", "total"}
+                or column.lower().endswith("count")
+                or column.lower().endswith("_count")
+            )
+        ]
+        if count_columns:
+            return (count_columns[0],)
+    if asks_textual_answer:
+        text_columns = [
+            column
+            for _, column in scored
+            if (
+                _column_question_aliases(column) & {"text", "body", "content", "description"}
+                or column.lower() in {"comment", "text", "body", "content"}
+                or (
+                    "comment" in _column_question_aliases(column)
+                    and "count" not in _column_question_aliases(column)
+                    and column.lower() not in {"commentcount", "comment_count"}
+                )
+            )
+        ]
+        if text_columns:
+            return (text_columns[0],)
+    return ordered
+
+
+def _text_answer_columns(frame: pd.DataFrame) -> list[str]:
+    columns: list[str] = []
+    for column in frame.columns:
+        column_name = str(column)
+        column_lower = column_name.lower()
+        aliases = _column_question_aliases(column_name)
+        if (
+            aliases & {"text", "body", "content", "description"}
+            or column_lower in {"comment", "text", "body", "content"}
+            or (
+                "comment" in aliases
+                and "count" not in aliases
+                and column_lower not in {"commentcount", "comment_count"}
+            )
+        ):
+            columns.append(column_name)
+    return columns
 
 
 def apply_question_column_pruner(
@@ -2551,6 +2533,287 @@ def apply_aggregate_ratio_verifier(
     return frame, []
 
 
+def _column_value_signature(series: pd.Series) -> tuple[str, ...]:
+    return tuple(sorted(_text_value(value) for value in series.tolist()))
+
+
+def _non_empty_value_count(series: pd.Series) -> int:
+    return sum(1 for value in series.tolist() if _text_value(value))
+
+
+def _contract_expected_frame_columns(contract: AnswerContract, frame: pd.DataFrame) -> set[str]:
+    expected_lower = {column.lower() for column in contract.expected_columns}
+    return {str(column) for column in frame.columns if str(column).lower() in expected_lower}
+
+
+def apply_column_only_compactor(
+    task: PublicTask,
+    frame: pd.DataFrame,
+    contract: AnswerContract,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Build a conservative column-only candidate without changing row semantics."""
+    if len(frame.columns) <= 1:
+        return frame, []
+
+    features = extract_question_features(task.question)
+    selected_columns = [str(column) for column in frame.columns]
+    protected_columns = _contract_expected_frame_columns(contract, frame)
+    removed: list[dict[str, Any]] = []
+
+    def can_remove(column: str) -> bool:
+        return column not in protected_columns
+
+    non_empty_columns = {
+        str(column): _non_empty_value_count(frame[column])
+        for column in frame.columns
+    }
+    if any(count > 0 for count in non_empty_columns.values()):
+        for column, count in list(non_empty_columns.items()):
+            if count == 0 and len(selected_columns) > 1 and can_remove(column):
+                selected_columns.remove(column)
+                removed.append(
+                    {
+                        "column": column,
+                        "reason": "empty_column",
+                    }
+                )
+
+    signatures: dict[tuple[str, ...], str] = {}
+    for column in list(selected_columns):
+        signature = _column_value_signature(frame[column])
+        previous = signatures.get(signature)
+        if previous is not None and len(selected_columns) > 1 and can_remove(column):
+            selected_columns.remove(column)
+            removed.append(
+                {
+                    "column": column,
+                    "reason": "duplicate_column_values",
+                    "kept_column": previous,
+                }
+            )
+            continue
+        signatures[signature] = column
+
+    strong_metric_request = (
+        features.asks_aggregation
+        or features.asks_ratio_or_percentage
+        or features.asks_superlative
+        or any(
+            term in features.strong_terms
+            for term in ("average", "avg", "mean", "sum", "total", "count", "how many")
+        )
+    )
+    if (
+        features.asks_entity_or_list
+        and not features.asks_multi_attribute
+        and not strong_metric_request
+        and contract.kind in {"entity_list", "table", "multi_attribute", "attribute_lookup"}
+        and not (contract.kind in {"two_attribute", "multi_attribute"} and len(protected_columns) >= 2)
+    ):
+        display_columns = [
+            column
+            for column in selected_columns
+            if _is_display_like_column(column)
+        ]
+        if display_columns and len(display_columns) < len(selected_columns):
+            for column in list(selected_columns):
+                if column not in display_columns and len(selected_columns) > len(display_columns) and can_remove(column):
+                    selected_columns.remove(column)
+                    removed.append(
+                        {
+                            "column": column,
+                            "reason": "entity_list_display_answer_present",
+                            "kept_columns": display_columns,
+                        }
+                    )
+
+    if contract.kind in {"entity_list", "table", "multi_attribute", "attribute_lookup"} and len(frame) > 1:
+        display_columns = [
+            column
+            for column in selected_columns
+            if _is_display_like_column(column)
+        ]
+        non_constant_display_columns = [
+            column
+            for column in display_columns
+            if frame[column].map(_text_value).nunique(dropna=False) > 1
+        ]
+        if non_constant_display_columns:
+            for column in list(display_columns):
+                if (
+                    column not in non_constant_display_columns
+                    and len(selected_columns) > 1
+                    and column in selected_columns
+                    and can_remove(column)
+                ):
+                    selected_columns.remove(column)
+                    removed.append(
+                        {
+                            "column": column,
+                            "reason": "constant_display_helper",
+                            "kept_columns": non_constant_display_columns,
+                        }
+                    )
+
+    if len(selected_columns) == len(frame.columns) or not selected_columns:
+        return frame, []
+
+    output = frame.loc[:, selected_columns].copy().reset_index(drop=True)
+    return output, [
+        {
+            "kind": "column_only_compaction",
+            "selected_columns": selected_columns,
+            "removed_columns": [item["column"] for item in removed],
+            "removed_column_reasons": removed,
+            "input_columns": [str(column) for column in frame.columns],
+            "row_count_preserved": True,
+            "reason": "safe_column_only_cleanup",
+        }
+    ]
+
+
+def _approx_equal(left: float, right: float, *, rel_tol: float = 1e-6, abs_tol: float = 1e-9) -> bool:
+    return abs(left - right) <= max(abs_tol, rel_tol * max(abs(left), abs(right), 1.0))
+
+
+def _best_column_for_text_segment(columns: list[str], text: str) -> str | None:
+    tokens = _normalized_question_tokens(text)
+    compact_text = re.sub(r"[^a-z0-9]+", "", text.lower())
+    scored: list[tuple[int, str]] = []
+    for index, column in enumerate(columns):
+        aliases = _column_question_aliases(column)
+        score = 10 * len(aliases & tokens)
+        if any(alias in compact_text for alias in aliases if len(alias) > 3):
+            score += 20
+        if score > 0:
+            scored.append((score * 1000 - index, column))
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    return scored[0][1]
+
+
+def apply_ratio_scale_compactor(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    question = task.question.lower()
+    asks_percentage = "percentage" in question or "percent" in question
+    asks_ratio = "compared to" in question or "how many times" in question or "ratio" in question
+    if not (asks_percentage or asks_ratio):
+        return frame, []
+    if len(frame) != 1 or len(frame.columns) < 2:
+        return frame, []
+
+    numeric_columns = _numeric_columns(frame)
+    if len(numeric_columns) < 2:
+        return frame, []
+
+    result_terms = ("ratio", "percentage", "percent", "rate", "share", "proportion")
+    result_columns = [
+        column
+        for column in numeric_columns
+        if any(term in column.lower() for term in result_terms)
+    ]
+    result_column = result_columns[0] if result_columns else None
+    component_columns = [column for column in numeric_columns if column != result_column]
+    if len(component_columns) < 2:
+        return frame, []
+
+    numerator: str | None = None
+    denominator: str | None = None
+    if "compared to" in question:
+        before, after = question.split("compared to", 1)
+        numerator = _best_column_for_text_segment(component_columns, before)
+        denominator = _best_column_for_text_segment(
+            [column for column in component_columns if column != numerator],
+            after,
+        )
+    if denominator is None:
+        denominator = _best_numeric_column(
+            component_columns,
+            ("total", "all", "denominator", "count"),
+            require_match=True,
+        )
+    if numerator is None:
+        numerator = _question_matched_numeric_column(
+            component_columns,
+            question,
+            exclude=denominator,
+            require_match=True,
+        )
+    if numerator is None or denominator is None:
+        return frame, []
+
+    denominator_value = pd.to_numeric(frame[denominator], errors="coerce").iloc[0]
+    numerator_value = pd.to_numeric(frame[numerator], errors="coerce").iloc[0]
+    if pd.isna(denominator_value) or pd.isna(numerator_value) or float(denominator_value) == 0:
+        return frame, []
+
+    ratio_value = float(numerator_value) / float(denominator_value)
+    percentage_value = ratio_value * 100
+    transform: dict[str, Any] = {
+        "kind": "ratio_scale_compaction",
+        "numerator_column": numerator,
+        "denominator_column": denominator,
+        "denominator_nonzero": True,
+    }
+
+    if asks_ratio:
+        if result_column is not None:
+            result_value = pd.to_numeric(frame[result_column], errors="coerce").iloc[0]
+            if pd.isna(result_value):
+                return frame, []
+            result_float = float(result_value)
+            if not (
+                _approx_equal(result_float, ratio_value)
+                or _approx_equal(result_float, percentage_value)
+            ):
+                return frame, []
+            transform["source_result_column"] = result_column
+            transform["source_result_value"] = result_float
+        if ratio_value < 0:
+            return frame, []
+        output = pd.DataFrame({"ratio": [ratio_value]})
+        transform.update(
+            {
+                "mode": "ratio",
+                "value": ratio_value,
+                "sanity_check": "numerator_divided_by_denominator",
+            }
+        )
+        return output, [transform]
+
+    if asks_percentage:
+        if result_column is not None:
+            result_value = pd.to_numeric(frame[result_column], errors="coerce").iloc[0]
+            if pd.isna(result_value):
+                return frame, []
+            result_float = float(result_value)
+            if not 0 <= result_float <= 100:
+                return frame, []
+            if not _approx_equal(result_float, percentage_value):
+                return frame, []
+            value = result_float
+            transform["source_result_column"] = result_column
+            transform["source_result_value"] = result_float
+        else:
+            value = percentage_value
+            if not 0 <= value <= 100:
+                return frame, []
+        output = pd.DataFrame({"percentage": [value]})
+        transform.update(
+            {
+                "mode": "percentage",
+                "value": value,
+                "sanity_check": "percentage_matches_components",
+            }
+        )
+        return output, [transform]
+
+    return frame, []
+
+
 def postprocess_answer_table(
     task: PublicTask,
     frame: pd.DataFrame,
@@ -2596,9 +2859,49 @@ def generate_verifier_candidate_frames(
     if aggregate_transforms and not aggregate_frame.equals(frame):
         candidates.append((aggregate_frame, aggregate_transforms, 0.46))
 
+    ratio_frame, ratio_transforms = apply_ratio_scale_compactor(task, frame)
+    if ratio_transforms and not ratio_frame.equals(frame):
+        candidates.append((ratio_frame, ratio_transforms, 0.66))
+
     return candidates
 
 
+def _non_identifier_numeric_columns(frame: pd.DataFrame) -> list[str]:
+    return [
+        column
+        for column in _numeric_columns(frame)
+        if not _is_id_like_column(column)
+    ]
+
+
+def _display_candidate_columns(frame: pd.DataFrame) -> list[str]:
+    return [
+        str(column)
+        for column in frame.columns
+        if _is_display_like_column(str(column)) and not _is_id_like_column(str(column))
+    ]
+def _duration_seconds(value: Any) -> float | None:
+    text = _text_value(value)
+    if not text:
+        return None
+    if text.startswith("+"):
+        text = text[1:]
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    parts = text.split(":")
+    if not 2 <= len(parts) <= 3:
+        return None
+    try:
+        numeric = [float(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numeric) == 2:
+        minutes, seconds = numeric
+        return minutes * 60 + seconds
+    hours, minutes, seconds = numeric
+    return hours * 3600 + minutes * 60 + seconds
 def _table_lookup(context_tables: list[ContextTable]) -> dict[str, ContextTable]:
     lookup: dict[str, ContextTable] = {}
     for table in context_tables:
@@ -3064,134 +3367,19 @@ def execute_structured_plan(task: PublicTask, plan: Mapping[str, Any]) -> pd.Dat
 
 
 def _context_document_text(context_dir: Path) -> str:
+    max_chars = MAX_DESCRIPTION_CHARS
     pieces: list[str] = []
     knowledge_path = context_dir / "knowledge.md"
     if knowledge_path.exists():
-        pieces.append(_description_from_file(knowledge_path, context_dir))
+        pieces.append(_description_from_file(knowledge_path, context_dir, max_chars=max_chars))
     doc_dir = context_dir / "doc"
     if doc_dir.is_dir():
         for path in sorted(item for item in doc_dir.rglob("*") if item.is_file()):
-            pieces.append(_description_from_file(path, context_dir))
+            pieces.append(_description_from_file(path, context_dir, max_chars=max_chars))
     text = "\n\n".join(pieces)
-    if len(text) > MAX_DESCRIPTION_CHARS:
-        text = text[:MAX_DESCRIPTION_CHARS] + "\n...[truncated]"
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[truncated]"
     return text
-
-
-def _filter_context_tables_by_retrieval(
-    context_tables: list[ContextTable],
-    retrieved_context: RetrievedContext | None,
-) -> list[ContextTable]:
-    if retrieved_context is None:
-        return context_tables
-    relevant = {value.lower() for value in retrieved_context.relevant_tables}
-    filtered = [
-        table
-        for table in context_tables
-        if table.name.lower() in relevant or table.path.lower() in relevant
-    ]
-    return filtered or context_tables[: min(5, len(context_tables))]
-
-
-def _planner_schema_payload(
-    task: PublicTask,
-    *,
-    retrieved_context: RetrievedContext | None = None,
-) -> dict[str, Any]:
-    context_tables = _filter_context_tables_by_retrieval(
-        load_context_tables(task.context_dir),
-        retrieved_context,
-    )
-    tables = []
-    for table in context_tables:
-        frame = table.frame
-        tables.append(
-            {
-                "name": table.name,
-                "path": table.path,
-                "source_kind": _source_kind_from_context_path(table.path),
-                "row_count": len(frame),
-                "columns": [
-                    {
-                        "name": str(column),
-                        "dtype": str(frame[column].dtype),
-                        "sample_values": [
-                            _json_safe_cell(value)
-                            for value in frame[column].dropna().head(MAX_PLANNER_SAMPLE_ROWS).tolist()
-                        ],
-                    }
-                    for column in frame.columns
-                ],
-            }
-        )
-    return {
-        "question": task.question,
-        "tables": tables,
-        "schema_graph": build_schema_graph(context_tables),
-        "retrieved_context": retrieved_context.to_dict() if retrieved_context else None,
-        "documents": (
-            "\n\n".join(snippet["text"] for snippet in retrieved_context.document_snippets)
-            if retrieved_context is not None and retrieved_context.document_snippets
-            else _context_document_text(task.context_dir)[:MAX_DESCRIPTION_CHARS]
-        ),
-    }
-
-
-def _build_structured_planner_messages(
-    *,
-    task: PublicTask,
-    schema_payload: dict[str, Any],
-    validation_error: str | None,
-) -> list[dict[str, str]]:
-    del task
-    correction = ""
-    if validation_error is not None:
-        correction = (
-            "\n\nThe previous plan failed validation/execution: "
-            f"{validation_error}\nReturn corrected JSON only."
-        )
-
-    system_prompt = (
-        "You are a DataAgent structured query planner. Return one JSON object and no prose. "
-        "Do not write Python, SQL, or natural-language analysis."
-    )
-    user_prompt = (
-        "Build a safe dataframe plan that answers the question using only the provided tables.\n"
-        "Plan shape: {\"steps\":[...],\"output\":\"alias\"}.\n"
-        "Allowed ops:\n"
-        "- source: {\"op\":\"source\",\"table\":\"TableName\",\"alias\":\"a\"}\n"
-        "- filter: {\"op\":\"filter\",\"source\":\"a\",\"alias\":\"b\","
-        "\"conditions\":[{\"column\":\"col\",\"op\":\"==\",\"value\":2}]}\n"
-        "- join: {\"op\":\"join\",\"left\":\"b\",\"right_table\":\"Other\",\"left_on\":\"ID\","
-        "\"right_on\":\"ID\",\"how\":\"inner\",\"alias\":\"c\"}\n"
-        "- select: {\"op\":\"select\",\"source\":\"c\",\"alias\":\"d\","
-        "\"columns\":[\"ID\",\"SEX\",{\"column\":\"Diagnosis\",\"as\":\"Diagnosis\"}]}\n"
-        "- distinct, sort, top_k, limit, date_filter, aggregate, count_distinct, derive, "
-        "ratio, and percentage are also allowed when needed.\n"
-        "Use strict filters from the question. Prefer inner joins when listing attributes that must exist "
-        "in both tables. Return only final answer columns.\n\n"
-        "Task schema JSON:\n"
-        f"{json.dumps(schema_payload, ensure_ascii=False)}"
-        f"{correction}"
-    )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-
-def _parse_json_object_response(text: str, *, label: str) -> dict[str, Any]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    start = stripped.find("{")
-    if start < 0:
-        raise ValueError(f"{label} response did not contain a JSON object.")
-    payload, _ = json.JSONDecoder().raw_decode(stripped[start:])
-    if not isinstance(payload, dict):
-        raise ValueError(f"{label} response JSON must be an object.")
-    return payload
 
 
 def _table_has_columns(table: ContextTable, required_columns: tuple[str, ...]) -> bool:
@@ -3222,7 +3410,10 @@ def build_task_context(
     context_summary: dict[str, Any] | None = None,
     heuristic_level: str | None = None,
 ) -> TaskContext:
-    context_tables = load_context_tables(task.context_dir, heuristic_level=heuristic_level)
+    context_tables = load_context_tables(
+        task.context_dir,
+        heuristic_level=heuristic_level,
+    )
     return TaskContext(
         task=task,
         context_tables=context_tables,
@@ -3255,6 +3446,8 @@ def _column_question_aliases(column_name: str) -> set[str]:
         aliases.update({"url", "link", "website"})
     if "count" in parts or lowered.endswith("count"):
         aliases.add("count")
+    if lowered in {"text", "body", "content"} or parts & {"text", "body", "content"}:
+        aliases.add("comment")
     return {alias for alias in aliases if alias}
 
 
@@ -3454,7 +3647,7 @@ def extract_question_features(
             confidence_delta=0.12,
         )
 
-    if re.search(r"\b(?:and|plus)\b", lowered) or re.search(r"\bwith\s+(?:their|its|the)\b", lowered):
+    if re.search(r"\b(?:and|plus)\b", lowered) or re.search(r"\bwith\s+(?:their|its)\b", lowered):
         asks_multi_attribute = True
         confidence += _add_question_evidence(
             evidence=evidence,
@@ -3547,7 +3740,12 @@ def _metric_like_columns(frame: pd.DataFrame) -> list[str]:
         lowered = str(column).lower()
         if lowered == "id" or lowered.endswith("_id") or lowered.startswith("link_to_"):
             continue
-        if pd.to_numeric(frame[column], errors="coerce").notna().any():
+        series = frame[column]
+        if pd.api.types.is_numeric_dtype(series):
+            columns.append(str(column))
+            continue
+        sample = series.dropna().head(MAX_SCHEMA_PROFILE_SAMPLE_ROWS)
+        if len(sample) and pd.to_numeric(sample, errors="coerce").notna().any():
             columns.append(str(column))
     return columns
 
@@ -3617,7 +3815,7 @@ def query_context_retriever(task_context: TaskContext, question: str) -> Retriev
             columns = [str(column) for column in table.frame.columns[: min(5, len(table.frame.columns))]]
         relevant_columns[table.name] = tuple(columns[:12])
         sample_frame = table.frame.loc[:, [column for column in columns if column in table.frame.columns]].head(
-            MAX_PLANNER_SAMPLE_ROWS
+            MAX_SCHEMA_SAMPLE_ROWS
         )
         sample_rows[table.name] = [
             {str(column): _json_safe_cell(value) for column, value in row.items()}
@@ -3802,7 +4000,7 @@ def build_complexity_profile(
         document_file_count += 1
     document_text_chars = len(task_context.document_text)
     total_columns = sum(len(table.frame.columns) for table in tables)
-    total_rows_sampled = sum(min(len(table.frame), MAX_PLANNER_SAMPLE_ROWS) for table in tables)
+    total_rows_sampled = sum(min(len(table.frame), MAX_SCHEMA_SAMPLE_ROWS) for table in tables)
     question = task_context.task.question
     question_tokens = _normalized_question_tokens(question)
     has_unstructured_docs = document_file_count > 0 or bool(document_tables)
@@ -3873,13 +4071,6 @@ def build_complexity_profile(
         if best_candidate.confidence < 0.5:
             uncertainty_score += 10
 
-    planner_payload_size = len(
-        json.dumps(
-            _planner_schema_payload(task_context.task, retrieved_context=retrieved_context),
-            ensure_ascii=False,
-        )
-    )
-
     return TaskComplexityProfile(
         source_count=len(set(source_kinds)),
         table_count=len(tables),
@@ -3910,32 +4101,7 @@ def build_complexity_profile(
         best_candidate_shape_mismatch=best_shape_mismatch,
         complexity_score=complexity_score,
         uncertainty_score=uncertainty_score,
-        planner_payload_within_limit=planner_payload_size <= MAX_FINALIZER_PAYLOAD_CHARS,
     )
-
-
-def should_run_planner_rescue(
-    profile: TaskComplexityProfile,
-    remaining_seconds: float | None,
-    best_candidate: Candidate | None,
-) -> bool:
-    del best_candidate
-    if remaining_seconds is not None and remaining_seconds <= 90:
-        return False
-    if not profile.planner_payload_within_limit:
-        return False
-    uncertainty_threshold = 30 if profile.best_candidate_score is None else 45
-    if profile.complexity_score < 45 or profile.uncertainty_score < uncertainty_threshold:
-        return False
-    severe_candidate_problem = (
-        profile.best_candidate_contract_valid is False
-        or profile.best_candidate_empty is True
-        or profile.best_candidate_has_metadata_columns is True
-        or profile.best_candidate_shape_mismatch is True
-        or profile.best_candidate_score is None
-        or profile.best_candidate_score < 5
-    )
-    return severe_candidate_problem
 
 
 def infer_task_intent(task_context: TaskContext) -> TaskIntent:
@@ -4401,7 +4567,7 @@ def rank_candidates(
     has_valid_non_verifier_candidate = any(
         isinstance(candidate.frame, pd.DataFrame)
         and len(candidate.frame.columns) > 0
-        and not any("verification" in str(transform.get("kind", "")) for transform in candidate.transformations)
+        and not any(str(transform.get("kind", "")) in HIGH_RISK_VERIFIER_KINDS for transform in candidate.transformations)
         and validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source).valid
         for candidate in candidates
     )
@@ -4484,9 +4650,32 @@ def rank_candidates(
             else:
                 score -= 10
                 reasons.append("id_helper_column_without_id_request")
+                if display_like_columns:
+                    score -= 15
+                    reasons.append("id_helper_with_display_answer")
+        if _question_asks_for_identifier(question) and not features.asks_multi_attribute:
+            non_id_columns = [
+                str(column)
+                for column in candidate.frame.columns
+                if not _is_id_like_column(str(column))
+            ]
+            if id_like_columns and not non_id_columns:
+                score += 20
+                reasons.append("explicit_identifier_answer_only")
+            elif id_like_columns and non_id_columns:
+                score -= 20
+                reasons.append("explicit_identifier_answer_has_extra_columns")
         if display_like_columns and contract.kind in {"entity_list", "table", "attribute_lookup", "two_attribute", "multi_attribute"}:
             score += 10
             reasons.append("display_column_present")
+        if bool(re.search(r"\b(?:comment|text|body|content)\b", question.lower())):
+            text_answer_columns = _text_answer_columns(candidate.frame)
+            if text_answer_columns and len(text_answer_columns) == len(candidate.frame.columns):
+                score += 20
+                reasons.append("text_answer_columns_only")
+            elif text_answer_columns and len(candidate.frame.columns) > len(text_answer_columns):
+                score -= 25
+                reasons.append("text_answer_has_extra_columns")
         if _question_asks_for_url(question):
             if any("url" in str(column).lower() or "link" in str(column).lower() for column in candidate.frame.columns):
                 score += 20
@@ -4494,7 +4683,9 @@ def rank_candidates(
             else:
                 score -= 20
                 reasons.append("url_question_without_url_column")
-        if _question_asks_count_metric(question):
+        if _question_asks_count_metric(question) and (
+            contract.kind == "scalar" or (features.asks_aggregation and not _question_asks_for_identifier(question))
+        ):
             count_like_columns = [
                 str(column)
                 for column in candidate.frame.columns
@@ -4541,7 +4732,9 @@ def rank_candidates(
             if not report.valid:
                 score -= 30
                 reasons.append("aggregate_ratio_contract_invalid")
-        if any("verification" in str(transform.get("kind", "")) for transform in candidate.transformations):
+        if (
+            any(str(transform.get("kind", "")) in HIGH_RISK_VERIFIER_KINDS for transform in candidate.transformations)
+        ):
             score -= 15
             reasons.append("verifier_candidate_discount")
             if not report.valid:
@@ -4560,6 +4753,26 @@ def rank_candidates(
         ):
             score -= 50
             reasons.append("high_risk_verifier_discount")
+        if any(str(transform.get("kind", "")) == "ratio_scale_compaction" for transform in candidate.transformations):
+            if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
+                score += 35
+                reasons.append("ratio_scale_evidence")
+            else:
+                score -= 35
+                reasons.append("ratio_scale_sanity_failed")
+        if any(str(transform.get("kind", "")) == "column_only_compaction" for transform in candidate.transformations):
+            transform = next(
+                transform
+                for transform in candidate.transformations
+                if str(transform.get("kind", "")) == "column_only_compaction"
+            )
+            if (
+                transform.get("row_count_preserved") is True
+                and len(candidate.frame.columns) < len(transform.get("input_columns", []))
+                and not metadata_columns
+            ):
+                score += 20
+                reasons.append("safe_column_only_compaction")
         row_count = len(candidate.frame)
         column_count = len(candidate.frame.columns)
         if row_count > 1000:
@@ -4662,7 +4875,7 @@ def build_schema_graph(context_tables: list[ContextTable]) -> dict[str, Any]:
             column_name = str(column)
             sample_values = [
                 _json_safe_cell(value)
-                for value in table.frame[column].dropna().head(MAX_PLANNER_SAMPLE_ROWS).tolist()
+                for value in table.frame[column].dropna().head(MAX_SCHEMA_SAMPLE_ROWS).tolist()
             ]
             columns.append(
                 {
@@ -4807,16 +5020,7 @@ def try_deterministic_candidate(task_context: TaskContext, intent: TaskIntent) -
 def choose_route_policy(
     task_context: TaskContext,
     intent: TaskIntent,
-    *,
-    structured_planner_mode: str,
 ) -> RouteDecision:
-    if structured_planner_mode == "off":
-        return RouteDecision(
-            route="databao",
-            reason="Structured deterministic routes disabled with planner mode off.",
-            confidence=0.0,
-        )
-
     candidate = try_deterministic_candidate(task_context, intent)
     if candidate is not None:
         return RouteDecision(
@@ -4826,135 +5030,11 @@ def choose_route_policy(
             candidate=candidate,
         )
 
-    if structured_planner_mode == "first":
-        return RouteDecision(
-            route="llm_structured_planner_first",
-            reason="No deterministic route matched; planner mode requests structured planner first.",
-            confidence=0.5,
-        )
-
     return RouteDecision(
         route="databao",
-        reason="No high-confidence deterministic route matched; using Databao first.",
+        reason="No high-confidence deterministic route matched; using Databao-first baseline.",
         confidence=0.0,
     )
-
-
-def _structured_report_from_candidate(candidate: Candidate) -> StructuredPlannerReport:
-    return StructuredPlannerReport(
-        attempted=True,
-        succeeded=True,
-        attempts=0,
-        failure_reason=None,
-        plan=None,
-        output_row_count=len(candidate.frame),
-        output_column_count=len(candidate.frame.columns),
-        attempt_details=[
-            {
-                "attempt": 0,
-                "kind": "deterministic_route",
-                "source": candidate.source,
-                "confidence": candidate.confidence,
-                "diagnostics": candidate.diagnostics,
-            }
-        ],
-    )
-
-
-def plan_structured_candidate(
-    task: PublicTask,
-    databao_env: DatabaoEnvironment,
-) -> tuple[pd.DataFrame | None, StructuredPlannerReport]:
-    retrieved_context = _CURRENT_RETRIEVED_CONTEXT.get()
-    schema_payload = _planner_schema_payload(task, retrieved_context=retrieved_context)
-    validation_error: str | None = None
-    attempt_details: list[dict[str, Any]] = []
-    attempts = 0
-
-    if not schema_payload["tables"]:
-        report = StructuredPlannerReport(
-            attempted=True,
-            succeeded=False,
-            attempts=0,
-            failure_reason="No structured context tables were found.",
-            plan=None,
-            output_row_count=None,
-            output_column_count=None,
-            attempt_details=[],
-        )
-        return None, report
-
-    for attempt in range(1, STRUCTURED_PLANNER_ATTEMPTS + 1):
-        attempts = attempt
-        messages = _build_structured_planner_messages(
-            task=task,
-            schema_payload=schema_payload,
-            validation_error=validation_error,
-        )
-        detail: dict[str, Any] = {
-            "attempt": attempt,
-            "payload_chars": len(json.dumps(schema_payload, ensure_ascii=False)),
-        }
-        started_at = perf_counter()
-        try:
-            result = _call_openai_chat_model(
-                databao_env=databao_env,
-                messages=messages,
-                max_tokens=MAX_STRUCTURED_PLANNER_TOKENS,
-                stage=f"structured_planner_attempt_{attempt}",
-                prefer_json_response=True,
-            )
-            detail.update(
-                {
-                    "elapsed_seconds": result.elapsed_seconds,
-                    "response_chars": result.response_chars,
-                    "response_format_used": result.response_format_used,
-                    "fallback_used": result.fallback_used,
-                }
-            )
-            plan = _parse_json_object_response(result.text, label="Planner")
-            frame = execute_structured_plan(task, plan)
-            detail.update(
-                {
-                    "succeeded": True,
-                    "output_row_count": len(frame),
-                    "output_column_count": len(frame.columns),
-                }
-            )
-            attempt_details.append(detail)
-            report = StructuredPlannerReport(
-                attempted=True,
-                succeeded=True,
-                attempts=attempts,
-                failure_reason=None,
-                plan=dict(plan),
-                output_row_count=len(frame),
-                output_column_count=len(frame.columns),
-                attempt_details=attempt_details,
-            )
-            return frame, report
-        except Exception as exc:  # noqa: BLE001
-            validation_error = _safe_exception_summary(exc, (databao_env.model_api_key,))
-            detail.update(
-                {
-                    "succeeded": False,
-                    "elapsed_seconds": round(perf_counter() - started_at, 3),
-                    "validation_error": validation_error,
-                }
-            )
-            attempt_details.append(detail)
-
-    report = StructuredPlannerReport(
-        attempted=True,
-        succeeded=False,
-        attempts=attempts,
-        failure_reason=validation_error,
-        plan=None,
-        output_row_count=None,
-        output_column_count=None,
-        attempt_details=attempt_details,
-    )
-    return None, report
 
 
 def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> Any:
@@ -5010,7 +5090,7 @@ def _json_safe_cell(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, str):
-        return value[:MAX_FINALIZER_CELL_CHARS]
+        return value[:MAX_CANDIDATE_CELL_CHARS]
     if isinstance(value, bool | int | float):
         if pd.isna(value):
             return None
@@ -5023,8 +5103,8 @@ def _json_safe_cell(value: Any) -> Any:
         pass
 
     text = str(value)
-    if len(text) > MAX_FINALIZER_CELL_CHARS:
-        return text[:MAX_FINALIZER_CELL_CHARS] + "...[truncated]"
+    if len(text) > MAX_CANDIDATE_CELL_CHARS:
+        return text[:MAX_CANDIDATE_CELL_CHARS] + "...[truncated]"
     return text
 
 
@@ -5038,7 +5118,7 @@ def _candidate_table_payload(frame: pd.DataFrame, task: PublicTask | None = None
     ]
     rows: list[dict[str, Any]] = []
 
-    for row_index in range(min(len(frame), MAX_FINALIZER_ROWS)):
+    for row_index in range(min(len(frame), MAX_CANDIDATE_PAYLOAD_ROWS)):
         row_payload = {
             "row_index": row_index,
             "values": [_json_safe_cell(value) for value in frame.iloc[row_index].tolist()],
@@ -5048,7 +5128,7 @@ def _candidate_table_payload(frame: pd.DataFrame, task: PublicTask | None = None
             "rows": rows + [row_payload],
         }
         candidate_text = json.dumps(candidate_payload, ensure_ascii=False, separators=(",", ":"))
-        if rows and len(candidate_text) > MAX_FINALIZER_PAYLOAD_CHARS:
+        if rows and len(candidate_text) > MAX_CANDIDATE_PAYLOAD_CHARS:
             break
         rows.append(row_payload)
 
@@ -5064,355 +5144,6 @@ def _candidate_table_payload(frame: pd.DataFrame, task: PublicTask | None = None
         if context_enrichment:
             payload["context_enrichment"] = context_enrichment
     return payload
-
-
-def _build_finalizer_messages(
-    *,
-    task: PublicTask,
-    candidate_payload: dict[str, Any],
-    validation_error: str | None,
-) -> list[dict[str, str]]:
-    system_prompt = (
-        "You are a strict DataAgent answer-table finalizer. "
-        "Use only the question and candidate table. Return one JSON object and no prose."
-    )
-    correction = ""
-    if validation_error is not None:
-        correction = (
-            "\n\nThe previous response could not be used: "
-            f"{validation_error}\nReturn corrected JSON only."
-        )
-
-    user_prompt = (
-        "Choose the final answer table needed to answer the question.\n"
-        "Prefer selecting rows and columns from the candidate table because that preserves source values.\n"
-        "Use rewrite only when a count, sum, average, ratio, percentage, or other scalar answer must be "
-        "computed from the candidate.\n\n"
-        "Return exactly one of these JSON shapes:\n"
-        '{"mode":"select","column_indices":[0],"row_indices":[0,1]}\n'
-        '{"mode":"select","column_indices":[0],"row_indices":"all"}\n'
-        '{"mode":"rewrite","columns":["answer"],"rows":[["value"]]}\n\n'
-        "Rules:\n"
-        "- Include only columns explicitly requested or required to express the answer.\n"
-        "- Do not include helper, evidence, source, amount, id, or intermediate columns unless asked.\n"
-        "- For scalar aggregate questions, return one row with one value column.\n"
-        "- For list questions, return only matching rows, not candidates or near matches.\n"
-        '- If "all_rows_included" is false and the complete matching row set is uncertain, keep '
-        '"row_indices":"all" and only prune columns.\n'
-        "- Preserve source values; do not invent missing values.\n\n"
-        f"Question: {task.question}\n\n"
-        "Candidate table JSON:\n"
-        f"{json.dumps(candidate_payload, ensure_ascii=False)}"
-        f"{correction}"
-    )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-
-
-def _message_content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-    return str(content)
-
-
-def _completion_to_log_payload(completion: Any) -> Any:
-    if hasattr(completion, "model_dump"):
-        try:
-            return completion.model_dump(mode="json")
-        except Exception:  # noqa: BLE001
-            pass
-    return completion
-
-
-def _call_openai_chat_model(
-    *,
-    databao_env: DatabaoEnvironment,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    stage: str,
-    prefer_json_response: bool,
-) -> ChatModelResult:
-    from openai import OpenAI
-
-    client = OpenAI(
-        api_key=databao_env.model_api_key,
-        base_url=databao_env.model_api_url,
-        timeout=_env_int(DATABAO_AUX_TIMEOUT_SECONDS_ENV, OPENAI_AUX_CALL_TIMEOUT_SECONDS),
-        max_retries=0,
-    )
-    request_payload = {
-        "model": databao_env.model_name,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": max_tokens,
-    }
-    diagnostics = _CURRENT_DIAGNOSTICS.get()
-    started_at = perf_counter()
-    response_format_used = False
-    fallback_used = False
-    fallback_error: str | None = None
-    try:
-        if prefer_json_response:
-            response_format_used = True
-            completion = client.chat.completions.create(
-                **request_payload,
-                response_format={"type": "json_object"},
-            )
-        else:
-            completion = client.chat.completions.create(**request_payload)
-    except Exception as exc:  # noqa: BLE001
-        fallback_used = True
-        response_format_used = False
-        fallback_error = _safe_exception_summary(exc, (databao_env.model_api_key,))
-        completion = client.chat.completions.create(**request_payload)
-    content = completion.choices[0].message.content
-    text = _message_content_to_text(content).strip()
-    if prefer_json_response and not fallback_used and "{" not in text:
-        fallback_used = True
-        response_format_used = False
-        fallback_error = "response_format returned a non-object response."
-        completion = client.chat.completions.create(**request_payload)
-        content = completion.choices[0].message.content
-        text = _message_content_to_text(content).strip()
-    if not text:
-        raise ValueError(f"{stage} model returned an empty response.")
-
-    elapsed_seconds = round(perf_counter() - started_at, 3)
-    result = ChatModelResult(
-        text=text,
-        response_format_used=response_format_used,
-        fallback_used=fallback_used,
-        fallback_error=fallback_error,
-        elapsed_seconds=elapsed_seconds,
-        response_chars=len(text),
-    )
-    if diagnostics is not None:
-        diagnostics.record_llm_call(
-            stage,
-            metadata={
-                "model": databao_env.model_name,
-                "base_url": databao_env.model_api_url,
-                "max_tokens": max_tokens,
-                "response_format_used": response_format_used,
-                "fallback_used": fallback_used,
-                "fallback_error": fallback_error,
-                "elapsed_seconds": elapsed_seconds,
-                "response_chars": len(text),
-            },
-            raw_request=request_payload,
-            raw_response=_completion_to_log_payload(completion),
-        )
-    return result
-
-
-def _call_finalizer_model(
-    *,
-    databao_env: DatabaoEnvironment,
-    messages: list[dict[str, str]],
-    stage: str,
-) -> ChatModelResult:
-    return _call_openai_chat_model(
-        databao_env=databao_env,
-        messages=messages,
-        max_tokens=MAX_FINALIZER_TOKENS,
-        stage=stage,
-        prefer_json_response=True,
-    )
-
-
-def _parse_finalizer_json(text: str) -> dict[str, Any]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
-
-    start = stripped.find("{")
-    if start < 0:
-        raise ValueError("Finalizer response did not contain a JSON object.")
-    payload, _ = json.JSONDecoder().raw_decode(stripped[start:])
-    if not isinstance(payload, dict):
-        raise ValueError("Finalizer response JSON must be an object.")
-    return payload
-
-
-def _normalize_index_list(
-    value: Any,
-    *,
-    upper_bound: int,
-    field_name: str,
-    allow_all: bool = False,
-) -> list[int]:
-    if allow_all and value == "all":
-        return list(range(upper_bound))
-    if not isinstance(value, list):
-        raise ValueError(f"{field_name} must be a list of zero-based integer indices.")
-
-    indices: list[int] = []
-    seen: set[int] = set()
-    for raw_item in value:
-        if isinstance(raw_item, bool):
-            raise ValueError(f"{field_name} cannot contain boolean values.")
-        if isinstance(raw_item, int):
-            item = raw_item
-        elif isinstance(raw_item, str) and raw_item.strip().isdigit():
-            item = int(raw_item.strip())
-        else:
-            raise ValueError(f"{field_name} contains a non-integer value.")
-
-        if item < 0 or item >= upper_bound:
-            raise ValueError(f"{field_name} contains out-of-range index {item}.")
-        if item in seen:
-            raise ValueError(f"{field_name} contains duplicate index {item}.")
-        seen.add(item)
-        indices.append(item)
-
-    return indices
-
-
-def apply_answer_finalizer_decision(
-    frame: pd.DataFrame,
-    decision: Mapping[str, Any],
-) -> tuple[pd.DataFrame, str]:
-    mode = str(decision.get("mode", "select")).strip().lower()
-
-    if mode == "select":
-        column_indices = _normalize_index_list(
-            decision.get("column_indices"),
-            upper_bound=len(frame.columns),
-            field_name="column_indices",
-        )
-        if not column_indices:
-            raise ValueError("column_indices must not be empty.")
-        row_indices = _normalize_index_list(
-            decision.get("row_indices", "all"),
-            upper_bound=len(frame),
-            field_name="row_indices",
-            allow_all=True,
-        )
-        return frame.iloc[row_indices, column_indices].reset_index(drop=True), mode
-
-    if mode == "rewrite":
-        columns = decision.get("columns")
-        rows = decision.get("rows")
-        if not isinstance(columns, list) or not columns:
-            raise ValueError("rewrite columns must be a non-empty list.")
-        normalized_columns = [str(column) for column in columns]
-        if not isinstance(rows, list):
-            raise ValueError("rewrite rows must be a list.")
-
-        normalized_rows: list[list[Any]] = []
-        for row in rows:
-            if not isinstance(row, list | tuple):
-                raise ValueError("each rewrite row must be a list.")
-            if len(row) != len(normalized_columns):
-                raise ValueError("rewrite row width must match column count.")
-            normalized_rows.append([_json_safe_cell(value) for value in row])
-        return pd.DataFrame(normalized_rows, columns=normalized_columns), mode
-
-    raise ValueError(f"Unsupported finalizer mode: {mode}.")
-
-
-def finalize_answer_table(
-    task: PublicTask,
-    frame: pd.DataFrame,
-    databao_env: DatabaoEnvironment,
-) -> tuple[pd.DataFrame, AnswerFinalizationReport]:
-    candidate_payload = _candidate_table_payload(frame, task=task)
-    all_rows_included = bool(candidate_payload["all_rows_included"])
-    validation_error: str | None = None
-    attempts = 0
-    attempt_details: list[dict[str, Any]] = []
-    payload_chars = len(json.dumps(candidate_payload, ensure_ascii=False))
-
-    for attempt in range(1, 3):
-        attempts = attempt
-        messages = _build_finalizer_messages(
-            task=task,
-            candidate_payload=candidate_payload,
-            validation_error=validation_error,
-        )
-        detail: dict[str, Any] = {
-            "attempt": attempt,
-            "payload_chars": payload_chars,
-            "input_row_count": len(frame),
-            "input_column_count": len(frame.columns),
-        }
-        started_at = perf_counter()
-        try:
-            result = _call_finalizer_model(
-                databao_env=databao_env,
-                messages=messages,
-                stage=f"finalizer_attempt_{attempt}",
-            )
-            detail.update(
-                {
-                    "elapsed_seconds": result.elapsed_seconds,
-                    "response_chars": result.response_chars,
-                    "response_format_used": result.response_format_used,
-                    "fallback_used": result.fallback_used,
-                    "fallback_error": result.fallback_error,
-                }
-            )
-            decision = _parse_finalizer_json(result.text)
-            finalized_frame, mode = apply_answer_finalizer_decision(frame, decision)
-            detail.update(
-                {
-                    "succeeded": True,
-                    "mode": mode,
-                    "output_row_count": len(finalized_frame),
-                    "output_column_count": len(finalized_frame.columns),
-                }
-            )
-            attempt_details.append(detail)
-            return finalized_frame, AnswerFinalizationReport(
-                attempted=True,
-                applied=True,
-                mode=mode,
-                attempts=attempts,
-                failure_reason=None,
-                input_row_count=len(frame),
-                input_column_count=len(frame.columns),
-                output_row_count=len(finalized_frame),
-                output_column_count=len(finalized_frame.columns),
-                all_rows_included=all_rows_included,
-                attempt_details=attempt_details,
-            )
-        except Exception as exc:  # noqa: BLE001
-            validation_error = _safe_exception_summary(exc, (databao_env.model_api_key,))
-            detail.update(
-                {
-                    "succeeded": False,
-                    "elapsed_seconds": round(perf_counter() - started_at, 3),
-                    "validation_error": validation_error,
-                }
-            )
-            attempt_details.append(detail)
-
-    return frame, AnswerFinalizationReport(
-        attempted=True,
-        applied=False,
-        mode=None,
-        attempts=attempts,
-        failure_reason=validation_error,
-        input_row_count=len(frame),
-        input_column_count=len(frame.columns),
-        output_row_count=len(frame),
-        output_column_count=len(frame.columns),
-        all_rows_included=all_rows_included,
-        attempt_details=attempt_details,
-    )
 
 
 def _write_prediction_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -5451,6 +5182,96 @@ def _read_task_progress(logs_dir: Path, task_id: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _context_payload_profile(
+    task_context: TaskContext | None,
+    context_summary: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if task_context is None:
+        return None
+    tables = task_context.context_tables
+    table_profiles: list[dict[str, Any]] = []
+    for table in tables:
+        table_profiles.append(
+            {
+                "name": table.name,
+                "path": table.path,
+                "source_kind": _source_kind_from_context_path(table.path),
+                "row_count": len(table.frame),
+                "column_count": len(table.frame.columns),
+            }
+        )
+    registered_sources = (
+        list(context_summary.get("registered_sources", []))
+        if isinstance(context_summary, Mapping)
+        else []
+    )
+    return {
+        "registered_source_count": len(registered_sources),
+        "registered_sources": registered_sources,
+        "table_count": len(tables),
+        "table_profiles": table_profiles,
+        "total_table_rows": sum(len(table.frame) for table in tables),
+        "total_table_columns": sum(len(table.frame.columns) for table in tables),
+        "document_text_chars": len(task_context.document_text),
+        "document_file_count": (
+            len(context_summary.get("document_files", []))
+            if isinstance(context_summary, Mapping)
+            else None
+        ),
+    }
+
+
+def _candidate_raw_table_diagnostics(
+    frame: pd.DataFrame,
+    task_context: TaskContext | None,
+) -> dict[str, Any]:
+    row_count = len(frame)
+    column_count = len(frame.columns)
+    closest_table: dict[str, Any] | None = None
+    if task_context is not None:
+        for table in task_context.context_tables:
+            source_rows = len(table.frame)
+            if source_rows == 0:
+                continue
+            ratio = row_count / source_rows
+            distance = abs(row_count - source_rows)
+            candidate = {
+                "name": table.name,
+                "path": table.path,
+                "source_row_count": source_rows,
+                "row_count_ratio": round(ratio, 4),
+                "row_count_distance": distance,
+            }
+            if closest_table is None or distance < int(closest_table["row_count_distance"]):
+                closest_table = candidate
+    close_to_source = False
+    if closest_table is not None:
+        ratio = float(closest_table["row_count_ratio"])
+        close_to_source = 0.9 <= ratio <= 1.1
+    return {
+        "row_count": row_count,
+        "column_count": column_count,
+        "wide_candidate": column_count >= 6,
+        "large_candidate": row_count >= 500,
+        "close_to_source_row_count": close_to_source,
+        "closest_source_table": closest_table,
+        "raw_table_like": bool(row_count >= 100 and (column_count >= 6 or close_to_source)),
+    }
+
+
+def _databao_failure_type(failure_reason: str | None) -> str | None:
+    if not failure_reason:
+        return None
+    lowered = failure_reason.lower()
+    if "graphrecursionerror" in lowered or "recursion" in lowered:
+        return "graph_recursion"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    if "did not return a dataframe" in lowered or "non_dataframe" in lowered:
+        return "non_dataframe"
+    return "exception"
+
+
 def _write_task_log(
     log_path: Path,
     *,
@@ -5461,8 +5282,6 @@ def _write_task_log(
     scorable: bool | None = None,
     context_summary: dict[str, Any] | None = None,
     candidate_source: str | None = None,
-    structured_planner: dict[str, Any] | None = None,
-    finalization: dict[str, Any] | None = None,
     postprocessing: dict[str, Any] | None = None,
     timings: dict[str, float] | None = None,
     llm_calls: list[dict[str, Any]] | None = None,
@@ -5479,12 +5298,13 @@ def _write_task_log(
     candidate_scores: list[dict[str, Any]] | None = None,
     selected_candidate_source: str | None = None,
     final_answer_guard: dict[str, Any] | None = None,
-    planner_skipped_reason: str | None = None,
     provisional_written_stage: str | None = None,
     missing_prediction_reason: str | None = None,
     active_progress: dict[str, Any] | None = None,
     timeout_budget: dict[str, Any] | None = None,
     failure_reason: str | None = None,
+    context_payload_profile: dict[str, Any] | None = None,
+    databao_failure_type: str | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -5496,8 +5316,6 @@ def _write_task_log(
         "elapsed_seconds": elapsed_seconds,
         "context_summary": context_summary,
         "candidate_source": candidate_source,
-        "structured_planner": structured_planner,
-        "finalization": finalization,
         "postprocessing": postprocessing,
         "timings": timings,
         "llm_calls": llm_calls or [],
@@ -5514,12 +5332,13 @@ def _write_task_log(
         "candidate_scores": candidate_scores or [],
         "selected_candidate_source": selected_candidate_source,
         "final_answer_guard": final_answer_guard,
-        "planner_skipped_reason": planner_skipped_reason,
         "provisional_written_stage": provisional_written_stage,
         "missing_prediction_reason": missing_prediction_reason,
         "active_progress": active_progress,
         "timeout_budget": timeout_budget,
         "failure_reason": failure_reason,
+        "context_payload_profile": context_payload_profile,
+        "databao_failure_type": databao_failure_type,
     }
     log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -5563,6 +5382,7 @@ def _timeout_task_artifact(
         missing_prediction_reason=missing_prediction_reason,
         active_progress=progress,
         failure_reason=failure_reason,
+        databao_failure_type="timeout",
     )
     traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
     traceback_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5581,35 +5401,7 @@ def _timeout_task_artifact(
         column_count=column_count,
         timings=timings,
         heuristic_level=_heuristic_level(),
-    )
-
-
-def _skipped_structured_planner_report(reason: str) -> StructuredPlannerReport:
-    return StructuredPlannerReport(
-        attempted=False,
-        succeeded=False,
-        attempts=0,
-        failure_reason=reason,
-        plan=None,
-        output_row_count=None,
-        output_column_count=None,
-        attempt_details=[{"kind": "skipped", "reason": reason}],
-    )
-
-
-def _skipped_finalization_report(frame: pd.DataFrame, reason: str) -> AnswerFinalizationReport:
-    return AnswerFinalizationReport(
-        attempted=False,
-        applied=False,
-        mode=None,
-        attempts=0,
-        failure_reason=reason,
-        input_row_count=len(frame),
-        input_column_count=len(frame.columns),
-        output_row_count=len(frame),
-        output_column_count=len(frame.columns),
-        all_rows_included=len(frame) <= MAX_FINALIZER_ROWS,
-        attempt_details=[{"kind": "skipped", "reason": reason}],
+        databao_failure_type="timeout",
     )
 
 
@@ -5618,8 +5410,10 @@ def _ask_databao_candidate(
     databao_env: DatabaoEnvironment,
     agent_builder: AgentBuilder,
     diagnostics: TaskDiagnostics,
+    *,
+    stage_name: str = "databao_ask",
 ) -> pd.DataFrame:
-    with diagnostics.stage("databao_ask"):
+    with diagnostics.stage(stage_name):
         agent = agent_builder(task, databao_env)
         thread = agent.thread(stream_ask=False, stream_plot=False, auto_output_modality=False)
         frame = thread.ask(_build_question_prompt(task), stream=False).df()
@@ -5634,36 +5428,6 @@ def _ask_databao_candidate(
     return frame
 
 
-def _try_structured_planner_candidate(
-    task: PublicTask,
-    databao_env: DatabaoEnvironment,
-    structured_planner: StructuredPlanner,
-    diagnostics: TaskDiagnostics,
-    *,
-    deadline_at: float | None = None,
-) -> tuple[pd.DataFrame | None, StructuredPlannerReport]:
-    skip_reason = _planner_skip_reason_for_deadline(deadline_at)
-    if skip_reason is not None:
-        return None, _skipped_structured_planner_report(skip_reason)
-    try:
-        with diagnostics.stage("structured_planner"):
-            planner_frame, structured_planner_report = structured_planner(task, databao_env)
-        if planner_frame is not None and not isinstance(planner_frame, pd.DataFrame):
-            raise TypeError("Structured planner did not return a dataframe.")
-        return planner_frame, structured_planner_report
-    except Exception as exc:  # noqa: BLE001
-        return None, StructuredPlannerReport(
-            attempted=True,
-            succeeded=False,
-            attempts=0,
-            failure_reason=_safe_exception_summary(exc, (databao_env.model_api_key,)),
-            plan=None,
-            output_row_count=None,
-            output_column_count=None,
-            attempt_details=[],
-        )
-
-
 def run_databao_task(
     *,
     task: PublicTask,
@@ -5671,12 +5435,10 @@ def run_databao_task(
     logs_dir: Path,
     databao_env: DatabaoEnvironment,
     agent_builder: AgentBuilder = build_databao_agent,
-    answer_finalizer: AnswerFinalizer = finalize_answer_table,
     answer_postprocessor: AnswerPostprocessor = postprocess_answer_table,
-    structured_planner: StructuredPlanner = plan_structured_candidate,
-    structured_planner_mode: str | None = None,
-    finalizer_mode: str | None = None,
+    **deprecated_options: Any,
 ) -> DatabaoTaskArtifacts:
+    del deprecated_options
     started_at = perf_counter()
     deadline_at = _deadline_from_start(started_at)
     task_output_dir = output_root / task.task_id
@@ -5684,21 +5446,20 @@ def run_databao_task(
     log_path = logs_dir / f"{task.task_id}.json"
     context_summary: dict[str, Any] | None = None
     candidate_source: str | None = None
-    structured_planner_report: StructuredPlannerReport | None = None
-    finalization_report: AnswerFinalizationReport | None = None
     postprocess_report_payload: dict[str, Any] | None = None
     route_policy: RouteDecision | None = None
     question_features: QuestionFeatures | None = None
     answer_contract: AnswerContract | None = None
     answer_contract_report: AnswerContractReport | None = None
+    task_context: TaskContext | None = None
     retrieved_context: RetrievedContext | None = None
     complexity_profile: TaskComplexityProfile | None = None
+    context_payload_profile: dict[str, Any] | None = None
     ranking_report: CandidateRankingReport | None = None
     final_guard_report: FinalAnswerShapeReport | None = None
-    planner_skipped_reason: str | None = None
     provisional_written_stage: str | None = None
     missing_prediction_reason: str | None = None
-    databao_failed = False
+    databao_failure_type: str | None = None
     effective_heuristic_level = _heuristic_level()
     enabled_strategies: list[dict[str, Any]] = []
     applied_strategies: list[dict[str, Any]] = []
@@ -5723,12 +5484,16 @@ def run_databao_task(
                 DATABAO_DATABAO_TIMEOUT_SECONDS_ENV,
                 DATABAO_AGENT_TIMEOUT_SECONDS,
             ),
-            "planner_min_remaining_seconds": MIN_SECONDS_FOR_PLANNER,
             "active_progress": _read_task_progress(logs_dir, task.task_id),
         }
 
     def candidate_payloads() -> list[dict[str, Any]]:
-        return [candidate.to_dict() for candidate in candidates]
+        payloads: list[dict[str, Any]] = []
+        for candidate in candidates:
+            payload = candidate.to_dict()
+            payload["raw_table_diagnostics"] = _candidate_raw_table_diagnostics(candidate.frame, task_context)
+            payloads.append(payload)
+        return payloads
 
     def candidate_score_payloads() -> list[dict[str, Any]]:
         if ranking_report is None:
@@ -5807,46 +5572,6 @@ def run_databao_task(
         )
         record_candidate(postprocessed_candidate)
 
-    def run_structured_planner_candidate(source_name: str) -> None:
-        nonlocal structured_planner_report, planner_skipped_reason
-        retrieved_token = _CURRENT_RETRIEVED_CONTEXT.set(retrieved_context)
-        try:
-            planner_frame, structured_planner_report = _try_structured_planner_candidate(
-                task,
-                databao_env,
-                structured_planner,
-                diagnostics,
-                deadline_at=deadline_at,
-            )
-        finally:
-            _CURRENT_RETRIEVED_CONTEXT.reset(retrieved_token)
-        if structured_planner_report is not None and not structured_planner_report.attempted:
-            planner_skipped_reason = structured_planner_report.failure_reason
-        if planner_frame is None:
-            return
-        planner_candidate = record_candidate(
-            build_candidate_from_frame(
-                planner_frame,
-                source=source_name,
-                confidence=0.75,
-                diagnostics_payload={
-                    "structured_planner": structured_planner_report.to_dict()
-                    if structured_planner_report
-                    else None,
-                },
-                elapsed_seconds=(
-                    sum(
-                        float(detail.get("elapsed_seconds", 0.0) or 0.0)
-                        for detail in structured_planner_report.attempt_details
-                    )
-                    if structured_planner_report
-                    else None
-                ),
-            )
-        )
-        if planner_candidate is not None:
-            add_postprocessed_candidate(planner_candidate)
-
     def add_verifier_candidates(base_candidate: Candidate) -> None:
         for verifier_frame, transforms, confidence in generate_verifier_candidate_frames(task, base_candidate.frame):
             verifier_candidate = record_candidate(
@@ -5868,6 +5593,42 @@ def run_databao_task(
                     }
                     for transform in transforms
                 )
+
+    def add_column_compaction_candidate(base_candidate: Candidate) -> None:
+        try:
+            with diagnostics.stage(f"column_compaction_{base_candidate.source}"):
+                compact_frame, transforms = apply_column_only_compactor(
+                    task,
+                    base_candidate.frame,
+                    answer_contract,
+                )
+        except Exception as exc:  # noqa: BLE001
+            base_candidate.diagnostics.setdefault(
+                "column_compaction_error",
+                _safe_exception_summary(exc, (databao_env.model_api_key,)),
+            )
+            return
+        if not transforms or compact_frame.equals(base_candidate.frame):
+            return
+        compact_candidate = record_candidate(
+            build_candidate_from_frame(
+                compact_frame,
+                source=f"{base_candidate.source}_column_compact",
+                confidence=min(base_candidate.confidence + 0.04, 1.0),
+                diagnostics_payload={"column_compaction_transforms": transforms},
+                transformations=tuple(transforms),
+            )
+        )
+        if compact_candidate is not None:
+            applied_strategies.extend(
+                {
+                    "strategy_name": str(transform.get("kind", "column_only_compaction")),
+                    "strategy_kind": "generic",
+                    "result": transform,
+                    "applied_to_final_answer": False,
+                }
+                for transform in transforms
+            )
 
     def write_candidate_prediction(candidate: Candidate, *, stage: str) -> tuple[pd.DataFrame, FinalAnswerShapeReport]:
         guarded_frame, guard_report = final_answer_shape_guard(
@@ -5896,9 +5657,20 @@ def run_databao_task(
         )
         diagnostics.add_timing(f"{stage}_prediction_write", 0.0)
 
+    def ask_databao_candidate() -> pd.DataFrame:
+        retrieved_token = _CURRENT_RETRIEVED_CONTEXT.set(retrieved_context)
+        try:
+            return _ask_databao_candidate(
+                task,
+                databao_env,
+                agent_builder,
+                diagnostics,
+                stage_name="databao_ask",
+            )
+        finally:
+            _CURRENT_RETRIEVED_CONTEXT.reset(retrieved_token)
+
     try:
-        effective_structured_planner_mode = _structured_planner_mode(structured_planner_mode)
-        effective_finalizer_mode = _finalizer_mode(finalizer_mode)
         effective_heuristic_level = _heuristic_level()
         enabled_strategies = [
             {
@@ -5932,11 +5704,6 @@ def run_databao_task(
                 "enabled_by": "generic",
             },
             {
-                "strategy_name": "structured_planner",
-                "strategy_kind": "generic",
-                "enabled_by": effective_structured_planner_mode,
-            },
-            {
                 "strategy_name": "deterministic_postprocess",
                 "strategy_kind": "generic",
                 "enabled_by": "generic",
@@ -5964,6 +5731,8 @@ def run_databao_task(
                 context_summary=context_summary,
                 heuristic_level=effective_heuristic_level,
             )
+            context_payload_profile = _context_payload_profile(task_context, context_summary)
+            diagnostics.checkpoint("context_loaded", context_payload_profile=context_payload_profile)
             question_features = extract_question_features(task.question, task_context.context_tables)
             task_intent = infer_task_intent(task_context)
             answer_contract = infer_answer_contract(task_context, task_intent)
@@ -6001,107 +5770,91 @@ def run_databao_task(
             )
 
         with _openai_api_key_from_model_env(databao_env):
-            route_policy = choose_route_policy(
-                task_context,
-                task_intent,
-                structured_planner_mode=effective_structured_planner_mode,
+            route_policy = RouteDecision(
+                route="databao",
+                reason="Databao-first baseline; experimental rescue/generator branches are not active.",
+                confidence=0.0,
             )
             applied_strategies.append(
                 {
                     "strategy_name": "route_policy",
                     "strategy_kind": "generic",
-                    "planner_route": route_policy.route,
+                    "route": route_policy.route,
                     "reason": route_policy.reason,
                     "confidence": route_policy.confidence,
                 }
             )
-            if route_policy.candidate is not None:
-                record_candidate(route_policy.candidate)
-                structured_planner_report = _structured_report_from_candidate(route_policy.candidate)
-
-            if effective_structured_planner_mode == "off":
-                structured_planner_report = _skipped_structured_planner_report(
-                    "Structured planner disabled by DATABAO_STRUCTURED_PLANNER_MODE=off."
+            databao_started_at = perf_counter()
+            try:
+                databao_frame = ask_databao_candidate()
+                with diagnostics.stage("raw_provisional_csv_write"):
+                    write_raw_provisional(databao_frame, stage="databao_raw_provisional")
+            except Exception as exc:
+                databao_failure_reason = _safe_exception_summary(exc, (databao_env.model_api_key,))
+                databao_failure_type = _databao_failure_type(databao_failure_reason)
+                complexity_profile = build_complexity_profile(
+                    task_context,
+                    retrieved_context,
+                    best_candidate=None,
                 )
-
-            if not candidates:
-                databao_started_at = perf_counter()
-                retrieved_token = _CURRENT_RETRIEVED_CONTEXT.set(retrieved_context)
-                try:
-                    databao_frame = _ask_databao_candidate(task, databao_env, agent_builder, diagnostics)
-                    with diagnostics.stage("raw_provisional_csv_write"):
-                        write_raw_provisional(databao_frame, stage="databao_raw_provisional")
-                except Exception as exc:
-                    databao_failed = True
-                    databao_failure_reason = _safe_exception_summary(exc, (databao_env.model_api_key,))
-                    complexity_profile = build_complexity_profile(
-                        task_context,
-                        retrieved_context,
-                        best_candidate=None,
-                    )
-                    planner_skipped_reason = (
-                        "Structured planner rescue skipped after Databao failure; "
-                        "planner fallback is disabled for missing-prediction recovery."
-                    )
-                    fallback = _cheap_count_fallback_candidate(task_context, retrieved_context)
-                    if fallback is not None:
-                        fallback_frame, fallback_transform = fallback
-                        fallback_candidate = record_candidate(
-                            build_candidate_from_frame(
-                                fallback_frame,
-                                source="cheap_count_fallback",
-                                confidence=float(fallback_transform.get("confidence", 0.2) or 0.2),
-                                diagnostics_payload={
-                                    "databao_failure_reason": databao_failure_reason,
-                                    "fallback": fallback_transform,
-                                },
-                                transformations=(fallback_transform,),
-                            )
-                        )
-                        if fallback_candidate is not None:
-                            applied_strategies.append(
-                                {
-                                    "strategy_name": "cheap_count_fallback",
-                                    "strategy_kind": "generic",
-                                    "result": fallback_transform,
-                                    "applied_to_final_answer": False,
-                                }
-                            )
-                    if not candidates:
-                        missing_prediction_reason = (
-                            "Databao failed and cheap count fallback did not produce a dataframe."
-                        )
-                        raise RuntimeError(
-                            f"{missing_prediction_reason} Databao: {databao_failure_reason}"
-                        ) from exc
-                finally:
-                    _CURRENT_RETRIEVED_CONTEXT.reset(retrieved_token)
-                if "databao_frame" in locals():
-                    databao_candidate = record_candidate(
+                fallback = _cheap_count_fallback_candidate(task_context, retrieved_context)
+                if fallback is not None:
+                    fallback_frame, fallback_transform = fallback
+                    fallback_candidate = record_candidate(
                         build_candidate_from_frame(
-                            databao_frame,
-                            source="databao_raw",
-                            confidence=0.55,
-                            diagnostics_payload={"stage": "databao_ask"},
-                            elapsed_seconds=round(perf_counter() - databao_started_at, 3),
+                            fallback_frame,
+                            source="cheap_count_fallback",
+                            confidence=float(fallback_transform.get("confidence", 0.2) or 0.2),
+                            diagnostics_payload={
+                                "databao_failure_reason": databao_failure_reason,
+                                "fallback": fallback_transform,
+                            },
+                            transformations=(fallback_transform,),
                         )
                     )
-                    if databao_candidate is not None:
-                        add_postprocessed_candidate(databao_candidate)
-                        selected_candidate, ranking_report = rank_candidates(
-                            candidates=candidates,
-                            contract=answer_contract,
-                            question=task.question,
-                            retrieved_context=retrieved_context,
+                    if fallback_candidate is not None:
+                        applied_strategies.append(
+                            {
+                                "strategy_name": "cheap_count_fallback",
+                                "strategy_kind": "generic",
+                                "result": fallback_transform,
+                                "applied_to_final_answer": False,
+                            }
                         )
-                        if selected_candidate is not None:
-                            with diagnostics.stage("provisional_csv_write"):
-                                _, provisional_guard_report = write_candidate_prediction(
-                                    selected_candidate,
-                                    stage="provisional",
-                                )
-                            final_guard_report = provisional_guard_report
-                            add_verifier_candidates(selected_candidate)
+                if not candidates:
+                    missing_prediction_reason = (
+                        "Databao failed and cheap count fallback did not produce a dataframe."
+                    )
+                    raise RuntimeError(
+                        f"{missing_prediction_reason} Databao: {databao_failure_reason}"
+                    ) from exc
+            else:
+                databao_candidate = record_candidate(
+                    build_candidate_from_frame(
+                        databao_frame,
+                        source="databao_raw",
+                        confidence=0.55,
+                        diagnostics_payload={"stage": "databao_ask"},
+                        elapsed_seconds=round(perf_counter() - databao_started_at, 3),
+                    )
+                )
+                if databao_candidate is not None:
+                    add_postprocessed_candidate(databao_candidate)
+                    selected_candidate, ranking_report = rank_candidates(
+                        candidates=candidates,
+                        contract=answer_contract,
+                        question=task.question,
+                        retrieved_context=retrieved_context,
+                    )
+                    if selected_candidate is not None:
+                        with diagnostics.stage("provisional_csv_write"):
+                            _, provisional_guard_report = write_candidate_prediction(
+                                selected_candidate,
+                                stage="provisional",
+                        )
+                        final_guard_report = provisional_guard_report
+                        add_column_compaction_candidate(selected_candidate)
+                        add_verifier_candidates(selected_candidate)
 
             selected_candidate, ranking_report = rank_candidates(
                 candidates=candidates,
@@ -6114,53 +5867,6 @@ def run_databao_task(
                 retrieved_context,
                 best_candidate=selected_candidate,
             )
-            rescue_allowed = should_run_planner_rescue(
-                complexity_profile,
-                _remaining_seconds(deadline_at),
-                selected_candidate,
-            ) and not databao_failed
-            if (
-                not rescue_allowed
-                and planner_skipped_reason is None
-                and effective_structured_planner_mode != "off"
-                and complexity_profile.uncertainty_score >= 30
-                and complexity_profile.complexity_score >= 45
-            ):
-                remaining = _remaining_seconds(deadline_at)
-                if remaining is not None and remaining <= 90:
-                    planner_skipped_reason = (
-                        "Structured planner skipped because remaining task budget "
-                        f"({remaining:.1f}s) is below 90s."
-                    )
-                elif not complexity_profile.planner_payload_within_limit:
-                    planner_skipped_reason = "Structured planner rescue skipped because planner payload is too large."
-                else:
-                    planner_skipped_reason = "Structured planner rescue skipped by feature-based gates."
-            if (
-                effective_structured_planner_mode != "off"
-                and (
-                    structured_planner_report is None
-                    or not structured_planner_report.attempted
-                    or structured_planner_report.failure_reason == "Databao returned a dataframe; structured planner fallback was not needed."
-                )
-                and rescue_allowed
-            ):
-                run_structured_planner_candidate("structured_planner_rescue")
-                selected_candidate, ranking_report = rank_candidates(
-                    candidates=candidates,
-                    contract=answer_contract,
-                    question=task.question,
-                    retrieved_context=retrieved_context,
-                )
-
-            if effective_structured_planner_mode != "off" and structured_planner_report is None:
-                if planner_skipped_reason is None:
-                    planner_skipped_reason = (
-                        "Structured planner skipped because feature-based rescue was not needed."
-                    )
-                structured_planner_report = _skipped_structured_planner_report(
-                    planner_skipped_reason
-                )
 
         selected_candidate, ranking_report = rank_candidates(
             candidates=candidates,
@@ -6186,48 +5892,6 @@ def run_databao_task(
                     "result": answer_contract_report.to_dict(),
                     "applied_to_final_answer": answer_contract_report.valid,
                 }
-            )
-
-        if effective_finalizer_mode == "always":
-            try:
-                with diagnostics.stage("finalizer"):
-                    finalized_frame, finalization_report = answer_finalizer(task, frame, databao_env)
-                    if not isinstance(finalized_frame, pd.DataFrame):
-                        raise TypeError("Answer finalizer did not return a dataframe.")
-                    finalized_candidate = record_candidate(
-                        build_candidate_from_frame(
-                            finalized_frame,
-                            source=f"{candidate_source}_finalizer",
-                            confidence=min(selected_candidate.confidence + 0.05, 1.0),
-                            diagnostics_payload={"finalization": finalization_report.to_dict()},
-                        )
-                    )
-                    if finalized_candidate is not None:
-                        selected_candidate, ranking_report = rank_candidates(
-                            candidates=candidates,
-                            contract=answer_contract,
-                            question=task.question,
-                            retrieved_context=retrieved_context,
-                        )
-                        candidate_source = selected_candidate.source if selected_candidate else candidate_source
-                        frame = selected_candidate.frame if selected_candidate else frame
-            except Exception as exc:  # noqa: BLE001
-                finalization_report = AnswerFinalizationReport(
-                    attempted=True,
-                    applied=False,
-                    mode=None,
-                    attempts=0,
-                    failure_reason=_safe_exception_summary(exc, (databao_env.model_api_key,)),
-                    input_row_count=len(frame),
-                    input_column_count=len(frame.columns),
-                    output_row_count=len(frame),
-                    output_column_count=len(frame.columns),
-                    all_rows_included=len(frame) <= MAX_FINALIZER_ROWS,
-                )
-        else:
-            finalization_report = _skipped_finalization_report(
-                frame,
-                "Answer finalizer disabled by DATABAO_FINALIZER_MODE=off.",
             )
 
         with diagnostics.stage("final_answer_shape_guard"):
@@ -6273,8 +5937,6 @@ def run_databao_task(
             elapsed_seconds=elapsed_seconds,
             context_summary=context_summary,
             candidate_source=candidate_source,
-            structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
-            finalization=finalization_report.to_dict() if finalization_report else None,
             postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
@@ -6291,11 +5953,12 @@ def run_databao_task(
             candidate_scores=candidate_score_payloads(),
             selected_candidate_source=candidate_source,
             final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
-            planner_skipped_reason=planner_skipped_reason,
             provisional_written_stage=provisional_written_stage,
             missing_prediction_reason=missing_prediction_reason,
             active_progress=_read_task_progress(logs_dir, task.task_id),
             timeout_budget=timeout_budget_payload(),
+            context_payload_profile=context_payload_profile,
+            databao_failure_type=databao_failure_type,
         )
         return DatabaoTaskArtifacts(
             task_id=task.task_id,
@@ -6310,8 +5973,6 @@ def run_databao_task(
             row_count=len(frame),
             column_count=len(frame.columns),
             candidate_source=candidate_source,
-            structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
-            finalization=finalization_report.to_dict() if finalization_report else None,
             postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
@@ -6326,6 +5987,8 @@ def run_databao_task(
             candidate_scores=candidate_score_payloads(),
             selected_candidate_source=candidate_source,
             final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
+            context_payload_profile=context_payload_profile,
+            databao_failure_type=databao_failure_type,
         )
     except Exception as exc:  # noqa: BLE001
         elapsed_seconds = round(perf_counter() - started_at, 3)
@@ -6340,8 +6003,6 @@ def run_databao_task(
             elapsed_seconds=elapsed_seconds,
             context_summary=context_summary,
             candidate_source=candidate_source,
-            structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
-            finalization=finalization_report.to_dict() if finalization_report else None,
             postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
@@ -6358,12 +6019,13 @@ def run_databao_task(
             candidate_scores=candidate_score_payloads(),
             selected_candidate_source=candidate_source,
             final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
-            planner_skipped_reason=planner_skipped_reason,
             provisional_written_stage=provisional_written_stage,
             missing_prediction_reason=missing_prediction_reason,
             active_progress=_read_task_progress(logs_dir, task.task_id),
             timeout_budget=timeout_budget_payload(),
             failure_reason=failure_reason,
+            context_payload_profile=context_payload_profile,
+            databao_failure_type=databao_failure_type or _databao_failure_type(failure_reason),
         )
         traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
         traceback_path.write_text(
@@ -6385,8 +6047,6 @@ def run_databao_task(
             row_count=predicted_rows,
             column_count=predicted_columns,
             candidate_source=candidate_source,
-            structured_planner=structured_planner_report.to_dict() if structured_planner_report else None,
-            finalization=finalization_report.to_dict() if finalization_report else None,
             postprocessing=postprocess_report_payload,
             timings=diagnostics.timings,
             llm_calls=diagnostics.llm_calls,
@@ -6402,6 +6062,8 @@ def run_databao_task(
             candidate_scores=candidate_score_payloads(),
             selected_candidate_source=candidate_source,
             final_answer_guard=final_guard_report.to_dict() if final_guard_report else None,
+            context_payload_profile=context_payload_profile,
+            databao_failure_type=databao_failure_type or _databao_failure_type(failure_reason),
         )
     finally:
         _CURRENT_DIAGNOSTICS.reset(diagnostics_token)
@@ -6422,8 +6084,6 @@ def _run_databao_task_child(
     logs_dir: Path,
     databao_env: DatabaoEnvironment,
     timeout_seconds: int,
-    structured_planner_mode: str | None,
-    finalizer_mode: str | None,
 ) -> None:
     previous_timeout = os.environ.get(DATABAO_TASK_TIMEOUT_SECONDS_ENV)
     os.environ[DATABAO_TASK_TIMEOUT_SECONDS_ENV] = str(timeout_seconds)
@@ -6433,8 +6093,6 @@ def _run_databao_task_child(
             output_root=output_root,
             logs_dir=logs_dir,
             databao_env=databao_env,
-            structured_planner_mode=structured_planner_mode,
-            finalizer_mode=finalizer_mode,
         )
     finally:
         if previous_timeout is None:
@@ -6451,9 +6109,9 @@ def _run_databao_task_with_timeout(
     logs_dir: Path,
     databao_env: DatabaoEnvironment,
     timeout_seconds: int,
-    structured_planner_mode: str | None,
-    finalizer_mode: str | None,
+    **deprecated_options: Any,
 ) -> DatabaoTaskArtifacts:
+    del deprecated_options
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue(maxsize=1)
     process = context.Process(
@@ -6465,10 +6123,8 @@ def _run_databao_task_with_timeout(
             logs_dir,
             databao_env,
             timeout_seconds,
-            structured_planner_mode,
-            finalizer_mode,
         ),
-        daemon=True,
+        daemon=False,
     )
     started_at = perf_counter()
     process.start()
@@ -6549,15 +6205,11 @@ def _run_databao_task_with_timeout(
 def _can_run_task_in_child_process(
     *,
     agent_builder: AgentBuilder,
-    answer_finalizer: AnswerFinalizer,
     answer_postprocessor: AnswerPostprocessor,
-    structured_planner: StructuredPlanner,
 ) -> bool:
     return (
         agent_builder is build_databao_agent
-        and answer_finalizer is finalize_answer_table
         and answer_postprocessor is postprocess_answer_table
-        and structured_planner is plan_structured_candidate
     )
 
 
@@ -6572,12 +6224,10 @@ def run_databao_tasks(
     task_timeout_seconds: int | None = None,
     databao_env: DatabaoEnvironment | None = None,
     agent_builder: AgentBuilder = build_databao_agent,
-    answer_finalizer: AnswerFinalizer = finalize_answer_table,
     answer_postprocessor: AnswerPostprocessor = postprocess_answer_table,
-    structured_planner: StructuredPlanner = plan_structured_candidate,
-    structured_planner_mode: str | None = None,
-    finalizer_mode: str | None = None,
+    **deprecated_options: Any,
 ) -> list[DatabaoTaskArtifacts]:
+    del deprecated_options
     effective_env = databao_env or load_databao_environment()
     dataset = DABenchPublicDataset(input_root)
     tasks = dataset.iter_tasks(task_ids=task_ids, difficulty=difficulty)
@@ -6589,9 +6239,7 @@ def run_databao_tasks(
         timeout_seconds = _env_int(DATABAO_TASK_TIMEOUT_SECONDS_ENV, 0)
     use_child_process = timeout_seconds > 0 and _can_run_task_in_child_process(
         agent_builder=agent_builder,
-        answer_finalizer=answer_finalizer,
         answer_postprocessor=answer_postprocessor,
-        structured_planner=structured_planner,
     )
 
     artifacts: list[DatabaoTaskArtifacts] = []
@@ -6603,8 +6251,6 @@ def run_databao_tasks(
                 logs_dir=logs_dir,
                 databao_env=effective_env,
                 timeout_seconds=timeout_seconds,
-                structured_planner_mode=structured_planner_mode,
-                finalizer_mode=finalizer_mode,
             )
         else:
             artifact = run_databao_task(
@@ -6613,11 +6259,7 @@ def run_databao_tasks(
                 logs_dir=logs_dir,
                 databao_env=effective_env,
                 agent_builder=agent_builder,
-                answer_finalizer=answer_finalizer,
                 answer_postprocessor=answer_postprocessor,
-                structured_planner=structured_planner,
-                structured_planner_mode=structured_planner_mode,
-                finalizer_mode=finalizer_mode,
             )
         artifacts.append(artifact)
 

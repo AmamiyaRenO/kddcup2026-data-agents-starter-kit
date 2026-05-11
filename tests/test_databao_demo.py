@@ -17,24 +17,24 @@ from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.cli import app
 from data_agent_baseline.run.databao_demo import (
     AnswerContract,
-    AnswerFinalizationReport,
     Candidate,
     DatabaoEnvironment,
     DATABAO_DEBUG_LOG_RAW_ENV,
     DATABAO_DATABAO_TIMEOUT_SECONDS_ENV,
     DATABAO_TASK_TIMEOUT_SECONDS_ENV,
     StructuredPlanError,
-    StructuredPlannerReport,
     TaskDiagnostics,
     _candidate_table_payload,
     _databao_timeout_seconds,
+    _build_question_prompt,
+    _metric_like_columns,
     _run_databao_task_with_timeout,
-    _structured_planner_mode,
     _timeout_task_artifact,
-    apply_aggregate_ratio_verifier,
-    apply_answer_finalizer_decision,
     apply_answer_column_verifier,
+    apply_aggregate_ratio_verifier,
+    apply_column_only_compactor,
     apply_question_column_pruner,
+    apply_ratio_scale_compactor,
     build_schema_graph,
     build_task_context,
     choose_route_policy,
@@ -104,34 +104,14 @@ def make_agent_builder(frame: pd.DataFrame | None):
     return build_agent
 
 
-def no_answer_finalizer(task, frame, databao_env):
-    del task, databao_env
-    return frame, AnswerFinalizationReport(
-        attempted=True,
-        applied=False,
-        mode=None,
-        attempts=0,
-        failure_reason=None,
-        input_row_count=len(frame),
-        input_column_count=len(frame.columns),
-        output_row_count=len(frame),
-        output_column_count=len(frame.columns),
-        all_rows_included=True,
-    )
+def no_answer_finalizer(*args, **kwargs):
+    del args, kwargs
+    raise AssertionError("finalizer hook should not be called by the Databao baseline")
 
 
 def no_structured_planner(task, databao_env):
     del task, databao_env
-    return None, StructuredPlannerReport(
-        attempted=False,
-        succeeded=False,
-        attempts=0,
-        failure_reason=None,
-        plan=None,
-        output_row_count=None,
-        output_column_count=None,
-        attempt_details=[],
-    )
+    raise AssertionError("structured planner hook should not be called by the Databao baseline")
 
 
 def write_task(
@@ -158,10 +138,6 @@ def write_task(
 
 
 class DatabaoDemoTests(unittest.TestCase):
-    def test_structured_planner_mode_defaults_to_off(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(_structured_planner_mode(), "off")
-
     def test_databao_timeout_defaults_and_respects_task_deadline(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_databao_timeout_seconds(None), 100)
@@ -219,6 +195,36 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertEqual(summary["csv_files"], ["csv/items.csv"])
             self.assertEqual(summary["json_files"], ["json/records.json"])
             self.assertEqual(summary["sqlite_files"], ["db/sample.db"])
+
+    def test_build_question_prompt_is_plain_databao_adapter_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_root = Path(tmp)
+            write_task(input_root, question="Which item has the highest score? Return the name.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+        prompt = _build_question_prompt(task)
+
+        self.assertIn("Return only the final answer table.", prompt)
+        self.assertIn("Question: Which item has the highest score? Return the name.", prompt)
+        self.assertNotIn("Context focus hints:", prompt)
+        self.assertNotIn("Expected answer shape:", prompt)
+
+    def test_metric_like_columns_use_schema_sample_not_full_object_column_scan(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "id": range(700),
+                "numeric_metric": range(700),
+                "numeric_text_metric": [""] + ["4"] * 699,
+                "late_numeric_text": ["not numeric"] * 600 + ["9"] * 100,
+            }
+        )
+
+        columns = _metric_like_columns(frame)
+
+        self.assertIn("numeric_metric", columns)
+        self.assertIn("numeric_text_metric", columns)
+        self.assertNotIn("id", columns)
+        self.assertNotIn("late_numeric_text", columns)
 
     def test_json_loader_preserves_envelope_table_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,7 +562,11 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertIn("candidate_scores", log_payload)
             self.assertIn("final_answer_guard", log_payload)
             self.assertIn("document_extraction_used", log_payload)
+            self.assertIn("context_payload_profile", log_payload)
+            self.assertIsNone(log_payload["databao_failure_type"])
+            self.assertIn("raw_table_diagnostics", log_payload["candidates"][0])
             self.assertEqual(artifact.heuristic_level, "generic")
+            self.assertIsNotNone(artifact.context_payload_profile)
             self.assertIn("context_load", log_payload["timings"])
             self.assertIn("databao_ask", log_payload["timings"])
             self.assertEqual(log_payload["llm_calls"], [])
@@ -668,7 +678,7 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertTrue(artifact.succeeded)
             self.assertEqual(artifact.candidate_source, "databao_raw")
             self.assertEqual(log_payload["candidate_source"], "databao_raw")
-            self.assertFalse(log_payload["structured_planner"]["attempted"])
+            self.assertNotIn("structured_planner", log_payload)
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
                 "answer\ndatabao\n",
@@ -685,17 +695,7 @@ class DatabaoDemoTests(unittest.TestCase):
 
             def planner(task, databao_env):
                 del task, databao_env
-                frame = pd.DataFrame({"answer": ["planner"]})
-                return frame, StructuredPlannerReport(
-                    attempted=True,
-                    succeeded=True,
-                    attempts=1,
-                    failure_reason=None,
-                    plan={"steps": [], "output": "answer"},
-                    output_row_count=1,
-                    output_column_count=1,
-                    attempt_details=[],
-                )
+                raise AssertionError("Structured planner should not run in the Databao baseline.")
 
             artifact = run_databao_task(
                 task=task,
@@ -712,7 +712,7 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertTrue(artifact.succeeded)
             self.assertEqual(artifact.candidate_source, "databao_raw")
             self.assertEqual(log_payload["candidate_source"], "databao_raw")
-            self.assertFalse(log_payload["structured_planner"]["attempted"])
+            self.assertNotIn("structured_planner", log_payload)
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
                 "answer\ndatabao\n",
@@ -754,7 +754,7 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertTrue(artifact.succeeded)
             self.assertEqual(artifact.candidate_source, "cheap_count_fallback")
             self.assertEqual(log_payload["candidate_source"], "cheap_count_fallback")
-            self.assertFalse(log_payload["structured_planner"]["attempted"])
+            self.assertNotIn("structured_planner", log_payload)
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
                 "count\n2\n",
@@ -1056,12 +1056,12 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertIsNone(captured["task_ids"])
             self.assertEqual(captured["task_timeout_seconds"], 150)
 
-    def test_run_databao_demo_cli_help_documents_planner_default_off(self) -> None:
+    def test_run_databao_demo_cli_help_does_not_expose_planner_mode(self) -> None:
         result = CliRunner().invoke(app, ["run-databao-demo", "--help"])
 
         self.assertEqual(result.exit_code, 0)
-        self.assertIn("Default is", result.output)
-        self.assertIn("off.", result.output)
+        self.assertNotIn("--planner-mode", result.output)
+        self.assertNotIn("--finalizer-mode", result.output)
 
     def test_timeout_artifact_writes_failure_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1136,68 +1136,6 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertIsNone(artifact.prediction_csv_path)
             self.assertFalse((output_root / "task_1" / "prediction.csv").exists())
             self.assertTrue((logs_dir / "task_1.json").exists())
-
-    def test_answer_finalizer_select_mode_slices_rows_and_columns(self) -> None:
-        frame = pd.DataFrame(
-            {
-                "date_received": ["2019-10-02", "2019-09-12"],
-                "amount": [50, 50],
-                "source": ["Dues", "Dues"],
-            }
-        )
-
-        pruned, mode = apply_answer_finalizer_decision(
-            frame,
-            {"mode": "select", "column_indices": [0], "row_indices": [1]},
-        )
-
-        self.assertEqual(mode, "select")
-        self.assertEqual(pruned.to_dict(orient="list"), {"date_received": ["2019-09-12"]})
-
-    def test_answer_finalizer_rewrite_mode_builds_dataframe(self) -> None:
-        frame = pd.DataFrame({"candidate": ["A", "B"]})
-
-        rewritten, mode = apply_answer_finalizer_decision(
-            frame,
-            {"mode": "rewrite", "columns": ["count"], "rows": [[2]]},
-        )
-
-        self.assertEqual(mode, "rewrite")
-        self.assertEqual(rewritten.to_dict(orient="list"), {"count": [2]})
-
-    def test_finalizer_failure_falls_back_to_databao_dataframe(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            input_root = root / "input"
-            output_root = root / "output"
-            logs_dir = root / "logs"
-            write_task(input_root)
-            task = DABenchPublicDataset(input_root).get_task("task_1")
-
-            def broken_finalizer(task, frame, databao_env):
-                del task, frame, databao_env
-                raise RuntimeError("bad finalizer")
-
-            artifact = run_databao_task(
-                task=task,
-                output_root=output_root,
-                logs_dir=logs_dir,
-                databao_env=DatabaoEnvironment("http://localhost:8080/v1", "key", "model"),
-                agent_builder=make_agent_builder(pd.DataFrame({"answer": ["A"], "extra": [1]})),
-                answer_finalizer=broken_finalizer,
-                structured_planner=no_structured_planner,
-                finalizer_mode="always",
-            )
-
-            log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
-
-            self.assertTrue(artifact.succeeded)
-            self.assertEqual(
-                (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
-                "answer,extra\nA,1\n",
-            )
-            self.assertFalse(log_payload["finalization"]["applied"])
-            self.assertIn("bad finalizer", log_payload["finalization"]["failure_reason"])
 
     def test_postprocessor_resolves_link_identifier_to_display_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1436,6 +1374,38 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             self.assertEqual(text_frame.to_dict(orient="list"), {"Text": ["hello"]})
 
+            write_task(
+                input_root,
+                task_id="task_comment_superlative",
+                question="Among the rows, what is the comment with the highest score?",
+            )
+            comment_task = DABenchPublicDataset(input_root).get_task("task_comment_superlative")
+            comment_frame, _ = apply_answer_column_verifier(
+                comment_task,
+                pd.DataFrame(
+                    {
+                        "Id": [1],
+                        "Score": [14],
+                        "CommentCount": [1],
+                        "Text": ["best comment"],
+                        "UserId": [88],
+                    }
+                ),
+            )
+            self.assertEqual(comment_frame.to_dict(orient="list"), {"Text": ["best comment"]})
+
+            write_task(
+                input_root,
+                task_id="task_post_identifier",
+                question="Which record has the most answers count? State the record ID.",
+            )
+            post_id_task = DABenchPublicDataset(input_root).get_task("task_post_identifier")
+            post_id_frame, _ = apply_answer_column_verifier(
+                post_id_task,
+                pd.DataFrame({"Id": [351], "OwnerUserId": [16], "AnswerCount": [12], "Title": [""]}),
+            )
+            self.assertEqual(post_id_frame.to_dict(orient="list"), {"Id": [351]})
+
             write_task(input_root, task_id="task_display", question="Identify the ViewCount and DisplayName.")
             views_task = DABenchPublicDataset(input_root).get_task("task_display")
             views_frame, _ = apply_answer_column_verifier(
@@ -1443,6 +1413,162 @@ class DatabaoDemoTests(unittest.TestCase):
                 pd.DataFrame({"Title": ["A"], "ViewCount": [1708], "DisplayName": ["mbq"], "UserId": [88]}),
             )
             self.assertEqual(views_frame.to_dict(orient="list"), {"ViewCount": [1708], "DisplayName": ["mbq"]})
+
+            write_task(
+                input_root,
+                task_id="task_count",
+                question="How many members attended the selected event?",
+            )
+            count_task = DABenchPublicDataset(input_root).get_task("task_count")
+            count_frame, _ = apply_answer_column_verifier(
+                count_task,
+                pd.DataFrame(
+                    {
+                        "event_id": ["recEvent"],
+                        "event_name": ["Selected Event"],
+                        "attendance_count": [17],
+                    }
+                ),
+            )
+            self.assertEqual(count_frame.to_dict(orient="list"), {"attendance_count": [17]})
+
+    def test_identifier_resolution_prefers_camel_case_display_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Name the user for the selected row.")
+            context_dir = input_root / "task_1" / "context"
+            json_dir = context_dir / "json"
+            json_dir.mkdir()
+            (json_dir / "users.json").write_text(
+                json.dumps([{"Id": 88, "DisplayName": "mbq"}]),
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            frame, report = postprocess_answer_table(
+                task,
+                pd.DataFrame({"UserId": [88]}),
+            )
+
+        self.assertEqual(frame.to_dict(orient="list"), {"DisplayName": ["mbq"]})
+        self.assertTrue(any(transform["kind"] == "identifier_resolution" for transform in report.transformations))
+
+    def test_ranker_prefers_display_candidate_over_id_helper_with_display(self) -> None:
+        contract = AnswerContract(
+            kind="multi_attribute",
+            expected_columns=("DisplayName", "ViewCount"),
+            max_rows=1,
+            max_columns=3,
+            allow_empty=False,
+            reason="test",
+        )
+        raw = Candidate(
+            frame=pd.DataFrame({"Id": [88], "DisplayName": ["mbq"], "Reputation": [14082]}),
+            source="databao_raw",
+            confidence=0.55,
+            diagnostics={},
+        )
+        postprocessed = Candidate(
+            frame=pd.DataFrame({"DisplayName": ["mbq"]}),
+            source="databao_raw_postprocessed",
+            confidence=0.63,
+            diagnostics={},
+            transformations=({"kind": "answer_column_verification"},),
+        )
+
+        selected, report = rank_candidates(
+            candidates=[raw, postprocessed],
+            contract=contract,
+            question="Identify the total views and name the user.",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw_postprocessed")
+        raw_score = next(score for score in report.candidate_scores if score.source == "databao_raw")
+        self.assertIn("id_helper_with_display_answer", raw_score.reasons)
+
+    def test_ranker_prefers_identifier_only_candidate_for_explicit_id_question(self) -> None:
+        contract = AnswerContract(
+            kind="attribute_lookup",
+            expected_columns=("Id",),
+            max_rows=1,
+            max_columns=3,
+            allow_empty=False,
+            reason="test",
+        )
+        raw = Candidate(
+            frame=pd.DataFrame({"Id": [351], "AnswerCount": [12], "DisplayName": ["slashnick"]}),
+            source="databao_raw",
+            confidence=0.55,
+            diagnostics={},
+        )
+        postprocessed = Candidate(
+            frame=pd.DataFrame({"Id": [351]}),
+            source="databao_raw_postprocessed",
+            confidence=0.63,
+            diagnostics={},
+            transformations=({"kind": "answer_column_verification"},),
+        )
+
+        selected, report = rank_candidates(
+            candidates=[raw, postprocessed],
+            contract=contract,
+            question="Which row has the highest count? State the ID.",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw_postprocessed")
+        raw_score = next(score for score in report.candidate_scores if score.source == "databao_raw")
+        selected_score = next(score for score in report.candidate_scores if score.source == "databao_raw_postprocessed")
+        self.assertIn("explicit_identifier_answer_has_extra_columns", raw_score.reasons)
+        self.assertIn("explicit_identifier_answer_only", selected_score.reasons)
+
+    def test_ranker_prefers_text_only_candidate_for_comment_answer(self) -> None:
+        contract = AnswerContract(
+            kind="attribute_lookup",
+            expected_columns=("Text",),
+            max_rows=1,
+            max_columns=5,
+            allow_empty=False,
+            reason="test",
+        )
+        raw = Candidate(
+            frame=pd.DataFrame(
+                {
+                    "Score": [14],
+                    "Text": ["answer text"],
+                    "ViewCount": [150],
+                    "Title": ["source title"],
+                }
+            ),
+            source="databao_raw",
+            confidence=0.55,
+            diagnostics={},
+        )
+        postprocessed = Candidate(
+            frame=pd.DataFrame({"Text": ["answer text"]}),
+            source="databao_raw_postprocessed",
+            confidence=0.63,
+            diagnostics={},
+            transformations=({"kind": "answer_column_verification"},),
+        )
+
+        selected, report = rank_candidates(
+            candidates=[raw, postprocessed],
+            contract=contract,
+            question="What is the comment with the highest score?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw_postprocessed")
+        raw_score = next(score for score in report.candidate_scores if score.source == "databao_raw")
+        selected_score = next(score for score in report.candidate_scores if score.source == "databao_raw_postprocessed")
+        self.assertIn("text_answer_has_extra_columns", raw_score.reasons)
+        self.assertIn("text_answer_columns_only", selected_score.reasons)
 
     def test_root_level_csv_is_loaded_and_registered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2187,6 +2313,128 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertIn("high_risk_verifier_discount", verifier_score.reasons)
         self.assertIn("valid_non_verifier_candidate_available", verifier_score.reasons)
 
+    def test_ratio_scale_compactor_converts_percentage_like_ratio_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_root = Path(tmp)
+            write_task(
+                input_root,
+                question="How many times is the number of posts compared to votes?",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame(
+                {
+                    "post_count": [3],
+                    "vote_count": [8],
+                    "posts_to_votes_ratio": [37.5],
+                }
+            )
+
+            compact, transforms = apply_ratio_scale_compactor(task, frame)
+
+        self.assertEqual(compact.to_dict(orient="list"), {"ratio": [0.375]})
+        self.assertEqual(transforms[0]["kind"], "ratio_scale_compaction")
+        self.assertEqual(transforms[0]["numerator_column"], "post_count")
+        self.assertEqual(transforms[0]["denominator_column"], "vote_count")
+        self.assertEqual(transforms[0]["source_result_column"], "posts_to_votes_ratio")
+
+    def test_candidate_ranking_prefers_ratio_scale_compaction_over_components(self) -> None:
+        contract = AnswerContract(
+            kind="scalar",
+            expected_columns=("answer",),
+            max_rows=1,
+            max_columns=1,
+            allow_empty=False,
+            reason="test",
+        )
+        raw = Candidate(
+            frame=pd.DataFrame(
+                {
+                    "post_count": [3],
+                    "vote_count": [8],
+                    "posts_to_votes_ratio": [37.5],
+                }
+            ),
+            source="databao_raw",
+            confidence=0.55,
+            diagnostics={},
+        )
+        compact = Candidate(
+            frame=pd.DataFrame({"ratio": [0.375]}),
+            source="databao_raw_ratio_compact",
+            confidence=0.66,
+            diagnostics={},
+            transformations=(
+                {
+                    "kind": "ratio_scale_compaction",
+                    "numerator_column": "post_count",
+                    "denominator_column": "vote_count",
+                    "source_result_column": "posts_to_votes_ratio",
+                },
+            ),
+        )
+
+        selected, report = rank_candidates(
+            candidates=[raw, compact],
+            contract=contract,
+            question="How many times is the number of posts compared to votes?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw_ratio_compact")
+        compact_score = next(
+            score for score in report.candidate_scores if score.source == "databao_raw_ratio_compact"
+        )
+        self.assertIn("ratio_scale_evidence", compact_score.reasons)
+
+    def test_column_only_compactor_removes_empty_duplicate_and_constant_display_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_root = Path(tmp)
+            write_task(input_root, question="Which names match the condition?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="entity_list",
+                expected_columns=(),
+                max_rows=None,
+                max_columns=None,
+                allow_empty=False,
+                reason="test",
+            )
+            frame = pd.DataFrame(
+                {
+                    "name": ["A", "B", "C"],
+                    "name_2": ["Unused", "Unused", "Unused"],
+                    "name_3": ["A", "B", "C"],
+                    "debug_note": ["", "", ""],
+                }
+            )
+
+            compact, transforms = apply_column_only_compactor(task, frame, contract)
+
+        self.assertEqual(compact.to_dict(orient="list"), {"name": ["A", "B", "C"]})
+        self.assertEqual(transforms[0]["kind"], "column_only_compaction")
+        self.assertTrue(transforms[0]["row_count_preserved"])
+
+    def test_column_only_compactor_preserves_multi_attribute_expected_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_root = Path(tmp)
+            write_task(input_root, question="Return the reference name and website.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="multi_attribute",
+                expected_columns=("constructorRef", "url"),
+                max_rows=1,
+                max_columns=2,
+                allow_empty=False,
+                reason="test",
+            )
+            frame = pd.DataFrame({"constructorRef": ["mclaren"], "url": ["https://example.test"]})
+
+            compact, transforms = apply_column_only_compactor(task, frame, contract)
+
+        self.assertTrue(compact.equals(frame))
+        self.assertEqual(transforms, [])
+
     def test_metadata_columns_never_reach_prediction_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2296,7 +2544,7 @@ class DatabaoDemoTests(unittest.TestCase):
 
             log_payload = json.loads((logs_dir / "task_1.json").read_text(encoding="utf-8"))
             self.assertTrue(artifact.succeeded)
-            self.assertIn("Structured planner skipped", log_payload["planner_skipped_reason"])
+            self.assertNotIn("planner_skipped_reason", log_payload)
             self.assertEqual(
                 (output_root / "task_1" / "prediction.csv").read_text(encoding="utf-8"),
                 "answer\n",
@@ -2331,7 +2579,7 @@ class DatabaoDemoTests(unittest.TestCase):
             task_context = build_task_context(task)
             intent = infer_task_intent(task_context)
 
-            decision = choose_route_policy(task_context, intent, structured_planner_mode="fallback")
+            decision = choose_route_policy(task_context, intent)
 
             self.assertEqual(decision.route, "databao")
             self.assertIsNone(decision.candidate)

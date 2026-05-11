@@ -278,14 +278,6 @@ def run_databao_demo_command(
         min=1,
         help="Override run.task_timeout_seconds for the Databao demo runner.",
     ),
-    planner_mode: str | None = typer.Option(
-        None,
-        help="Structured planner mode: off, fallback, or first. Default is off.",
-    ),
-    finalizer_mode: str | None = typer.Option(
-        None,
-        help="LLM finalizer mode: off or always. Default is off.",
-    ),
 ) -> None:
     """Run the Databao-backed demo runner on local public tasks."""
     app_config = load_app_config(config)
@@ -310,8 +302,6 @@ def run_databao_demo_command(
     console.print(f"Logs: {logs_dir}")
     console.print(f"Task timeout: {effective_task_timeout_seconds}s")
     console.print(f"Difficulty: {difficulty or 'all'}")
-    console.print(f"Planner mode: {planner_mode or 'off'}")
-    console.print(f"Finalizer mode: {finalizer_mode or 'off'}")
 
     artifacts = run_databao_tasks(
         input_root=app_config.dataset.root_path,
@@ -322,8 +312,6 @@ def run_databao_demo_command(
         difficulty=difficulty,
         task_timeout_seconds=effective_task_timeout_seconds,
         databao_env=databao_env,
-        structured_planner_mode=planner_mode,
-        finalizer_mode=finalizer_mode,
     )
     succeeded_count = sum(1 for artifact in artifacts if artifact.succeeded)
     prediction_written_count = sum(1 for artifact in artifacts if artifact.prediction_written)
