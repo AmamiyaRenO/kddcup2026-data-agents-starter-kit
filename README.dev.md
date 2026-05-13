@@ -219,6 +219,7 @@ Relevant baseline and negative-run notes:
   recovered to exact in run `20260511T003620Z`, while `task_250` later hit Databao
   `GraphRecursionError` with no prediction in `20260511T003720Z`. The broad switch has been removed;
   future prompt/context work should restart as a smaller targeted experiment.
+
 - Post-cleanup hard diagnostics:
   - `20260511T052829Z` targeted `task_349` succeeded and wrote a prediction, but evaluator score was
     still `0.0`; this is a semantic-source issue, not a missing-file issue.
@@ -261,6 +262,41 @@ Relevant baseline and negative-run notes:
       `task_349`, `task_352`, and `task_420`, all Databao `GraphRecursionError` after 50 LLM calls.
       The average recovered to the older high hard baseline, but prediction-written stability is
       still worse than desired.
+
+## 2026-05-14 High-Score Restore Decision
+
+The branch was restored to the previously saved high-scoring `databao_demo.py` from
+`C:\Users\tianj\Downloads\databao_demo.py` instead of continuing the conservative cleanup branch.
+The restored file differs from the smaller baseline in one important way: Databao uses
+`DATABAO_EXECUTOR_TYPE=lighthouse_salvage` by default. This executor keeps the latest successful
+Databao/Lighthouse DataFrame when the agent fails to submit a final result, records the generated
+code and submit/salvage flags on `frame.attrs`, and lets the normal Databao-first ranking path use
+that salvaged table.
+
+Temporary validation with the downloaded file before committing:
+
+| Difficulty | Run id | Prediction | Exact | Avg |
+| --- | --- | --- | --- | --- |
+| easy | `20260513T153200Z` | `15/15` | `10/15` | `0.713` |
+| medium | `20260513T153634Z` | `23/23` | `13/23` | `0.570` |
+| hard | `20260513T154923Z` | `11/11` | `6/11` | `0.545` |
+
+This result makes the tradeoff clear. The conservative branch kept the runner cleaner, but it lost
+the most valuable hard-stability mechanism. The restored high-score version is less minimal because
+it contains salvaged-result compactors and repair candidates, but those are tied to Databao's own
+latest execution state rather than broad pre-Databao synthetic guessing. For the current goal, the
+salvage path is worth keeping as the mainline.
+
+The immediately preceding conservative branch is recorded as a negative experiment:
+
+- Answer-focus column targeting, uppercase camel-case ID suppression, `Diagnosis`/`disease` aliasing,
+  and duplicate answer-row removal were small, generic-looking fixes.
+- Targeted `task_180` showed the ID-helper cleanup worked, but Databao still selected one extra
+  semantic source row; the fix did not address the real failure source.
+- Full checks on that branch produced easy `20260513T080952Z` avg `0.676`, exact `9/15`,
+  prediction `15/15`; medium `20260513T081454Z` avg `0.576`, exact `13/23`, prediction `22/23`.
+- Those changes should not be treated as active mainline behavior. If revisited, they should be
+  reintroduced one at a time behind targeted ablation, not mixed into the restored salvage baseline.
 
 ## Diagnostics
 

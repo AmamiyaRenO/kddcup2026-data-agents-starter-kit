@@ -31,6 +31,7 @@ DATABAO_DEBUG_LOG_RAW_ENV = "DATABAO_DEBUG_LOG_RAW"
 DATABAO_TASK_TIMEOUT_SECONDS_ENV = "DATABAO_TASK_TIMEOUT_SECONDS"
 DATABAO_DATABAO_TIMEOUT_SECONDS_ENV = "DATABAO_DATABAO_TIMEOUT_SECONDS"
 DATABAO_HEURISTIC_LEVEL_ENV = "DATABAO_HEURISTIC_LEVEL"
+DATABAO_EXECUTOR_TYPE_ENV = "DATABAO_EXECUTOR_TYPE"
 
 SOURCE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 MAX_DESCRIPTION_CHARS = 20000
@@ -38,6 +39,7 @@ MAX_CANDIDATE_PAYLOAD_ROWS = 120
 MAX_CANDIDATE_CELL_CHARS = 500
 MAX_CANDIDATE_PAYLOAD_CHARS = 45000
 MAX_DATABAO_TOKENS = 2048
+MAX_DATABAO_CODE_CHARS = 8000
 DATABAO_AGENT_TIMEOUT_SECONDS = 100
 MAX_FAILURE_REASON_CHARS = 1000
 MAX_CONTEXT_ENRICHMENT_ROWS = 80
@@ -46,6 +48,7 @@ MAX_SCHEMA_SAMPLE_ROWS = 3
 MAX_SCHEMA_PROFILE_SAMPLE_ROWS = 512
 RECORD_ID_PATTERN = re.compile(r"^rec[A-Za-z0-9]+$")
 HEURISTIC_LEVELS = {"generic", "experimental_generic"}
+DATABAO_EXECUTOR_TYPES = {"lighthouse", "lighthouse_salvage"}
 _CURRENT_DIAGNOSTICS: ContextVar["TaskDiagnostics | None"] = ContextVar(
     "databao_task_diagnostics",
     default=None,
@@ -698,6 +701,15 @@ def _heuristic_level(value: str | None = None) -> str:
     )
 
 
+def _databao_executor_type(value: str | None = None) -> str:
+    return _normalize_mode(
+        value if value is not None else os.environ.get(DATABAO_EXECUTOR_TYPE_ENV),
+        default="lighthouse_salvage",
+        allowed=DATABAO_EXECUTOR_TYPES,
+        aliases={"lighthouse-salvage": "lighthouse_salvage", "salvage": "lighthouse_salvage"},
+    )
+
+
 class StructuredPlanError(ValueError):
     """Raised when a structured query plan is not safe or executable."""
 
@@ -730,6 +742,20 @@ def _safe_log_value(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     if len(text) > MAX_FAILURE_REASON_CHARS:
         text = text[:MAX_FAILURE_REASON_CHARS] + "...[truncated]"
     return text
+
+
+def _databao_frame_execution_payload(frame: pd.DataFrame) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    code = _text_value(frame.attrs.get("databao_code"))
+    if code:
+        payload["databao_code"] = code[:MAX_DATABAO_CODE_CHARS]
+    for key in ("databao_submit_called", "databao_salvaged_latest_query_result"):
+        if key in frame.attrs:
+            payload[key] = bool(frame.attrs.get(key))
+    executor_type = frame.attrs.get("databao_executor_type")
+    if executor_type:
+        payload["databao_executor_type"] = _text_value(executor_type)
+    return payload
 
 
 class TaskDiagnostics:
@@ -1015,6 +1041,49 @@ def _extract_named_value(paragraph: str, labels: tuple[str, ...]) -> str | None:
     return None
 
 
+def _clean_identifier_display_value(value: str) -> str:
+    value = _clean_document_value(value)
+    value = re.sub(
+        r"^(?:the\s+)?(?:academic\s+|official\s+|corresponding\s+|specialized\s+|professional\s+|"
+        r"vocational\s+|interdisciplinary\s+|modern\s+|general\s+|flexible\s+|foundational\s+|"
+        r"key\s+|strategic\s+|core\s+|next\s+)?"
+        r"(?:record|entry|listing|profile|unit|program|track|discipline|designation)\s+"
+        r"(?:for|of|as|is|was|now|to)?\s*",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
+        r"^.*\b(?:called|known as|designated as|identified as|titled|confirmed as|updated to|"
+        r"corrected to|amended to|relabeled as|recorded as|designation is|designation is now|"
+        r"title is|name is)\s+",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return value.strip(" .,:;\"'`")
+
+
+def _extract_display_value_for_identifier(paragraph: str, identifier_value: str) -> str | None:
+    if not identifier_value:
+        return None
+    escaped_identifier = re.escape(identifier_value)
+    id_label = r"(?:Registry ID|ID|identifier|record id|code|reference)"
+    patterns = (
+        rf"([^.;()\n]{{2,140}}?)\s*\(\s*{id_label}\s*:?\s*{escaped_identifier}\s*\)",
+        rf"([^.;()\n]{{2,140}}?)\s*\(\s*{escaped_identifier}\s*\)",
+        rf"([^.;\n]{{2,140}}?)\b{escaped_identifier}\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, paragraph, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = _clean_identifier_display_value(match.group(1))
+        if value and not re.fullmatch(r"(?:record|entry|id|identifier|code|reference)", value, flags=re.IGNORECASE):
+            return value
+    return None
+
+
 def _extract_numeric_attribute(paragraph: str, attribute: str) -> float | None:
     pattern = rf"\b{re.escape(attribute)}\b[^\d.\-]{{0,40}}(-?\d+(?:\.\d+)?)"
     matches = re.findall(pattern, paragraph, flags=re.IGNORECASE)
@@ -1101,6 +1170,10 @@ def _generic_document_rows_for_path(
             row = dict(base)
             row["record_id_kind"] = identifier_kind
             row["record_id"] = identifier_value
+            if "name" not in row:
+                display_value = _extract_display_value_for_identifier(paragraph, identifier_value)
+                if display_value:
+                    row["name"] = display_value
             rows.append(row)
     return rows
 
@@ -1153,6 +1226,22 @@ def _document_records_agent_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if not selected_columns:
         return pd.DataFrame()
     output = frame.loc[:, selected_columns].copy()
+    if "record_id" in output.columns and "name" in output.columns:
+        scored = output.copy()
+        scored["__display_score"] = scored["name"].map(_display_value_score)
+        if "confidence" in scored.columns:
+            scored["__confidence_score"] = pd.to_numeric(scored["confidence"], errors="coerce").fillna(0)
+        else:
+            scored["__confidence_score"] = 0.0
+        scored = scored.sort_values(
+            ["record_id", "__display_score", "__confidence_score"],
+            ascending=[True, False, False],
+            kind="stable",
+        )
+        output = scored.drop_duplicates(subset=["record_id"], keep="first").drop(
+            columns=["__display_score", "__confidence_score"],
+            errors="ignore",
+        )
     return output.drop_duplicates().reset_index(drop=True)
 
 
@@ -1524,6 +1613,23 @@ def _display_series(table: ContextTable) -> tuple[str, pd.Series] | None:
     return None
 
 
+def _display_value_score(value: str) -> int:
+    text = _text_value(value)
+    if not text:
+        return -100
+    words = re.findall(r"[A-Za-z0-9]+", text)
+    score = 40
+    if len(words) <= 4:
+        score += 20
+    if len(words) == 1:
+        score += 10
+    if len(text) > 80:
+        score -= 30
+    if re.search(r"\b(?:record|entry|listing|profile|unit|program|track|discipline|designation)\b", text, flags=re.I):
+        score -= 12
+    return score
+
+
 def _make_unique_column_name(
     column_name: str,
     existing_columns: list[str],
@@ -1560,6 +1666,7 @@ def _match_context_identifier(
 
         for id_column in _identifier_columns(table.frame):
             lookup: dict[str, str] = {}
+            lookup_scores: dict[str, int] = {}
             for raw_id, raw_display in zip(
                 table.frame[id_column].tolist(),
                 display_values.tolist(),
@@ -1568,7 +1675,10 @@ def _match_context_identifier(
                 record_id = _text_value(raw_id)
                 display_value = _text_value(raw_display)
                 if record_id and display_value:
-                    lookup[record_id] = display_value
+                    display_score = _display_value_score(display_value)
+                    if record_id not in lookup or display_score > lookup_scores.get(record_id, -100):
+                        lookup[record_id] = display_value
+                        lookup_scores[record_id] = display_score
 
             if not lookup:
                 continue
@@ -2814,6 +2924,591 @@ def apply_ratio_scale_compactor(
     return frame, []
 
 
+def _boolean_indicator_series(series: pd.Series) -> pd.Series | None:
+    mapped = series.map(
+        lambda value: (
+            None
+            if pd.isna(value)
+            else (
+                1
+                if _text_value(value).strip().lower() in {"1", "true", "yes", "y"}
+                else 0
+                if _text_value(value).strip().lower() in {"0", "false", "no", "n"}
+                else None
+            )
+        )
+    )
+    non_null = mapped.dropna()
+    if non_null.empty:
+        return None
+    if not set(non_null.astype(int).unique()).issubset({0, 1}):
+        return None
+    return mapped.astype("Float64")
+
+
+def apply_salvaged_boolean_percentage_compactor(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    if not bool(frame.attrs.get("databao_salvaged_latest_query_result")):
+        return frame, []
+    lowered_question = task.question.lower()
+    if not re.search(r"\b(?:percentage|percent|proportion|share)\b", lowered_question):
+        return frame, []
+
+    question_tokens = _normalized_question_tokens(task.question)
+    negated_have = bool(
+        re.search(r"\b(?:do|does|did)\s+not\s+have\b", lowered_question)
+        or re.search(r"\bwithout\b", lowered_question)
+    )
+    positive_have = bool(re.search(r"\b(?:have|has|with)\b", lowered_question))
+    if not (negated_have or positive_have):
+        return frame, []
+
+    boolean_candidates: list[tuple[str, pd.Series, int]] = []
+    for column in frame.columns:
+        column_name = str(column)
+        if _is_id_like_column(column_name):
+            continue
+        aliases = _column_question_aliases(column_name)
+        overlap = aliases & question_tokens
+        if not overlap:
+            continue
+        indicator = _boolean_indicator_series(frame[column])
+        if indicator is None:
+            continue
+        boolean_candidates.append((column_name, indicator, len(overlap)))
+
+    if not boolean_candidates:
+        return frame, []
+
+    column_name, indicator, overlap_count = max(boolean_candidates, key=lambda item: item[2])
+    valid_values = indicator.dropna()
+    denominator = int(len(valid_values))
+    if denominator == 0:
+        return frame, []
+    target_value = 0 if negated_have else 1
+    numerator = int((valid_values.astype(int) == target_value).sum())
+    percentage = numerator * 100.0 / denominator
+    output = pd.DataFrame({"percentage": [percentage]})
+    output.attrs.update(frame.attrs)
+    transform = {
+        "kind": "salvaged_boolean_percentage_compaction",
+        "source_boolean_column": column_name,
+        "target_value": target_value,
+        "numerator": numerator,
+        "denominator": denominator,
+        "denominator_nonzero": True,
+        "matched_column_alias_count": overlap_count,
+        "databao_salvaged_latest_query_result": True,
+        "operation": "percentage",
+    }
+    return output, [transform]
+
+
+def apply_salvaged_detail_count_compactor(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    if frame.empty or len(frame.columns) == 0:
+        return frame, []
+    if frame.attrs.get("databao_submit_called") is not False and not frame.attrs.get(
+        "databao_salvaged_latest_query_result"
+    ):
+        return frame, []
+    if not _question_asks_count_metric(task.question):
+        return frame, []
+    if extract_question_features(task.question).asks_ratio_or_percentage:
+        return frame, []
+    count_like_columns = [
+        str(column)
+        for column in frame.columns
+        if any(term in str(column).lower() for term in ("answer", "count", "total", "number"))
+    ]
+    if count_like_columns and len(frame.columns) <= 2:
+        return frame, []
+    id_columns = [str(column) for column in frame.columns if _is_id_like_column(str(column))]
+    if id_columns:
+        count_value = int(frame[id_columns[0]].dropna().nunique())
+        count_basis = "distinct_id"
+        count_column = id_columns[0]
+    else:
+        count_value = int(len(frame))
+        count_basis = "row_count"
+        count_column = None
+    output = pd.DataFrame({"count": [count_value]})
+    output.attrs.update(frame.attrs)
+    transform = {
+        "kind": "salvaged_detail_count_compaction",
+        "operation": "count",
+        "count_basis": count_basis,
+        "count_column": count_column,
+        "input_rows": int(len(frame)),
+        "input_columns": [str(column) for column in frame.columns],
+    }
+    return output, [transform]
+
+
+GENERIC_FILTER_TOKEN_STOPWORDS = {
+    "what",
+    "which",
+    "percentage",
+    "percent",
+    "proportion",
+    "share",
+    "ratio",
+    "record",
+    "records",
+    "row",
+    "rows",
+    "entry",
+    "entries",
+    "table",
+    "tables",
+    "does",
+    "did",
+    "have",
+    "has",
+    "with",
+    "without",
+    "not",
+    "and",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+}
+
+
+def _question_filter_tokens(question: str) -> set[str]:
+    return {
+        token
+        for token in _normalized_question_tokens(question)
+        if token not in GENERIC_FILTER_TOKEN_STOPWORDS and len(token) > 2
+    }
+
+
+def _row_text_for_filter_match(row: pd.Series) -> str:
+    parts: list[str] = []
+    for column, value in row.items():
+        text = _text_value(value)
+        if not text:
+            continue
+        if _is_id_like_column(str(column)) and RECORD_ID_PATTERN.match(text):
+            continue
+        parts.append(text)
+    return " ".join(parts)
+
+
+def _question_matched_filter_frame(table: ContextTable, question_tokens: set[str]) -> tuple[pd.DataFrame, dict[str, Any] | None]:
+    if len(table.frame) == 0 or len(table.frame) > 5000 or not question_tokens:
+        return table.frame.iloc[0:0].copy(), None
+    matches: list[int] = []
+    matched_terms: set[str] = set()
+    for index, row in table.frame.iterrows():
+        row_tokens = _normalized_question_tokens(_row_text_for_filter_match(row))
+        overlap = question_tokens & row_tokens
+        if len(overlap) >= 2:
+            matches.append(index)
+            matched_terms.update(overlap)
+    if not matches:
+        return table.frame.iloc[0:0].copy(), None
+    return (
+        table.frame.loc[matches].copy().reset_index(drop=True),
+        {
+            "filter_table": table.name,
+            "filter_table_path": table.path,
+            "matched_terms": sorted(matched_terms),
+            "matched_rows": len(matches),
+        },
+    )
+
+
+def _relation_column_pairs(left: pd.DataFrame, right: pd.DataFrame) -> list[tuple[str, str, int]]:
+    scored_pairs: list[tuple[int, str, str, int]] = []
+    left_columns = _identifier_columns(left)
+    right_columns = _identifier_columns(right)
+    for left_column in left_columns:
+        left_values = {_text_value(value) for value in left[left_column].dropna().tolist()}
+        left_values.discard("")
+        if not left_values:
+            continue
+        for right_column in right_columns:
+            right_values = {_text_value(value) for value in right[right_column].dropna().head(200000).tolist()}
+            right_values.discard("")
+            overlap_count = len(left_values & right_values)
+            if overlap_count:
+                score = overlap_count
+                if left_column.lower() not in {"id", "record_id", "numeric_id"}:
+                    score += 1000
+                if right_column.lower() not in {"id", "record_id", "numeric_id"}:
+                    score += 100
+                scored_pairs.append((score, left_column, right_column, overlap_count))
+    scored_pairs.sort(key=lambda item: item[0], reverse=True)
+    return [(left_column, right_column, overlap_count) for _, left_column, right_column, overlap_count in scored_pairs]
+
+
+def apply_salvaged_context_boolean_percentage_repair(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    salvaged_result = bool(frame.attrs.get("databao_salvaged_latest_query_result"))
+    not_submitted = frame.attrs.get("databao_submit_called") is False
+    if not (salvaged_result or not_submitted):
+        return frame, []
+    if len(frame) != 0 and not not_submitted:
+        return frame, []
+    lowered_question = task.question.lower()
+    if not re.search(r"\b(?:percentage|percent|proportion|share)\b", lowered_question):
+        return frame, []
+
+    question_tokens = _question_filter_tokens(task.question)
+    if len(question_tokens) < 2:
+        return frame, []
+    negated_have = bool(
+        re.search(r"\b(?:do|does|did)\s+not\s+have\b", lowered_question)
+        or re.search(r"\bwithout\b", lowered_question)
+    )
+    positive_have = bool(re.search(r"\b(?:have|has|with)\b", lowered_question))
+    if not (negated_have or positive_have):
+        return frame, []
+
+    context_tables = load_context_tables(task.context_dir, heuristic_level=_heuristic_level())
+    best: tuple[int, pd.DataFrame, dict[str, Any]] | None = None
+    for filter_table in context_tables:
+        filtered_frame, filter_evidence = _question_matched_filter_frame(filter_table, question_tokens)
+        if filter_evidence is None or filtered_frame.empty:
+            continue
+
+        for indicator_table in context_tables:
+            boolean_columns: list[tuple[str, pd.Series, int]] = []
+            for column in indicator_table.frame.columns:
+                column_name = str(column)
+                if _is_id_like_column(column_name):
+                    continue
+                aliases = _column_question_aliases(column_name)
+                overlap_count = len(aliases & _normalized_question_tokens(task.question))
+                if overlap_count == 0:
+                    continue
+                indicator = _boolean_indicator_series(indicator_table.frame[column])
+                if indicator is not None:
+                    boolean_columns.append((column_name, indicator, overlap_count))
+            if not boolean_columns:
+                continue
+
+            if filter_table.name == indicator_table.name and filter_table.path == indicator_table.path:
+                joined_frame = filtered_frame
+                relation_evidence: dict[str, Any] = {"relation": "same_table"}
+            else:
+                relation_pairs = _relation_column_pairs(filtered_frame, indicator_table.frame)
+                if not relation_pairs:
+                    continue
+                left_column, right_column, overlap_count = relation_pairs[0]
+                left_values = {_text_value(value) for value in filtered_frame[left_column].dropna().tolist()}
+                left_values.discard("")
+                mask = indicator_table.frame[right_column].map(lambda value: _text_value(value) in left_values)
+                joined_frame = indicator_table.frame.loc[mask].copy().reset_index(drop=True)
+                relation_evidence = {
+                    "relation": "identifier_join",
+                    "left_table": filter_table.name,
+                    "left_column": left_column,
+                    "right_table": indicator_table.name,
+                    "right_column": right_column,
+                    "matched_identifier_count": overlap_count,
+                }
+            if joined_frame.empty:
+                continue
+
+            for column_name, _, column_overlap in boolean_columns:
+                if column_name not in joined_frame.columns:
+                    continue
+                indicator = _boolean_indicator_series(joined_frame[column_name])
+                if indicator is None:
+                    continue
+                valid_values = indicator.dropna()
+                denominator = int(len(valid_values))
+                if denominator == 0:
+                    continue
+                target_value = 0 if negated_have else 1
+                numerator = int((valid_values.astype(int) == target_value).sum())
+                percentage = numerator * 100.0 / denominator
+                output = pd.DataFrame({"percentage": [percentage]})
+                output.attrs.update(frame.attrs)
+                evidence = {
+                    "filter_evidence": filter_evidence,
+                    "relation_evidence": relation_evidence,
+                    "indicator_table": indicator_table.name,
+                    "indicator_column": column_name,
+                    "target_value": target_value,
+                    "numerator": numerator,
+                    "denominator": denominator,
+                    "denominator_nonzero": True,
+                    "operation": "percentage",
+                }
+                score = int(filter_evidence["matched_rows"]) + denominator + (10 * column_overlap)
+                if best is None or score > best[0]:
+                    best = (score, output, evidence)
+
+    if best is None:
+        return frame, []
+    _, output, evidence = best
+    transform = {
+        "kind": "salvaged_context_boolean_percentage_repair",
+        **evidence,
+    }
+    return output, [transform]
+
+
+def _quoted_phrases(text: str) -> tuple[str, ...]:
+    phrases = re.findall(r'"([^"]+)"|\'([^\']+)\'', text)
+    return tuple(match[0] or match[1] for match in phrases if match[0] or match[1])
+
+
+def _display_columns_for_entity_lookup(frame: pd.DataFrame) -> list[str]:
+    display_columns = _display_like_columns(frame)
+    return display_columns or [str(column) for column in frame.columns if frame[column].dtype == object][:3]
+
+
+def _ids_for_quoted_entity(phrase: str, context_tables: list[ContextTable]) -> list[str]:
+    phrase_lower = phrase.strip().lower()
+    ids: list[str] = []
+    for table in context_tables:
+        id_columns = _identifier_columns(table.frame)
+        if not id_columns:
+            continue
+        for display_column in _display_columns_for_entity_lookup(table.frame):
+            if display_column not in table.frame.columns:
+                continue
+            mask = table.frame[display_column].map(lambda value: _text_value(value).lower() == phrase_lower)
+            if not mask.any():
+                continue
+            for id_column in id_columns:
+                ids.extend(
+                    _text_value(value)
+                    for value in table.frame.loc[mask, id_column].tolist()
+                    if _text_value(value)
+                )
+    return list(dict.fromkeys(ids))
+
+
+def _numeric_amount_from_text(text: str) -> float | None:
+    patterns = (
+        r"\b(?:amount|total|allocated|budgeted|funded|provisionally budgeted|final budget)\b[^\d.\-]{0,40}(-?\d+(?:\.\d+)?)",
+        r"\b(-?\d+(?:\.\d+)?)\b[^\n.;]{0,40}\b(?:amount|total|allocated|budgeted|funded)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            return float(match.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _record_numeric_amount(record_id: str, reasoning_frame: pd.DataFrame) -> tuple[float | None, dict[str, Any]]:
+    rows = reasoning_frame[reasoning_frame["record_id"].map(_text_value).eq(record_id)]
+    evidence: dict[str, Any] = {"record_id": record_id, "row_count": int(len(rows))}
+    if rows.empty:
+        return None, evidence
+    for column in ("amount", "total", "value", "cost", "price"):
+        if column not in rows.columns:
+            continue
+        numeric = pd.to_numeric(rows[column], errors="coerce").dropna()
+        positive = numeric[numeric > 0]
+        if not positive.empty:
+            value = float(positive.iloc[0])
+            evidence.update({"amount_column": column, "amount_value": value})
+            return value, evidence
+    for _, row in rows.iterrows():
+        text_value = _text_value(row.get("evidence_span"))
+        value = _numeric_amount_from_text(text_value)
+        if value is not None and value > 0:
+            evidence.update({"amount_column": "evidence_span", "amount_value": value})
+            return value, evidence
+    return None, evidence
+
+
+def _record_text_bundle(record_id: str, reasoning_frame: pd.DataFrame) -> str:
+    if "record_id" not in reasoning_frame.columns:
+        return ""
+    rows = reasoning_frame[reasoning_frame["record_id"].astype(str) == str(record_id)]
+    parts: list[str] = []
+    for _, row in rows.iterrows():
+        for column in ("name", "category", "status", "evidence_span"):
+            value = _text_value(row.get(column))
+            if value:
+                parts.append(value)
+    return "\n".join(parts)
+
+
+def _record_question_overlap_score(
+    record_id: str,
+    reasoning_frame: pd.DataFrame,
+    question_tokens: set[str],
+) -> int:
+    if not question_tokens:
+        return 0
+    if "record_id" not in reasoning_frame.columns:
+        return 0
+    rows = reasoning_frame[reasoning_frame["record_id"].astype(str) == str(record_id)]
+    score = 0
+    for _, row in rows.iterrows():
+        for column, weight in (
+            ("category", 6),
+            ("status", 4),
+            ("name", 3),
+            ("evidence_span", 1),
+        ):
+            value = _text_value(row.get(column))
+            if not value:
+                continue
+            score += weight * len(_normalized_question_tokens(value) & question_tokens)
+    return score
+
+
+def _record_column_overlap_score(
+    record_id: str,
+    reasoning_frame: pd.DataFrame,
+    column_name: str,
+    question_tokens: set[str],
+) -> int:
+    if not question_tokens or "record_id" not in reasoning_frame.columns or column_name not in reasoning_frame.columns:
+        return 0
+    rows = reasoning_frame[reasoning_frame["record_id"].astype(str) == str(record_id)]
+    score = 0
+    for _, row in rows.iterrows():
+        score += len(_normalized_question_tokens(_text_value(row.get(column_name))) & question_tokens)
+    return score
+
+
+def _record_classification_overlap_score(
+    record_id: str,
+    reasoning_frame: pd.DataFrame,
+    question_tokens: set[str],
+) -> int:
+    if not question_tokens or "record_id" not in reasoning_frame.columns:
+        return 0
+    rows = reasoning_frame[reasoning_frame["record_id"].astype(str) == str(record_id)]
+    score = 0
+    cue_pattern = re.compile(
+        r"\b(?:categor(?:y|ized|ised)|classified|classification|designated|designation|allocated|assigned|corrected|reclassified)\b"
+        r"[^.]{0,80}",
+        flags=re.IGNORECASE,
+    )
+    for _, row in rows.iterrows():
+        text = _text_value(row.get("evidence_span"))
+        for match in cue_pattern.finditer(text):
+            score += len(_normalized_question_tokens(match.group(0)) & question_tokens)
+    return score
+
+
+def _record_ids_related_to_entity(entity_id: str, reasoning_frame: pd.DataFrame, question_tokens: set[str]) -> list[str]:
+    candidates: list[tuple[int, str]] = []
+    noisy_ids = {"record", "records", "recent", "recently", "reclassified", "recurring", "reconciliation"}
+    for _, row in reasoning_frame.iterrows():
+        text = _text_value(row.get("evidence_span"))
+        if entity_id not in text:
+            continue
+        row_tokens = _normalized_question_tokens(text)
+        overlap = row_tokens & question_tokens
+        record_ids = [
+            match
+            for match in re.findall(r"\brec[A-Za-z0-9]+\b", text)
+            if match != entity_id and match.lower() not in noisy_ids
+        ]
+        for record_id in record_ids:
+            candidates.append((len(overlap), record_id))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return list(dict.fromkeys(record_id for _, record_id in candidates))
+
+
+def apply_quoted_entity_ratio_repair(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    lowered_question = task.question.lower()
+    if not re.search(r"\b(?:how many times|ratio|compared to|more than)\b", lowered_question):
+        return frame, []
+    if len(frame) != 0 and frame.attrs.get("databao_submit_called") is not False:
+        return frame, []
+    phrases = _quoted_phrases(task.question)
+    if len(phrases) < 2:
+        return frame, []
+
+    context_tables = load_context_tables(task.context_dir, heuristic_level=_heuristic_level())
+    reasoning_tables = document_records_for_reasoning(task.context_dir, heuristic_level=_heuristic_level())
+    if not reasoning_tables:
+        return frame, []
+    reasoning_frame = pd.concat([table.frame for table in reasoning_tables], ignore_index=True)
+    if "record_id" not in reasoning_frame.columns or "evidence_span" not in reasoning_frame.columns:
+        return frame, []
+
+    question_without_quotes = re.sub(r'"[^"]+"|\'[^\']+\'', " ", task.question)
+    question_tokens = _question_filter_tokens(question_without_quotes)
+    resolved: list[dict[str, Any]] = []
+    for phrase in phrases[:2]:
+        entity_ids = _ids_for_quoted_entity(phrase, context_tables)
+        if not entity_ids:
+            return frame, []
+        best: tuple[float, str, dict[str, Any]] | None = None
+        best_evidence_score: tuple[int, int, float] | None = None
+        for entity_id in entity_ids:
+            for record_id in _record_ids_related_to_entity(entity_id, reasoning_frame, question_tokens):
+                amount, amount_evidence = _record_numeric_amount(record_id, reasoning_frame)
+                if amount is None:
+                    continue
+                filter_score = _record_question_overlap_score(record_id, reasoning_frame, question_tokens)
+                if filter_score <= 0 and question_tokens:
+                    continue
+                category_score = _record_column_overlap_score(record_id, reasoning_frame, "category", question_tokens)
+                classification_score = _record_classification_overlap_score(record_id, reasoning_frame, question_tokens)
+                evidence_score = (category_score + classification_score, filter_score, amount)
+                if best_evidence_score is None or evidence_score > best_evidence_score:
+                    best = (amount, record_id, amount_evidence | {"entity_id": entity_id})
+                    best_evidence_score = evidence_score
+        if best is None:
+            return frame, []
+        amount, record_id, evidence = best
+        resolved.append(
+            {
+                "phrase": phrase,
+                "entity_ids": entity_ids,
+                "record_id": record_id,
+                "amount": amount,
+                "evidence": evidence
+                | {
+                    "record_category_score": best_evidence_score[0] if best_evidence_score else 0,
+                    "record_filter_score": best_evidence_score[1] if best_evidence_score else 0,
+                },
+            }
+        )
+
+    denominator = float(resolved[1]["amount"])
+    numerator = float(resolved[0]["amount"])
+    if denominator == 0:
+        return frame, []
+    ratio = numerator / denominator
+    output = pd.DataFrame({"ratio": [ratio]})
+    output.attrs.update(frame.attrs)
+    transform = {
+        "kind": "quoted_entity_ratio_repair",
+        "operation": "ratio",
+        "numerator_phrase": resolved[0]["phrase"],
+        "denominator_phrase": resolved[1]["phrase"],
+        "numerator_record_id": resolved[0]["record_id"],
+        "denominator_record_id": resolved[1]["record_id"],
+        "numerator": numerator,
+        "denominator": denominator,
+        "denominator_nonzero": True,
+        "question_tokens": sorted(question_tokens),
+        "evidence": resolved,
+    }
+    return output, [transform]
+
+
 def postprocess_answer_table(
     task: PublicTask,
     frame: pd.DataFrame,
@@ -2862,6 +3557,28 @@ def generate_verifier_candidate_frames(
     ratio_frame, ratio_transforms = apply_ratio_scale_compactor(task, frame)
     if ratio_transforms and not ratio_frame.equals(frame):
         candidates.append((ratio_frame, ratio_transforms, 0.66))
+
+    salvaged_percentage_frame, salvaged_percentage_transforms = apply_salvaged_boolean_percentage_compactor(
+        task,
+        frame,
+    )
+    if salvaged_percentage_transforms and not salvaged_percentage_frame.equals(frame):
+        candidates.append((salvaged_percentage_frame, salvaged_percentage_transforms, 0.74))
+
+    context_percentage_frame, context_percentage_transforms = apply_salvaged_context_boolean_percentage_repair(
+        task,
+        frame,
+    )
+    if context_percentage_transforms and not context_percentage_frame.equals(frame):
+        candidates.append((context_percentage_frame, context_percentage_transforms, 0.68))
+
+    detail_count_frame, detail_count_transforms = apply_salvaged_detail_count_compactor(task, frame)
+    if detail_count_transforms and not detail_count_frame.equals(frame):
+        candidates.append((detail_count_frame, detail_count_transforms, 0.7))
+
+    quoted_ratio_frame, quoted_ratio_transforms = apply_quoted_entity_ratio_repair(task, frame)
+    if quoted_ratio_transforms and not quoted_ratio_frame.equals(frame):
+        candidates.append((quoted_ratio_frame, quoted_ratio_transforms, 0.66))
 
     return candidates
 
@@ -3479,7 +4196,7 @@ def _infer_generic_target_entity(question: str) -> str | None:
 
 
 STRONG_AGGREGATION_TERMS = ("average", "avg", "mean", "sum", "total", "count", "how many")
-RATIO_TERMS = ("ratio", "percentage", "percent", "proportion", "share")
+RATIO_TERMS = ("ratio", "percentage", "percent", "proportion", "share", "how many times", "compared to")
 VALUE_METRIC_TERMS = ("amount", "cost", "price", "score", "points")
 WEAK_METRIC_TERMS = ("number", "rate", "value", "view count")
 
@@ -3877,6 +4594,8 @@ def _question_mentions_multiple_attributes(question: str) -> bool:
 
 def _question_asks_count_metric(question: str) -> bool:
     features = extract_question_features(question)
+    if features.asks_ratio_or_percentage and "how many times" in question.lower():
+        return "count" in features.strong_terms
     return any(term in features.strong_terms for term in ("how many", "count"))
 
 
@@ -4125,13 +4844,16 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
         operation = "filter_select"
 
     target_entity = _infer_generic_target_entity(question)
+    explicit_scalar_ratio_question = bool(
+        re.search(r"\bwhat\s+(?:percentage|percent|proportion|share|ratio)\b", question)
+    )
     answer_kind = (
         "scalar"
         if operation in {"average", "count", "sum", "ratio", "percentage"}
-        and features.asks_scalar_metric
-        and features.confidence >= 0.45
-        and not features.asks_entity_plus_metric
-        and not features.asks_multi_attribute
+        and (features.asks_scalar_metric or explicit_scalar_ratio_question)
+        and (features.confidence >= 0.45 or explicit_scalar_ratio_question)
+        and (not features.asks_entity_plus_metric or explicit_scalar_ratio_question)
+        and (operation in {"ratio", "percentage"} or not features.asks_multi_attribute)
         else "table"
     )
     return TaskIntent(
@@ -4145,6 +4867,7 @@ def infer_task_intent(task_context: TaskContext) -> TaskIntent:
 
 def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> AnswerContract:
     question = task_context.task.question
+    lowered_question = question.lower()
     features = extract_question_features(question, task_context.context_tables)
     schema_columns = [str(column) for table in task_context.context_tables for column in table.frame.columns]
     display_schema_columns = [column for column in schema_columns if _is_display_like_column(column)]
@@ -4176,9 +4899,27 @@ def infer_answer_contract(task_context: TaskContext, intent: TaskIntent) -> Answ
 
     if (
         intent.answer_kind == "scalar"
-        and features.asks_scalar_metric
-        and features.confidence >= 0.45
-        and not features.asks_entity_or_list
+        and (
+            features.asks_scalar_metric
+            or (
+                intent.operation in {"ratio", "percentage"}
+                and bool(re.search(r"\bwhat\s+(?:percentage|percent|proportion|share|ratio)\b", lowered_question))
+            )
+        )
+        and (
+            features.confidence >= 0.45
+            or (
+                intent.operation in {"ratio", "percentage"}
+                and bool(re.search(r"\bwhat\s+(?:percentage|percent|proportion|share|ratio)\b", lowered_question))
+            )
+        )
+        and (
+            not features.asks_entity_or_list
+            or (
+                intent.operation in {"ratio", "percentage"}
+                and bool(re.search(r"\bwhat\s+(?:percentage|percent|proportion|share|ratio)\b", lowered_question))
+            )
+        )
     ):
         return AnswerContract(
             kind="scalar",
@@ -4571,6 +5312,19 @@ def rank_candidates(
         and validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source).valid
         for candidate in candidates
     )
+    percentage_repair_kinds = {
+        "ratio_scale_compaction",
+        "salvaged_boolean_percentage_compaction",
+        "salvaged_context_boolean_percentage_repair",
+        "quoted_entity_ratio_repair",
+    }
+    has_valid_percentage_repair_candidate = any(
+        isinstance(candidate.frame, pd.DataFrame)
+        and len(candidate.frame.columns) > 0
+        and any(str(transform.get("kind", "")) in percentage_repair_kinds for transform in candidate.transformations)
+        and validate_answer_contract(contract, candidate.frame, candidate_source=candidate.source).valid
+        for candidate in candidates
+    )
     for candidate in candidates:
         if not isinstance(candidate.frame, pd.DataFrame) or len(candidate.frame.columns) == 0:
             scored.append((-100, candidate, ["invalid dataframe"]))
@@ -4760,6 +5514,50 @@ def rank_candidates(
             else:
                 score -= 35
                 reasons.append("ratio_scale_sanity_failed")
+        if any(
+            str(transform.get("kind", "")) == "salvaged_boolean_percentage_compaction"
+            for transform in candidate.transformations
+        ):
+            if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
+                score += 35
+                reasons.append("salvaged_boolean_percentage_evidence")
+            else:
+                score -= 35
+                reasons.append("salvaged_boolean_percentage_sanity_failed")
+        if any(
+            str(transform.get("kind", "")) == "salvaged_context_boolean_percentage_repair"
+            for transform in candidate.transformations
+        ):
+            if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
+                score += 25
+                reasons.append("salvaged_context_percentage_evidence")
+            else:
+                score -= 45
+                reasons.append("salvaged_context_percentage_sanity_failed")
+        if any(
+            str(transform.get("kind", "")) == "salvaged_detail_count_compaction"
+            for transform in candidate.transformations
+        ):
+            if report.valid and not extract_question_features(question).asks_ratio_or_percentage:
+                score += 35
+                reasons.append("salvaged_detail_count_evidence")
+            else:
+                score -= 35
+                reasons.append("salvaged_detail_count_sanity_failed")
+        if any(str(transform.get("kind", "")) == "quoted_entity_ratio_repair" for transform in candidate.transformations):
+            if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
+                score += 30
+                reasons.append("quoted_entity_ratio_evidence")
+            else:
+                score -= 45
+                reasons.append("quoted_entity_ratio_sanity_failed")
+        if (
+            features.asks_ratio_or_percentage
+            and has_valid_percentage_repair_candidate
+            and not any(str(transform.get("kind", "")) in percentage_repair_kinds for transform in candidate.transformations)
+        ):
+            score -= 35
+            reasons.append("percentage_question_non_percentage_candidate")
         if any(str(transform.get("kind", "")) == "column_only_compaction" for transform in candidate.transformations):
             transform = next(
                 transform
@@ -5017,6 +5815,88 @@ def try_deterministic_candidate(task_context: TaskContext, intent: TaskIntent) -
     del task_context, intent
     return None
 
+
+def _make_lighthouse_salvage_executor() -> Any:
+    from databao.agent.core import ExecutionResult
+    from databao.agent.core.executor import OutputModalityHints
+    from databao.agent.executors.lighthouse.executor import LighthouseExecutor
+
+    class LighthouseSalvageExecutor(LighthouseExecutor):
+        @staticmethod
+        def _invoke_graph_sync(compiled_graph: Any, start_state: Any, **kwargs: Any) -> Any:
+            config = kwargs.get("config")
+            stream_kwargs = {key: value for key, value in kwargs.items() if key not in {"config", "stream", "writer"}}
+            last_state = None
+            try:
+                for mode, chunk in compiled_graph.stream(
+                    start_state,
+                    stream_mode=["values"],
+                    config=config,
+                    **stream_kwargs,
+                ):
+                    if mode == "values":
+                        last_state = chunk
+            except Exception:
+                if isinstance(last_state, dict) and last_state.get("df") is not None:
+                    return last_state
+                raise
+            if last_state is None:
+                raise RuntimeError("Graph execution produced no output state")
+            return last_state
+
+        def _get_result_with_salvage(self, state: dict[str, Any]) -> Any:
+            try:
+                return self._graph.get_result(state)
+            except Exception:
+                df = state.get("df")
+                if df is None:
+                    raise
+                return ExecutionResult(
+                    text="Salvaged the latest successful SQL result after Databao did not submit a final result.",
+                    df=df,
+                    code=state.get("sql", ""),
+                    meta={
+                        "visualization_prompt": state.get("visualization_prompt"),
+                        ExecutionResult.META_MESSAGES_KEY: state.get("messages", []),
+                        "submit_called": False,
+                        "salvaged_latest_query_result": True,
+                    },
+                )
+
+        def execute(
+            self,
+            opas: list[Any],
+            cache: Any,
+            llm_config: Any,
+            agent_config: Any,
+            domain: Any,
+            *,
+            rows_limit: int = 100,
+            stream: bool = True,
+            writer: Any = None,
+        ) -> Any:
+            del stream
+            self._init_sources_from_domain(domain)
+            system_prompt = self.render_system_prompt(self._duckdb_connection, domain, agent_config.recursion_limit)
+            init_state = self._graph.init_state([], limit_max_rows=rows_limit)
+            execution_result, _ = self._execute_core(
+                opas,
+                cache,
+                llm_config,
+                agent_config,
+                domain,
+                system_prompt=system_prompt,
+                init_state=init_state,
+                get_result=self._get_result_with_salvage,
+                stream=True,
+                writer=writer,
+            )
+            execution_result.meta[OutputModalityHints.META_KEY] = self._make_output_modality_hints(execution_result)
+            return execution_result
+
+    return LighthouseSalvageExecutor()
+
+
 def choose_route_policy(
     task_context: TaskContext,
     intent: TaskIntent,
@@ -5060,10 +5940,13 @@ def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> An
         use_responses_api=False,
         model_kwargs=model_kwargs,
     )
+    executor_type = _databao_executor_type()
+    data_executor = _make_lighthouse_salvage_executor() if executor_type == "lighthouse_salvage" else None
     return bao.agent(
         domain,
         name=f"databao_{task.task_id}",
         llm_config=llm_config,
+        data_executor=data_executor,
         rows_limit=1000,
         stream_ask=False,
         stream_plot=False,
@@ -5416,14 +6299,30 @@ def _ask_databao_candidate(
     with diagnostics.stage(stage_name):
         agent = agent_builder(task, databao_env)
         thread = agent.thread(stream_ask=False, stream_plot=False, auto_output_modality=False)
-        frame = thread.ask(_build_question_prompt(task), stream=False).df()
+        thread.ask(_build_question_prompt(task), stream=False)
+        frame = thread.df()
+        try:
+            code = thread.code()
+            meta = thread.meta()
+        except Exception:  # noqa: BLE001
+            code = None
+            meta = {}
     if not isinstance(frame, pd.DataFrame):
         raise TypeError("Databao did not return a dataframe.")
+    if code:
+        frame.attrs["databao_code"] = _text_value(code)
+    if isinstance(meta, Mapping):
+        if "submit_called" in meta:
+            frame.attrs["databao_submit_called"] = bool(meta.get("submit_called"))
+        if "salvaged_latest_query_result" in meta:
+            frame.attrs["databao_salvaged_latest_query_result"] = bool(meta.get("salvaged_latest_query_result"))
+    frame.attrs["databao_executor_type"] = _databao_executor_type()
     diagnostics.checkpoint(
         "databao_frame_received",
         row_count=len(frame),
         column_count=len(frame.columns),
         columns=[str(column) for column in frame.columns[:20]],
+        **_databao_frame_execution_payload(frame),
     )
     return frame
 
@@ -5484,6 +6383,7 @@ def run_databao_task(
                 DATABAO_DATABAO_TIMEOUT_SECONDS_ENV,
                 DATABAO_AGENT_TIMEOUT_SECONDS,
             ),
+            "databao_executor_type": _databao_executor_type(),
             "active_progress": _read_task_progress(logs_dir, task.task_id),
         }
 
@@ -5822,8 +6722,64 @@ def run_databao_task(
                             }
                         )
                 if not candidates:
+                    repair_seed = pd.DataFrame({"_databao_failure": []})
+                    repair_seed.attrs["databao_salvaged_latest_query_result"] = True
+                    context_percentage_frame, context_percentage_transforms = (
+                        apply_salvaged_context_boolean_percentage_repair(task, repair_seed)
+                    )
+                    if context_percentage_transforms and not context_percentage_frame.equals(repair_seed):
+                        repair_candidate = record_candidate(
+                            build_candidate_from_frame(
+                                context_percentage_frame,
+                                source="databao_failure_context_percentage_repair",
+                                confidence=0.52,
+                                diagnostics_payload={
+                                    "databao_failure_reason": databao_failure_reason,
+                                    "repair_transforms": context_percentage_transforms,
+                                },
+                                transformations=tuple(context_percentage_transforms),
+                            )
+                        )
+                        if repair_candidate is not None:
+                            applied_strategies.extend(
+                                {
+                                    "strategy_name": str(transform.get("kind", "context_percentage_repair")),
+                                    "strategy_kind": "generic",
+                                    "result": transform,
+                                    "applied_to_final_answer": False,
+                                }
+                                for transform in context_percentage_transforms
+                            )
+                if not candidates:
+                    repair_seed = pd.DataFrame({"_databao_failure": []})
+                    repair_seed.attrs["databao_salvaged_latest_query_result"] = True
+                    quoted_ratio_frame, quoted_ratio_transforms = apply_quoted_entity_ratio_repair(task, repair_seed)
+                    if quoted_ratio_transforms and not quoted_ratio_frame.equals(repair_seed):
+                        repair_candidate = record_candidate(
+                            build_candidate_from_frame(
+                                quoted_ratio_frame,
+                                source="databao_failure_quoted_ratio_repair",
+                                confidence=0.5,
+                                diagnostics_payload={
+                                    "databao_failure_reason": databao_failure_reason,
+                                    "repair_transforms": quoted_ratio_transforms,
+                                },
+                                transformations=tuple(quoted_ratio_transforms),
+                            )
+                        )
+                        if repair_candidate is not None:
+                            applied_strategies.extend(
+                                {
+                                    "strategy_name": str(transform.get("kind", "quoted_ratio_repair")),
+                                    "strategy_kind": "generic",
+                                    "result": transform,
+                                    "applied_to_final_answer": False,
+                                }
+                                for transform in quoted_ratio_transforms
+                            )
+                if not candidates:
                     missing_prediction_reason = (
-                        "Databao failed and cheap count fallback did not produce a dataframe."
+                        "Databao failed and cheap count fallback/context repairs did not produce a dataframe."
                     )
                     raise RuntimeError(
                         f"{missing_prediction_reason} Databao: {databao_failure_reason}"
@@ -5834,7 +6790,10 @@ def run_databao_task(
                         databao_frame,
                         source="databao_raw",
                         confidence=0.55,
-                        diagnostics_payload={"stage": "databao_ask"},
+                        diagnostics_payload={
+                            "stage": "databao_ask",
+                            **_databao_frame_execution_payload(databao_frame),
+                        },
                         elapsed_seconds=round(perf_counter() - databao_started_at, 3),
                     )
                 )
