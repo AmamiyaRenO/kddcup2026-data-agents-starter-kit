@@ -298,6 +298,34 @@ The immediately preceding conservative branch is recorded as a negative experime
 - Those changes should not be treated as active mainline behavior. If revisited, they should be
   reintroduced one at a time behind targeted ablation, not mixed into the restored salvage baseline.
 
+## 2026-05-14 Easy Safe Cleanup
+
+After restoring the salvage runner, the first easy-focused cleanup stayed inside deterministic
+answer shaping rather than Databao prompt/planner changes:
+
+- Entity display lookup now prefers stable display/name/title/label columns before status/category
+  columns. This lets context superlative verification return event names instead of status values.
+- Answer-column pruning now uses the leading answer phrase as a signal, so questions such as
+  "provide the eye colour", "what is his number", and "what is the finish time" prefer the requested
+  attribute over filter/sort/helper columns.
+- Superlative metric columns are treated as sort evidence unless the question explicitly asks for
+  the metric value. Context superlative candidates with strong metric evidence and tied rows can
+  beat a single-row Databao candidate.
+
+Targeted checks:
+
+- `task_25` run `20260513T162452Z`: exact, repaired lowest-cost ties to three event names.
+- `task_74` run `20260513T162519Z`: exact, selected `eye_colour`.
+- `task_80` run `20260513T162857Z`: exact, selected only `number`.
+- `task_89` run `20260513T162804Z`: column shape fixed to `time`, but Databao selected the wrong
+  source row; this is a semantic filtering issue and was not forced by the guard.
+
+Full easy check:
+
+- `20260513T163105Z`: prediction `15/15`, exact `11/15`, avg `0.733`.
+- Remaining easy misses should be treated as Databao semantic/source-row errors or run variance, not
+  as safe final-guard targets.
+
 ## Diagnostics
 
 Each task log records:

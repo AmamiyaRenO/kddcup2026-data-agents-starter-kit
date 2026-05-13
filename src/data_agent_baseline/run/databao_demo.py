@@ -77,6 +77,19 @@ DISPLAY_COLUMN_PRIORITY = (
     "description",
 )
 
+ENTITY_DISPLAY_COLUMN_PRIORITY = (
+    "name",
+    "title",
+    "label",
+    "display_name",
+    "url",
+    "link",
+    "website",
+    "text",
+    "value",
+    "description",
+)
+
 DEBUG_METADATA_COLUMNS = {
     "source_doc",
     "evidence_span",
@@ -1589,7 +1602,7 @@ def _display_series(table: ContextTable) -> tuple[str, pd.Series] | None:
         ).str.strip()
         return "full_name", series
 
-    for preferred in DISPLAY_COLUMN_PRIORITY:
+    for preferred in ENTITY_DISPLAY_COLUMN_PRIORITY:
         if preferred in frame.columns:
             return str(preferred), frame[preferred]
         lowered = preferred.lower()
@@ -1601,6 +1614,14 @@ def _display_series(table: ContextTable) -> tuple[str, pd.Series] | None:
         lowered = str(column).lower()
         if lowered.endswith("_name") or lowered.endswith(" name"):
             return str(column), frame[column]
+
+    for preferred in DISPLAY_COLUMN_PRIORITY:
+        if preferred in frame.columns:
+            return str(preferred), frame[preferred]
+        lowered = preferred.lower()
+        if lowered in lowered_to_original:
+            original = lowered_to_original[lowered]
+            return str(original), frame[original]
 
     display_like_columns = [
         str(column)
@@ -2351,6 +2372,56 @@ def _find_existing_columns(frame: pd.DataFrame, candidates: tuple[str, ...]) -> 
     return matches
 
 
+def _answer_focus_fragments(question: str) -> tuple[str, ...]:
+    lowered = re.sub(r"\s+", " ", question.strip().lower())
+    fragments: list[str] = []
+
+    def add(value: str) -> None:
+        value = re.sub(r"^(?:the|a|an|their|his|her|its)\s+", "", value.strip(" .,:;!?"))
+        if value and value not in fragments:
+            fragments.append(value)
+
+    leading_patterns = (
+        r"\b(?:provide|give|return|show|list|state|identify|name)\s+(?:the\s+)?(.+?)"
+        r"(?:\s+(?:of|for|whose|who|that|which|where|when|with|from|in)\b|\?|$)",
+        r"\b(?:what(?:'s|\s+is|\s+are|\s+was|\s+were)?)\s+(?:the\s+)?(.+?)"
+        r"(?:\s+(?:of|for|whose|who|that|which|where|when|with|from|in)\b|\?|$)",
+        r"\bwhich\s+(.+?)\s+(?:has|have|is|are|was|were|had)\b",
+    )
+    for pattern in leading_patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            add(match.group(1))
+
+    return tuple(fragments)
+
+
+def _column_matches_answer_focus(column_name: str, aliases: set[str], focus_fragments: tuple[str, ...]) -> bool:
+    if not focus_fragments:
+        return False
+    column_lower = column_name.lower()
+    compact_column = re.sub(r"[^a-z0-9]+", "", column_lower)
+    for fragment in focus_fragments:
+        fragment_tokens = _normalized_question_tokens(fragment)
+        compact_fragment = re.sub(r"[^a-z0-9]+", "", fragment.lower())
+        if not compact_fragment:
+            continue
+        if column_lower == fragment or compact_column == compact_fragment:
+            return True
+        if compact_column.endswith(compact_fragment) and len(compact_fragment) > 3:
+            return True
+        if compact_fragment.endswith(compact_column) and len(compact_column) > 3:
+            return True
+        meaningful_aliases = {alias for alias in aliases if len(alias) > 1}
+        if meaningful_aliases & fragment_tokens and (
+            len(fragment_tokens) <= 2 or len(meaningful_aliases & fragment_tokens) >= 2
+        ):
+            return True
+        if any(alias in compact_fragment for alias in meaningful_aliases if len(alias) > 3):
+            return True
+    return False
+
+
 def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, ...]:
     if len(frame.columns) <= 1:
         return ()
@@ -2358,6 +2429,7 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
     lowered_question = question.lower()
     tokens = _normalized_question_tokens(question)
     compact_question = re.sub(r"[^a-z0-9]+", "", lowered_question)
+    focus_fragments = _answer_focus_fragments(question)
     generic_answer_terms = {
         "id",
         "identifier",
@@ -2397,6 +2469,9 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         column_lower = column_name.lower()
         aliases = _column_question_aliases(column_name)
         score = 0
+        focus_match = _column_matches_answer_focus(column_name, aliases, focus_fragments)
+        if focus_match:
+            score += 120
         if column_lower in lowered_question:
             score += 50
         elif _is_id_like_column(column_name) and not asks_identifier:
@@ -2424,16 +2499,39 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
             or aliases & {"display", "displayname", "userdisplayname", "name", "owner", "editor", "author"}
         ):
             score += 35
-        if (
-            superlative_direction is not None
-            and asks_textual_answer
-            and aliases & metric_sort_terms
-            and not (aliases & {"comment", "text", "body", "content"})
+        if superlative_direction is not None and not _question_requests_metric_value(question):
+            if aliases & metric_sort_terms and not focus_match:
+                score -= 80
+            if _is_display_like_column(column_name) or aliases & {"name", "title", "label"}:
+                score += 30
+        if superlative_direction is not None and asks_textual_answer and aliases & metric_sort_terms and not (
+            aliases & {"comment", "text", "body", "content"}
         ):
             score -= 60
         if score > 0:
             scored.append((score * 1000 - index, column_name))
     scored.sort(reverse=True)
+    if asks_textual_answer:
+        text_columns = [
+            column
+            for _, column in scored
+            if (
+                _column_question_aliases(column) & {"text", "body", "content", "description"}
+                or column.lower() in {"comment", "text", "body", "content"}
+                or (
+                    "comment" in _column_question_aliases(column)
+                    and "count" not in _column_question_aliases(column)
+                    and column.lower() not in {"commentcount", "comment_count"}
+                )
+            )
+        ]
+        if text_columns:
+            return (text_columns[0],)
+    strongly_scored = [(score_key, column) for score_key, column in scored if score_key >= 100_000]
+    if strongly_scored:
+        if len(strongly_scored) == 1 or strongly_scored[0][0] - strongly_scored[1][0] >= 30_000:
+            return (strongly_scored[0][1],)
+        return tuple(dict.fromkeys(column for _, column in strongly_scored[:3]))
     ordered = tuple(dict.fromkeys(column for _, column in scored[:3]))
     if asks_identifier and not asks_name_answer:
         id_columns = [column for _, column in scored if _is_id_like_column(column)]
@@ -2451,22 +2549,6 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         ]
         if count_columns:
             return (count_columns[0],)
-    if asks_textual_answer:
-        text_columns = [
-            column
-            for _, column in scored
-            if (
-                _column_question_aliases(column) & {"text", "body", "content", "description"}
-                or column.lower() in {"comment", "text", "body", "content"}
-                or (
-                    "comment" in _column_question_aliases(column)
-                    and "count" not in _column_question_aliases(column)
-                    and column.lower() not in {"commentcount", "comment_count"}
-                )
-            )
-        ]
-        if text_columns:
-            return (text_columns[0],)
     return ordered
 
 
@@ -4157,6 +4239,8 @@ def _column_question_aliases(column_name: str) -> set[str]:
         aliases.add("date")
     if "time" in parts or lowered.endswith("time"):
         aliases.add("time")
+    if "colour" in parts or "color" in parts or lowered.endswith("colour") or lowered.endswith("color"):
+        aliases.update({"colour", "color"})
     if "name" in parts or lowered.endswith("name"):
         aliases.add("name")
     if "url" in parts or "link" in parts or "website" in parts:
@@ -5507,6 +5591,22 @@ def rank_candidates(
         ):
             score -= 50
             reasons.append("high_risk_verifier_discount")
+        context_superlative_transforms = [
+            transform
+            for transform in candidate.transformations
+            if str(transform.get("kind", "")) == "context_superlative_verification"
+        ]
+        if context_superlative_transforms and features.asks_superlative and not _question_requests_metric_value(question):
+            best_metric_score = max(
+                int(transform.get("metric_score") or 0)
+                for transform in context_superlative_transforms
+            )
+            if report.valid and best_metric_score >= 100 and len(candidate.frame.columns) == 1:
+                score += 110
+                reasons.append("context_superlative_metric_evidence")
+                if len(candidate.frame) > 1:
+                    score += 15
+                    reasons.append("context_superlative_tie_rows")
         if any(str(transform.get("kind", "")) == "ratio_scale_compaction" for transform in candidate.transformations):
             if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
                 score += 35

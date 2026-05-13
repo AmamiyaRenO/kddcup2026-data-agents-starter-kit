@@ -1240,8 +1240,8 @@ class DatabaoDemoTests(unittest.TestCase):
                     {
                         "table": "event",
                         "records": [
-                            {"event_id": "recA", "event_name": "Alpha"},
-                            {"event_id": "recB", "event_name": "Beta"},
+                            {"event_id": "recA", "event_name": "Alpha", "status": "Open"},
+                            {"event_id": "recB", "event_name": "Beta", "status": "Closed"},
                         ],
                     }
                 ),
@@ -1432,6 +1432,34 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             self.assertEqual(count_frame.to_dict(orient="list"), {"attendance_count": [17]})
 
+            write_task(input_root, task_id="task_attribute", question="Provide the eye colour of the selected record.")
+            attribute_task = DABenchPublicDataset(input_root).get_task("task_attribute")
+            attribute_frame, _ = apply_answer_column_verifier(
+                attribute_task,
+                pd.DataFrame({"name": ["A"], "full_name": ["A B"], "eye_colour": ["Brown"]}),
+            )
+            self.assertEqual(attribute_frame.to_dict(orient="list"), {"eye_colour": ["Brown"]})
+
+            write_task(
+                input_root,
+                task_id="task_finish_time",
+                question="What's the finish time for the selected row?",
+            )
+            time_task = DABenchPublicDataset(input_root).get_task("task_finish_time")
+            time_frame, _ = apply_answer_column_verifier(
+                time_task,
+                pd.DataFrame({"time": ["+16.445"], "fastestLapTime": ["1:35.123"]}),
+            )
+            self.assertEqual(time_frame.to_dict(orient="list"), {"time": ["+16.445"]})
+
+            write_task(input_root, task_id="task_number", question="What is his number of the selected driver?")
+            number_task = DABenchPublicDataset(input_root).get_task("task_number")
+            number_frame, _ = apply_answer_column_verifier(
+                number_task,
+                pd.DataFrame({"number": [3], "q3": ["1:54.455"]}),
+            )
+            self.assertEqual(number_frame.to_dict(orient="list"), {"number": [3]})
+
     def test_identifier_resolution_prefers_camel_case_display_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1569,6 +1597,51 @@ class DatabaoDemoTests(unittest.TestCase):
         selected_score = next(score for score in report.candidate_scores if score.source == "databao_raw_postprocessed")
         self.assertIn("text_answer_has_extra_columns", raw_score.reasons)
         self.assertIn("text_answer_columns_only", selected_score.reasons)
+
+    def test_ranker_accepts_context_superlative_tie_candidate_with_metric_evidence(self) -> None:
+        contract = AnswerContract(
+            kind="multi_attribute",
+            expected_columns=("event_name", "cost"),
+            max_rows=None,
+            max_columns=2,
+            allow_empty=False,
+            reason="test",
+        )
+        raw = Candidate(
+            frame=pd.DataFrame({"event_name": ["October Speaker"], "cost": [6.0]}),
+            source="databao_raw",
+            confidence=0.55,
+            diagnostics={},
+        )
+        verifier = Candidate(
+            frame=pd.DataFrame({"event_name": ["November Speaker", "October Speaker", "September Speaker"]}),
+            source="databao_raw_postprocessed_verifier",
+            confidence=0.42,
+            diagnostics={},
+            transformations=(
+                {
+                    "kind": "context_superlative_verification",
+                    "direction": "min",
+                    "metric_column": "cost",
+                    "metric_score": 180,
+                    "output_rows": 3,
+                },
+            ),
+        )
+
+        selected, report = rank_candidates(
+            candidates=[raw, verifier],
+            contract=contract,
+            question="Which event has the lowest cost?",
+            retrieved_context=None,
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.source, "databao_raw_postprocessed_verifier")
+        selected_score = next(
+            score for score in report.candidate_scores if score.source == "databao_raw_postprocessed_verifier"
+        )
+        self.assertIn("context_superlative_metric_evidence", selected_score.reasons)
 
     def test_root_level_csv_is_loaded_and_registered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
