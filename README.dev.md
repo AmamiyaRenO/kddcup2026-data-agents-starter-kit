@@ -326,6 +326,44 @@ Full easy check:
 - Remaining easy misses should be treated as Databao semantic/source-row errors or run variance, not
   as safe final-guard targets.
 
+## 2026-05-14 Medium Adapter Repair
+
+The next adapter-only pass focused on cases where Databao already produced a filtered/detail table
+or a nearly final identifier answer. It did not modify Databao internals, restore planner/finalizer,
+or add task/domain/file-stem rules.
+
+Changes:
+
+- Databao generated code is parsed into a lightweight `sql_observation` diagnostic with operation
+  flags for select, filter, join, group-by, aggregate, ratio, order-by, and limit.
+- A narrow `databao_observed_detail_aggregate_compaction` verifier can turn Databao's own filtered
+  detail table into a count or average candidate. It only fires when the SQL/code evidence shows
+  filter/group/join work has already happened, and it is ranked like any other candidate.
+- Count compaction now prefers distinct ID/display values when available, avoiding duplicate detail
+  rows in count questions.
+- Explicit identifier answers prefer primary/short identifier columns over helper relation IDs such
+  as accepted/owner/editor/parent variants unless those helper roles are explicitly requested.
+
+Targeted results:
+
+- `task_145` run `20260513T165205Z`: exact. Databao returned filtered meeting detail; the adapter
+  counted the rows.
+- `task_196` run `20260513T165241Z`: exact. Databao returned per-atom bond counts; the adapter
+  averaged the metric.
+- `task_250` run `20260513T165425Z`: exact. The adapter selected `Id` rather than a helper answer id.
+- `task_214` run `20260513T165305Z`: still wrong because Databao's filtered detail table contained
+  the wrong population. This remains a source/filter semantics issue, not a safe adapter repair.
+
+Full sweep after this pass:
+
+- Easy `20260513T165623Z`: prediction `14/15`, exact `11/15`, avg `0.767`; `task_80` timed out with
+  no prediction in this run, while previous targeted `task_80` run `20260513T162857Z` was exact.
+- Medium `20260513T170308Z`: prediction `23/23`, exact `15/23`, avg `0.685`.
+
+This is the current best evidence that the adapter can safely improve medium when it completes an
+operation that Databao has already partially executed. It should not be broadened into arbitrary
+context recomputation.
+
 ## Diagnostics
 
 Each task log records:

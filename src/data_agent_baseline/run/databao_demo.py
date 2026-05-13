@@ -762,6 +762,7 @@ def _databao_frame_execution_payload(frame: pd.DataFrame) -> dict[str, Any]:
     code = _text_value(frame.attrs.get("databao_code"))
     if code:
         payload["databao_code"] = code[:MAX_DATABAO_CODE_CHARS]
+        payload["sql_observation"] = _databao_sql_observation(code)
     for key in ("databao_submit_called", "databao_salvaged_latest_query_result"):
         if key in frame.attrs:
             payload[key] = bool(frame.attrs.get(key))
@@ -769,6 +770,42 @@ def _databao_frame_execution_payload(frame: pd.DataFrame) -> dict[str, Any]:
     if executor_type:
         payload["databao_executor_type"] = _text_value(executor_type)
     return payload
+
+
+def _databao_sql_observation(code: str | None) -> dict[str, Any]:
+    text = _text_value(code or "")
+    lowered = text.lower()
+    compact = re.sub(r"\s+", " ", lowered).strip()
+    code_kind = "unknown"
+    if re.search(r"\bselect\b.+\bfrom\b", compact, flags=re.DOTALL) or compact.startswith("with "):
+        code_kind = "sql"
+    elif re.search(r"\bpd\.|\.groupby\(|\.merge\(|\.query\(", lowered):
+        code_kind = "dataframe_python"
+    elif "select" in lowered and any(token in lowered for token in ("pd.", ".groupby", ".merge")):
+        code_kind = "mixed"
+
+    operations = {
+        "select": bool(re.search(r"\bselect\b", compact)),
+        "filter": bool(re.search(r"\bwhere\b|\bhaving\b", compact)),
+        "join": bool(re.search(r"\bjoin\b", compact)),
+        "groupby": bool(re.search(r"\bgroup\s+by\b|\.groupby\(", compact)),
+        "aggregate": bool(re.search(r"\b(?:count|sum|avg|average|min|max)\s*\(", compact)),
+        "ratio": "/" in compact and bool(re.search(r"\b(?:count|sum|avg|average)\s*\(", compact)),
+        "order_by": bool(re.search(r"\border\s+by\b|\.sort_values\(", compact)),
+        "limit": bool(re.search(r"\blimit\s+\d+\b|\.head\(", compact)),
+    }
+    risk_flags: list[str] = []
+    if operations["limit"] and not operations["order_by"]:
+        risk_flags.append("limit_without_order_by")
+    if operations["aggregate"] and not operations["groupby"] and operations["filter"]:
+        risk_flags.append("scalar_aggregate_after_filter")
+    if operations["groupby"] and not operations["aggregate"]:
+        risk_flags.append("groupby_without_detected_aggregate")
+    return {
+        "code_kind": code_kind,
+        "operations": operations,
+        "risk_flags": risk_flags,
+    }
 
 
 class TaskDiagnostics:
@@ -1568,6 +1605,22 @@ def _is_id_like_column(column: str) -> bool:
         or bool(re.search(r"[A-Za-z0-9]Id$", original))
         or lowered in {"identifier", "code", "reference"}
     )
+
+
+def _identifier_answer_column_priority(column: str, question: str) -> tuple[int, int]:
+    lowered = column.lower()
+    aliases = _column_question_aliases(column)
+    tokens = _normalized_question_tokens(question)
+    score = 0
+    if lowered in {"id", "record_id", "identifier", "code", "reference"}:
+        score += 100
+    if lowered.endswith("_id") or lowered.endswith("id"):
+        score += 20
+    score += 10 * len((aliases - {"id", "identifier", "code", "reference"}) & tokens)
+    helper_terms = {"accepted", "owner", "editor", "parent", "child", "author", "user", "answer", "comment"}
+    unmatched_helpers = (aliases & helper_terms) - tokens
+    score -= 25 * len(unmatched_helpers)
+    return score, -len(lowered)
 
 
 def _question_asks_for_identifier(question: str) -> bool:
@@ -2536,7 +2589,7 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
     if asks_identifier and not asks_name_answer:
         id_columns = [column for _, column in scored if _is_id_like_column(column)]
         if id_columns:
-            return (id_columns[0],)
+            return (max(id_columns, key=lambda column: _identifier_answer_column_priority(column, question)),)
     if asks_count_answer:
         count_columns = [
             column
@@ -3094,6 +3147,8 @@ def apply_salvaged_detail_count_compactor(
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     if frame.empty or len(frame.columns) == 0:
         return frame, []
+    if _question_asks_for_identifier(task.question):
+        return frame, []
     if frame.attrs.get("databao_submit_called") is not False and not frame.attrs.get(
         "databao_salvaged_latest_query_result"
     ):
@@ -3110,10 +3165,12 @@ def apply_salvaged_detail_count_compactor(
     if count_like_columns and len(frame.columns) <= 2:
         return frame, []
     id_columns = [str(column) for column in frame.columns if _is_id_like_column(str(column))]
-    if id_columns:
-        count_value = int(frame[id_columns[0]].dropna().nunique())
-        count_basis = "distinct_id"
-        count_column = id_columns[0]
+    display_columns = _display_candidate_columns(frame)
+    distinct_columns = id_columns + display_columns
+    if distinct_columns:
+        count_column = distinct_columns[0]
+        count_value = int(frame[count_column].dropna().nunique())
+        count_basis = "distinct_column"
     else:
         count_value = int(len(frame))
         count_basis = "row_count"
@@ -3129,6 +3186,83 @@ def apply_salvaged_detail_count_compactor(
         "input_columns": [str(column) for column in frame.columns],
     }
     return output, [transform]
+
+
+def apply_databao_observed_detail_aggregate_compactor(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    if frame.empty or len(frame.columns) == 0 or _question_asks_for_identifier(task.question):
+        return frame, []
+    observation = _databao_sql_observation(_text_value(frame.attrs.get("databao_code")))
+    operations = observation.get("operations") if isinstance(observation, dict) else {}
+    if observation.get("code_kind") != "sql" or not isinstance(operations, dict):
+        return frame, []
+
+    features = extract_question_features(task.question)
+    has_filter_or_group_evidence = bool(
+        operations.get("filter") or operations.get("groupby") or operations.get("join")
+    )
+    if not has_filter_or_group_evidence:
+        return frame, []
+
+    if _question_asks_count_metric(task.question) and not features.asks_ratio_or_percentage:
+        existing_count_like = [
+            str(column)
+            for column in frame.columns
+            if any(term in str(column).lower() for term in ("count", "total", "number", "answer"))
+        ]
+        if len(frame) == 1 and len(frame.columns) <= 2 and existing_count_like:
+            return frame, []
+        id_columns = [str(column) for column in frame.columns if _is_id_like_column(str(column))]
+        display_columns = _display_candidate_columns(frame)
+        distinct_columns = id_columns + display_columns
+        count_column = distinct_columns[0] if distinct_columns else None
+        count_value = int(frame[count_column].dropna().nunique()) if count_column else int(len(frame))
+        count_basis = "distinct_column" if count_column else "row_count"
+        output = pd.DataFrame({"count": [count_value]})
+        output.attrs.update(frame.attrs)
+        transform = {
+            "kind": "databao_observed_detail_aggregate_compaction",
+            "operation": "count",
+            "count_basis": count_basis,
+            "count_column": count_column,
+            "input_rows": int(len(frame)),
+            "input_columns": [str(column) for column in frame.columns],
+            "sql_observation": observation,
+            "evidence": "databao_sql_filter_or_group_detail_table",
+        }
+        return output, [transform]
+
+    if any(term in features.strong_terms for term in ("average", "avg", "mean")):
+        numeric_columns = _non_identifier_numeric_columns(frame)
+        if not numeric_columns:
+            return frame, []
+        metric_column = _question_matched_numeric_column(
+            numeric_columns,
+            task.question,
+            require_match=False,
+        )
+        if metric_column is None:
+            return frame, []
+        values = pd.to_numeric(frame[metric_column], errors="coerce").dropna()
+        if values.empty:
+            return frame, []
+        value = float(values.mean())
+        output = pd.DataFrame({f"avg_{metric_column}": [value]})
+        output.attrs.update(frame.attrs)
+        transform = {
+            "kind": "databao_observed_detail_aggregate_compaction",
+            "operation": "average",
+            "metric_column": metric_column,
+            "input_rows": int(len(frame)),
+            "input_columns": [str(column) for column in frame.columns],
+            "sql_observation": observation,
+            "evidence": "databao_sql_filtered_detail_metric_table",
+        }
+        return output, [transform]
+
+    return frame, []
 
 
 GENERIC_FILTER_TOKEN_STOPWORDS = {
@@ -3657,6 +3791,13 @@ def generate_verifier_candidate_frames(
     detail_count_frame, detail_count_transforms = apply_salvaged_detail_count_compactor(task, frame)
     if detail_count_transforms and not detail_count_frame.equals(frame):
         candidates.append((detail_count_frame, detail_count_transforms, 0.7))
+
+    observed_aggregate_frame, observed_aggregate_transforms = apply_databao_observed_detail_aggregate_compactor(
+        task,
+        frame,
+    )
+    if observed_aggregate_transforms and not observed_aggregate_frame.equals(frame):
+        candidates.append((observed_aggregate_frame, observed_aggregate_transforms, 0.68))
 
     quoted_ratio_frame, quoted_ratio_transforms = apply_quoted_entity_ratio_repair(task, frame)
     if quoted_ratio_transforms and not quoted_ratio_frame.equals(frame):
@@ -5614,6 +5755,16 @@ def rank_candidates(
             else:
                 score -= 35
                 reasons.append("ratio_scale_sanity_failed")
+        if any(
+            str(transform.get("kind", "")) == "databao_observed_detail_aggregate_compaction"
+            for transform in candidate.transformations
+        ):
+            if report.valid and len(candidate.frame) == 1 and len(candidate.frame.columns) == 1:
+                score += 70
+                reasons.append("databao_observed_detail_aggregate_evidence")
+            else:
+                score -= 35
+                reasons.append("databao_observed_detail_aggregate_shape_mismatch")
         if any(
             str(transform.get("kind", "")) == "salvaged_boolean_percentage_compaction"
             for transform in candidate.transformations

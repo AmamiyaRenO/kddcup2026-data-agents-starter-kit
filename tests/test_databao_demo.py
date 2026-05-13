@@ -30,6 +30,7 @@ from data_agent_baseline.run.databao_demo import (
     _metric_like_columns,
     _run_databao_task_with_timeout,
     _timeout_task_artifact,
+    apply_databao_observed_detail_aggregate_compactor,
     apply_answer_column_verifier,
     apply_aggregate_ratio_verifier,
     apply_column_only_compactor,
@@ -1345,6 +1346,65 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertAlmostEqual(frame.iloc[0, 0], 52.17391304347826)
             self.assertEqual(transforms[0]["mode"], "percentage")
 
+    def test_databao_observed_detail_aggregate_counts_filtered_detail_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="How many rows match the selected condition?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame({"record_id": [1, 2, 3], "status": ["A", "A", "A"]})
+            frame.attrs["databao_code"] = "SELECT record_id, status FROM items WHERE status = 'A'"
+
+            output, transforms = apply_databao_observed_detail_aggregate_compactor(task, frame)
+
+            self.assertEqual(output.to_dict(orient="list"), {"count": [3]})
+            self.assertEqual(transforms[0]["operation"], "count")
+
+    def test_databao_observed_detail_aggregate_counts_distinct_display_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="How many entries match the selected condition?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame({"name": ["A", "A", "B", "B", "C"]})
+            frame.attrs["databao_code"] = "SELECT name FROM items WHERE status = 'A'"
+
+            output, transforms = apply_databao_observed_detail_aggregate_compactor(task, frame)
+
+            self.assertEqual(output.to_dict(orient="list"), {"count": [3]})
+            self.assertEqual(transforms[0]["count_basis"], "distinct_column")
+
+    def test_databao_observed_detail_aggregate_averages_filtered_metric(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="What is the average number of bonds for the selected atoms?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame({"atom_id": ["a", "b", "c"], "unique_bonds": [1, 2, 3]})
+            frame.attrs["databao_code"] = (
+                "SELECT atom_id, COUNT(DISTINCT bond_id) AS unique_bonds "
+                "FROM connected WHERE element = 'x' GROUP BY atom_id"
+            )
+
+            output, transforms = apply_databao_observed_detail_aggregate_compactor(task, frame)
+
+            self.assertEqual(output.to_dict(orient="list"), {"avg_unique_bonds": [2.0]})
+            self.assertEqual(transforms[0]["operation"], "average")
+
+    def test_databao_observed_detail_aggregate_does_not_override_identifier_questions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which post has the most answers count? State the post ID.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame({"Id": [351], "AnswerCount": [12]})
+            frame.attrs["databao_code"] = "SELECT Id, AnswerCount FROM posts ORDER BY AnswerCount DESC LIMIT 1"
+
+            output, transforms = apply_databao_observed_detail_aggregate_compactor(task, frame)
+
+            self.assertTrue(output.equals(frame))
+            self.assertEqual(transforms, [])
+
     def test_answer_column_verifier_keeps_generic_requested_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1403,6 +1463,14 @@ class DatabaoDemoTests(unittest.TestCase):
             post_id_frame, _ = apply_answer_column_verifier(
                 post_id_task,
                 pd.DataFrame({"Id": [351], "OwnerUserId": [16], "AnswerCount": [12], "Title": [""]}),
+            )
+            self.assertEqual(post_id_frame.to_dict(orient="list"), {"Id": [351]})
+
+            write_task(input_root, task_id="task_post_id", question="State the post ID.")
+            post_id_task = DABenchPublicDataset(input_root).get_task("task_post_id")
+            post_id_frame, _ = apply_answer_column_verifier(
+                post_id_task,
+                pd.DataFrame({"Id": [351], "AcceptedAnswerId": [99], "AnswerCount": [12]}),
             )
             self.assertEqual(post_id_frame.to_dict(orient="list"), {"Id": [351]})
 
