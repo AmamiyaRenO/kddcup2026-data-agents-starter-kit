@@ -451,6 +451,30 @@ Current conclusion: these adapter fixes are worth keeping because they are schem
 generic, improve easy/hard stability, and do not introduce public-task domains. Remaining easy and
 medium failures are mostly Databao source/filter/operation mistakes, not safe final-guard work.
 
+## 2026-05-14 Databao Internal Observation Shadow Mode
+
+The remaining easy/medium failures increasingly require observing Databao's own execution path
+rather than adding final-answer patches. A shadow-only diagnostic layer was added:
+
+- `databao_internal_observation` is written to each task log after Databao returns a frame.
+- It records whether the frame is `databao_final` or `databao_salvaged_intermediate`, submit status,
+  executor type, output shape, SQL/code operation flags, column families, risk flags, and shadow
+  recommendations.
+- It does not generate candidates, change ranking, prune columns, or trigger rescue.
+
+Targeted validation:
+
+- `task_243` run `20260514T032735Z`: prediction remained wrong (`post_count`), but the log now
+  records `ratio_question_without_ratio_operation` and recommends checking numerator/denominator
+  evidence. This is the desired behavior for Phase 1 observation: expose why Databao's submitted
+  result is incomplete without changing the answer.
+
+Next use:
+
+- Run easy/medium misses and collect `databao_internal_observation.risk_flags`.
+- Promote a repair only when the Databao trace proves enough operation evidence, for example a
+  filtered detail table for count/aggregate or complete numerator/denominator for ratio.
+
 ## Diagnostics
 
 Each task log records:
@@ -459,6 +483,7 @@ Each task log records:
 - retrieved context summary
 - task complexity profile
 - context payload profile and Databao failure type
+- Databao internal observation shadow diagnostics
 - candidate list and candidate scores
 - selected candidate source
 - `prediction_written`, `scorable`, and missing-prediction status
@@ -508,3 +533,170 @@ log. Aggregate coverage is kept as debugging context rather than the only score 
 - `src/` banned public-domain memory term scan: no violations.
 
 Keep this file high-level. Put function-by-function details in `README.function-ledger.md`.
+
+## Databao Internal Patch Note
+
+On 2026-05-14 we started moving the next improvement layer into the local Databao clone rather than
+adding more adapter-side candidate heuristics. The first patch is a graph-state salvage fix:
+
+- Clone path: `D:\Data\_external\databao-agent`.
+- Patched files:
+  - `databao/agent/executors/lighthouse/graph.py`
+  - `databao/agent/executors/separate/graph.py`
+- Behavior: Databao tracks the latest non-empty SQL result. If the model later runs an empty query
+  or stops without `submit_result`, Databao can return the previous non-empty result with metadata
+  `salvaged_previous_non_empty_result=True`.
+- This is intentionally an internal Databao execution-state fix, not an adapter rewrite and not a
+  public-task heuristic.
+
+Editable install note: `uv pip install -e D:\Data\_external\databao-agent` currently fails because
+the Databao build hook requires `pnpm` for frontend assets. For local validation, the two patched
+Python files were copied into `.venv\Lib\site-packages\databao\agent\executors\...`. If this patch
+becomes part of the project path, either install `pnpm` and use editable mode or add a clean local
+dependency workflow.
+
+Validation:
+
+- Targeted runs:
+  - `task_352` run `20260514T044746Z`: exact, `salvaged_previous_non_empty_result=True`.
+  - `task_420` run `20260514T044921Z`: exact, `salvaged_previous_non_empty_result=True`.
+- Hard sweep:
+  - `20260514T045138Z`: prediction `9/11`, exact `4/11`, average `0.382`.
+  - This improves on the referenced hard baseline `8/11`, exact `3/11`, average `0.273`.
+
+Open follow-up:
+
+- Run easy/medium regression with the patched Databao package before declaring it safe for the
+  mainline.
+- Investigate `task_355` timeout inside Databao; `task_415` in the latest hard sweep failed due to
+  OpenRouter key limit, not code behavior.
+
+## Databao Submit Critique Research
+
+The local Databao clone now also has an internal submit-critique hook:
+
+- Env: `DATABAO_INTERNAL_SUBMIT_CRITIQUE_MODE=off|shadow|reject`.
+- Default: `shadow`.
+- Scope: Databao graph only, not the starter-kit adapter.
+- It records generic submit risks such as empty result, ratio/percentage without ratio evidence,
+  detail rows for aggregate questions, count questions without count-like output, unordered `LIMIT`,
+  and wide non-list submissions.
+
+Targeted research:
+
+- `task_408` shadow run `20260514T055942Z`: correctly flagged a percentage question submitted as
+  detail rows without ratio evidence.
+- `task_408` reject run `20260514T060255Z`: Databao revised into a scalar percentage answer, but the
+  value was still wrong because the underlying race/entity grounding was wrong.
+- `task_344` reject run `20260514T060543Z`: Databao revised into a count-like answer, but the count
+  was still wrong because the filter/value grounding was wrong.
+
+Conclusion: submit critique is useful as an internal diagnostic and possibly a targeted operation
+shape gate, but it is not enough to fix grounding errors. Keep global behavior at `shadow`; do not
+enable `reject` by default without easy/medium/hard ablation.
+
+Grounding follow-up:
+
+- The local Databao clone now also records shadow-only grounding flags for SQL equality filters that
+  use numeric IDs/codes not directly present in the user question.
+- Targeted runs:
+  - `task_11` run `20260514T062057Z`: flagged `Thrombosis = 3` as
+    `numeric_code_filter_needs_value_grounding`.
+  - `task_89` run `20260514T062112Z`: flagged `raceId = 34` as
+    `numeric_identifier_filter_needs_grounding`.
+  - `task_408` run `20260514T062254Z`: still hit `GraphRecursionError` before submit, so submit-only
+    critique did not run.
+- Decision: grounding flags remain diagnostics only. They explain wrong ID/code filters, but they
+  should not become reject conditions until Databao has a grounded lookup/validation loop and
+  targeted ablations show no easy/medium regression.
+- A small grounding-reject targeted ablation did not produce reliable gains, so the reject path stays
+  off. The signal was tightened instead: generic ordinal/ranking phrases now count as numeric
+  evidence, which avoids false positives for filters like `position = 2` when the question says
+  "second".
+
+No-submit diagnostics follow-up:
+
+- Databao now appends a no-submit critique when it returns or salvages an intermediate SQL result
+  without a `submit_result` call.
+- Targeted runs:
+  - `task_352` run `20260514T063034Z`: exact, `databao_salvaged_intermediate`, critique included
+    `no_submit_result`.
+  - `task_420` run `20260514T063146Z`: exact, `databao_salvaged_intermediate`, critique included
+    `no_submit_result` and `ratio_question_without_ratio_evidence`.
+- Decision: keep this as diagnostics. It makes no-submit salvage explainable without turning the
+  adapter into a new rescue system.
+
+Graph-recursion salvage follow-up:
+
+- The Lighthouse salvage executor now returns the last streamed graph state when GraphRecursionError
+  happens after Databao has produced either `df` or `last_non_empty_df`.
+- `task_408` run `20260514T063751Z`: prediction was written instead of missing. The score was still
+  `0.000`; submit critique flagged ungrounded `raceId = 28` and incomplete ratio evidence. This
+  confirms the fix is stability/observability only. Correctness needs a later grounded ID/code
+  validation loop inside Databao.
+
+Task 355 investigation:
+
+- `task_355` now has enough checkpoints to localize its missing-prediction failure.
+- Single-task reruns `20260514T093917Z`, `20260514T094344Z`, and `20260514T095049Z` all timed out
+  before prediction.
+- The latest progress reaches Databao source initialization, system prompt rendering, execution core
+  start, graph stream start, and the initial graph state. It then stalls before any Databao chat
+  callback is recorded.
+- Lowering `DATABAO_DATABAO_TIMEOUT_SECONDS` to `30` did not force an earlier exception, so the
+  configured LLM timeout is not a reliable guard for this hang.
+- A Databao retry-attempt experiment did not help and was reverted.
+- Likely next fix: a real ask-stage watchdog/process boundary plus, separately, a generic
+  structured-table anchored lookup path for cases where no Databao frame is produced.
+
+Ask-stage watchdog experiment:
+
+- `DATABAO_ASK_STAGE_TIMEOUT_SECONDS=75` was tested on `task_355` in run `20260514T095903Z`.
+- Result: prediction was written in `27.5s`, so the process boundary can avoid the parent task
+  hanging in `thread.ask`.
+- Score remained `0.000`; Databao returned broad expense rows matching any item word instead of the
+  single full-phrase row plus linked member name.
+- Keep this watchdog default-off until it receives the same retrieval/context settings as the parent
+  process and passes easy/medium/hard ablation. It is a stability tool, not a semantic fix.
+
+Anchored lookup critique experiment:
+
+- The local Databao clone now records generic anchored-lookup submit critique flags:
+  `disjunctive_text_filter_needs_anchored_match` and `linked_identifier_needs_display_lookup`.
+- `DATABAO_INTERNAL_ANCHORED_LOOKUP_REJECT=1` can reject one such submit and ask Databao to anchor on
+  rows matching all requested text terms and resolve `link_to_*` values to display/name fields.
+- Targeted `task_355` runs were mixed:
+  - `20260514T100545Z`: score `0.250`; correct expense/cost row, but still missing the member name.
+  - `20260514T101239Z`: score `0.000`; two rejections pushed Databao to a bad document-record row,
+    so that extra rejection behavior was reverted.
+  - `20260514T101511Z`: score `0.000`; adding concrete link-value hints made the diagnostic clearer
+    but did not reliably fix the answer.
+- Decision: keep anchored lookup as Databao-internal diagnostics only. Do not enable anchored reject
+  globally. The next real scoring path should be a grounded lookup executor or a better generic
+  document-record extractor, not more critique wording.
+
+High-yield generic cleanup follow-up:
+
+- Instead of continuing to tune `task_355`, the next patch targeted a broader score leak:
+  answer tables that already contain the correct value but also include all-blank columns or duplicate
+  same-family columns.
+- Generic document extraction was improved so paragraphs with forms such as
+  `record/id ... is/identified as/corresponds to ...` can populate the display `name` for a
+  `record_id`. This is domain-agnostic and helps `link_to_*` / document lookup workflows.
+- `final_answer_shape_guard()` now removes:
+  - columns whose values are all blank when at least one nonblank answer column remains;
+  - duplicate same-family columns such as `name` / `name_2` when their normalized values are
+    identical.
+- Targeted validation:
+  - `task_349` run `20260514T102859Z`: exact, score `1.000`; previous targeted run had the correct
+    value plus four extra blank/duplicate columns and scored `0.200`.
+  - `task_200` run `20260514T103200Z`: exact, score `1.000`.
+  - `task_257` run `20260514T103243Z`: still partial (`0.500`) because Databao returned only the
+    display name and not the requested metric; this is a Databao source/output selection issue, not
+    a guard issue.
+- Full sweeps after the patch:
+  - Easy `20260514T103419Z`: prediction `15/15`, exact `12/15`, avg `0.800`.
+  - Medium `20260514T103857Z`: prediction `23/23`, exact `17/23`, avg `0.739`.
+  - Hard `20260514T105041Z`: prediction `11/11`, exact `6/11`, avg `0.545`.
+- Decision: keep this patch. It is the best recent score/complexity tradeoff: broad enough to help
+  multiple tasks, but conservative enough to avoid source-row semantic rewrites.

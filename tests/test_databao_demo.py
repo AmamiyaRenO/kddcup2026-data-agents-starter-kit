@@ -25,6 +25,8 @@ from data_agent_baseline.run.databao_demo import (
     StructuredPlanError,
     TaskDiagnostics,
     _candidate_table_payload,
+    _databao_state_has_salvageable_frame,
+    _databao_submit_critique,
     _databao_timeout_seconds,
     _build_question_prompt,
     _metric_like_columns,
@@ -227,6 +229,71 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertNotIn("id", columns)
         self.assertNotIn("late_numeric_text", columns)
 
+    def test_databao_submit_critique_records_shadow_risks_without_changing_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_root = Path(tmp)
+            write_task(input_root, question="What percentage of rows are selected?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame({"selected_count": [3]})
+            frame.attrs["databao_code"] = "SELECT COUNT(*) AS selected_count FROM rows WHERE selected = 1"
+            frame.attrs["databao_submit_called"] = False
+            frame.attrs["databao_salvaged_latest_query_result"] = True
+            frame.attrs["databao_submit_critiques"] = [
+                {
+                    "query_id": "latest",
+                    "flags": ["no_submit_result", "numeric_code_filter_needs_value_grounding"],
+                    "grounding_evidence": [
+                        {
+                            "column": "selected",
+                            "value": "1",
+                            "raw_value": "1",
+                            "value_kind": "numeric",
+                        }
+                    ],
+                    "anchored_lookup_evidence": [
+                        {
+                            "kind": "link_resolution",
+                            "columns": ["cost", "link_to_member"],
+                            "link_samples": {"link_to_member": ["recA"]},
+                        }
+                    ],
+                    "no_submit": True,
+                    "no_submit_reason": "latest_tool_call_was_run_sql_query",
+                }
+            ]
+            contract = AnswerContract(
+                kind="percentage",
+                expected_columns=("percentage",),
+                max_rows=1,
+                max_columns=1,
+                allow_empty=False,
+                reason="test",
+            )
+
+            observation = _databao_submit_critique(task=task, frame=frame, answer_contract=contract)
+
+        self.assertTrue(observation["shadow_only"])
+        self.assertEqual(observation["source_kind"], "databao_salvaged_intermediate")
+        self.assertIn("ratio_question_without_ratio_operation", observation["risk_flags"])
+        self.assertIn("no_submit_latest_result", observation["risk_flags"])
+        self.assertIn("submit_critique:no_submit_result", observation["risk_flags"])
+        self.assertIn("submit_critique:numeric_code_filter_needs_value_grounding", observation["risk_flags"])
+        self.assertEqual(
+            observation["submit_critiques"][0]["anchored_lookup_evidence"][0]["link_samples"],
+            {"link_to_member": ["recA"]},
+        )
+        self.assertTrue(observation["submit_critiques"][0]["no_submit"])
+        self.assertEqual(observation["code_observation"]["code_kind"], "sql")
+
+    def test_databao_state_has_salvageable_frame_accepts_previous_non_empty_result(self) -> None:
+        self.assertFalse(_databao_state_has_salvageable_frame({"df": None}))
+        self.assertTrue(_databao_state_has_salvageable_frame({"df": pd.DataFrame({"answer": [1]})}))
+        self.assertTrue(
+            _databao_state_has_salvageable_frame(
+                {"df": None, "last_non_empty_df": pd.DataFrame({"answer": [1]})}
+            )
+        )
+
     def test_json_loader_preserves_envelope_table_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -248,6 +315,24 @@ class DatabaoDemoTests(unittest.TestCase):
             tables = load_context_tables(context_dir)
 
             self.assertEqual([table.name for table in tables], ["Patient"])
+
+    def test_generic_document_loader_extracts_display_name_after_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root)
+            doc_dir = input_root / "task_1" / "context" / "doc"
+            doc_dir.mkdir(parents=True)
+            (doc_dir / "records.md").write_text(
+                "The asset registered under recABC123 is Jordan Rivera. This person manages shared records.",
+                encoding="utf-8",
+            )
+
+            tables = load_context_tables(input_root / "task_1" / "context")
+            document_table = next(table for table in tables if table.name == "document_records")
+            row = document_table.frame[document_table.frame["record_id"].eq("recABC123")].iloc[0]
+
+            self.assertEqual(row["name"], "Jordan Rivera")
 
     def test_structured_plan_executes_task_11_style_join(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1538,6 +1623,30 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             self.assertEqual(count_frame.to_dict(orient="list"), {"attendance_count": [17]})
 
+            write_task(
+                input_root,
+                task_id="task_total_count",
+                question="Calculate the total atoms with the selected property.",
+            )
+            total_count_task = DABenchPublicDataset(input_root).get_task("task_total_count")
+            total_count_frame, _ = apply_answer_column_verifier(
+                total_count_task,
+                pd.DataFrame({"element": ["p"], "atom_count": [1]}),
+            )
+            self.assertEqual(total_count_frame.to_dict(orient="list"), {"atom_count": [1]})
+
+            write_task(
+                input_root,
+                task_id="task_total_value",
+                question="Identify the category and total value for the selected group.",
+            )
+            total_value_task = DABenchPublicDataset(input_root).get_task("task_total_value")
+            total_value_frame, _ = apply_answer_column_verifier(
+                total_value_task,
+                pd.DataFrame({"category": ["A"], "total_value": [10.5]}),
+            )
+            self.assertEqual(total_value_frame.to_dict(orient="list"), {"category": ["A"], "total_value": [10.5]})
+
             write_task(input_root, task_id="task_attribute", question="Provide the eye colour of the selected record.")
             attribute_task = DABenchPublicDataset(input_root).get_task("task_attribute")
             attribute_frame, _ = apply_answer_column_verifier(
@@ -1604,6 +1713,51 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertEqual(frame.to_dict(orient="list"), {"DisplayName": ["mbq"]})
         self.assertTrue(any(transform["kind"] == "identifier_resolution" for transform in report.transformations))
 
+    def test_identifier_resolution_prefers_user_display_table_over_helper_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Identify the total views on the selected post. Name the user who posted it last time.")
+            context_dir = input_root / "task_1" / "context"
+            json_dir = context_dir / "json"
+            json_dir.mkdir()
+            (json_dir / "posts.json").write_text(
+                json.dumps(
+                    [
+                        {"Id": 10, "OwnerUserId": 37, "LastEditorUserId": 88, "Title": "Computer Game Datasets"},
+                        {"Id": 11, "OwnerUserId": 37, "LastEditorUserId": 88, "Title": "Another Post"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (json_dir / "users.json").write_text(
+                json.dumps([{"Id": 37, "DisplayName": "owner"}, {"Id": 88, "DisplayName": "mbq"}]),
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            frame, report = postprocess_answer_table(
+                task,
+                pd.DataFrame(
+                    {
+                        "OwnerUserId": [37],
+                        "OwnerDisplayName": [""],
+                        "LastEditorUserId": [88.0],
+                        "LastEditorDisplayName": [""],
+                        "ViewCount": [1708],
+                    }
+                ),
+            )
+
+        self.assertEqual(frame.to_dict(orient="list"), {"LastEditorDisplayName": ["mbq"], "ViewCount": [1708]})
+        self.assertTrue(
+            any(
+                transform.get("source_column") == "LastEditorUserId"
+                and transform.get("lookup_table") == "json/users.json"
+                for transform in report.transformations
+            )
+        )
+
     def test_identifier_resolution_rejects_conflicting_camel_case_id_hints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1636,6 +1790,38 @@ class DatabaoDemoTests(unittest.TestCase):
                 for transform in report.transformations
             )
         )
+
+    def test_identifier_resolution_does_not_map_unrelated_id_families_to_users(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Return the title and user display for the selected row.")
+            context_dir = input_root / "task_1" / "context"
+            json_dir = context_dir / "json"
+            json_dir.mkdir()
+            (json_dir / "users.json").write_text(
+                json.dumps([{"Id": 1, "DisplayName": "wrong"}, {"Id": 88, "DisplayName": "mbq"}]),
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            frame, report = postprocess_answer_table(
+                task,
+                pd.DataFrame(
+                    {
+                        "Id": [1],
+                        "Title": ["Existing Title"],
+                        "PostHistoryTypeId": [1],
+                        "UserId": [88],
+                    }
+                ),
+            )
+
+        self.assertNotIn("wrong", str(frame.to_dict(orient="list")))
+        self.assertFalse(
+            any(transform.get("source_column") == "PostHistoryTypeId" for transform in report.transformations)
+        )
+        self.assertTrue(any(transform.get("source_column") == "UserId" for transform in report.transformations))
 
     def test_postprocessor_removes_exact_duplicate_answer_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2079,6 +2265,40 @@ class DatabaoDemoTests(unittest.TestCase):
 
             self.assertEqual(guarded.to_dict(orient="list"), {"answer": ["A"]})
             self.assertTrue(report.to_dict()["metadata_columns_removed"])
+
+    def test_final_answer_shape_guard_removes_blank_and_duplicate_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="What is the name?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            contract = AnswerContract(
+                kind="table",
+                expected_columns=(),
+                max_rows=None,
+                max_columns=None,
+                allow_empty=False,
+                reason="test",
+            )
+
+            guarded, report = final_answer_shape_guard(
+                task=task,
+                frame=pd.DataFrame(
+                    {
+                        "name": ["Business"],
+                        "name_2": ["Business"],
+                        "title": [""],
+                        "year": [None],
+                    }
+                ),
+                contract=contract,
+                candidate_source="databao_raw",
+            )
+
+            self.assertEqual(guarded.to_dict(orient="list"), {"name": ["Business"]})
+            self.assertIn("name_2", report.removed_columns)
+            self.assertIn("title", report.removed_columns)
+            self.assertIn("year", report.removed_columns)
 
     def test_final_answer_shape_guard_enforces_scalar_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

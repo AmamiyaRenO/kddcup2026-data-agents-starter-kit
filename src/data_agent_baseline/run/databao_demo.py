@@ -32,6 +32,7 @@ DATABAO_TASK_TIMEOUT_SECONDS_ENV = "DATABAO_TASK_TIMEOUT_SECONDS"
 DATABAO_DATABAO_TIMEOUT_SECONDS_ENV = "DATABAO_DATABAO_TIMEOUT_SECONDS"
 DATABAO_HEURISTIC_LEVEL_ENV = "DATABAO_HEURISTIC_LEVEL"
 DATABAO_EXECUTOR_TYPE_ENV = "DATABAO_EXECUTOR_TYPE"
+DATABAO_ASK_STAGE_TIMEOUT_SECONDS_ENV = "DATABAO_ASK_STAGE_TIMEOUT_SECONDS"
 
 SOURCE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 MAX_DESCRIPTION_CHARS = 20000
@@ -763,9 +764,19 @@ def _databao_frame_execution_payload(frame: pd.DataFrame) -> dict[str, Any]:
     if code:
         payload["databao_code"] = code[:MAX_DATABAO_CODE_CHARS]
         payload["sql_observation"] = _databao_sql_observation(code)
-    for key in ("databao_submit_called", "databao_salvaged_latest_query_result"):
+    for key in (
+        "databao_submit_called",
+        "databao_salvaged_latest_query_result",
+        "databao_salvaged_previous_non_empty_result",
+    ):
         if key in frame.attrs:
             payload[key] = bool(frame.attrs.get(key))
+    if "databao_salvaged_previous_non_empty_query_id" in frame.attrs:
+        payload["databao_salvaged_previous_non_empty_query_id"] = _text_value(
+            frame.attrs.get("databao_salvaged_previous_non_empty_query_id")
+        )
+    if "databao_submit_critiques" in frame.attrs:
+        payload["databao_submit_critiques"] = frame.attrs.get("databao_submit_critiques")
     executor_type = frame.attrs.get("databao_executor_type")
     if executor_type:
         payload["databao_executor_type"] = _text_value(executor_type)
@@ -805,6 +816,107 @@ def _databao_sql_observation(code: str | None) -> dict[str, Any]:
         "code_kind": code_kind,
         "operations": operations,
         "risk_flags": risk_flags,
+    }
+
+
+def _databao_source_kind(frame: pd.DataFrame) -> str:
+    if frame.attrs.get("databao_salvaged_latest_query_result") or frame.attrs.get("databao_submit_called") is False:
+        return "databao_salvaged_intermediate"
+    return "databao_final"
+
+
+def _databao_submit_critique(
+    *,
+    task: PublicTask,
+    frame: pd.DataFrame,
+    answer_contract: AnswerContract | None,
+) -> dict[str, Any]:
+    observation = _databao_sql_observation(_text_value(frame.attrs.get("databao_code")))
+    operations = observation.get("operations") if isinstance(observation, Mapping) else {}
+    if not isinstance(operations, Mapping):
+        operations = {}
+
+    features = extract_question_features(task.question)
+    risk_flags: list[str] = list(observation.get("risk_flags", [])) if isinstance(observation, Mapping) else []
+    recommendations: list[str] = []
+    row_count = int(len(frame))
+    column_count = int(len(frame.columns))
+
+    if frame.empty:
+        risk_flags.append("empty_candidate")
+        recommendations.append("Check whether filters/date parsing removed all rows.")
+    if frame.attrs.get("databao_submit_called") is False:
+        risk_flags.append("no_submit_latest_result")
+        recommendations.append("Treat latest result as intermediate unless answer shape is strongly supported.")
+    if frame.attrs.get("databao_salvaged_latest_query_result"):
+        risk_flags.append("salvaged_latest_query_result")
+        recommendations.append("Verify latest query result is final-answer shaped before selecting it.")
+    if frame.attrs.get("databao_salvaged_previous_non_empty_result"):
+        risk_flags.append("salvaged_previous_non_empty_result")
+        recommendations.append(
+            "Databao returned an earlier non-empty query because the latest result was empty or not submitted."
+        )
+    submit_critiques = frame.attrs.get("databao_submit_critiques")
+    if isinstance(submit_critiques, list):
+        for critique in submit_critiques:
+            if not isinstance(critique, Mapping):
+                continue
+            for flag in critique.get("flags") or []:
+                risk_flags.append(f"submit_critique:{flag}")
+            for suggestion in critique.get("suggestions") or []:
+                recommendations.append(f"Submit critique: {suggestion}")
+    if features.asks_ratio_or_percentage and not operations.get("ratio"):
+        risk_flags.append("ratio_question_without_ratio_operation")
+        recommendations.append("Check numerator and denominator evidence before accepting scalar/count output.")
+    if features.asks_aggregation and not operations.get("aggregate") and row_count > 1:
+        risk_flags.append("aggregate_question_returned_detail_rows")
+        recommendations.append("Check whether Databao stopped before aggregate/group step.")
+    if features.asks_entity_or_list and operations.get("limit") and not features.asks_superlative:
+        risk_flags.append("list_question_with_limit")
+        recommendations.append("Check whether LIMIT removed valid matching rows.")
+    if answer_contract is not None:
+        if answer_contract.kind in {"scalar", "aggregation", "ratio", "percentage"} and (row_count > 1 or column_count > 1):
+            risk_flags.append("scalar_contract_shape_mismatch")
+            recommendations.append("Candidate may still be detail/intermediate output.")
+        if answer_contract.max_columns is not None and column_count > answer_contract.max_columns:
+            risk_flags.append("too_many_columns_for_contract")
+        if answer_contract.max_rows is not None and row_count > answer_contract.max_rows:
+            risk_flags.append("too_many_rows_for_contract")
+
+    id_columns = [str(column) for column in frame.columns if _is_id_like_column(str(column))]
+    display_columns = [str(column) for column in frame.columns if _is_display_like_column(str(column))]
+    metric_columns = _metric_like_columns(frame)
+    if id_columns and not display_columns and not _question_asks_for_identifier(task.question):
+        risk_flags.append("id_only_entity_output")
+        recommendations.append("Resolve IDs to display columns when context evidence is strong.")
+
+    return {
+        "source_kind": _databao_source_kind(frame),
+        "submit_called": frame.attrs.get("databao_submit_called"),
+        "salvaged_latest_query_result": bool(frame.attrs.get("databao_salvaged_latest_query_result")),
+        "salvaged_previous_non_empty_result": bool(
+            frame.attrs.get("databao_salvaged_previous_non_empty_result")
+        ),
+        "salvaged_previous_non_empty_query_id": frame.attrs.get(
+            "databao_salvaged_previous_non_empty_query_id"
+        ),
+        "submit_critiques": submit_critiques if isinstance(submit_critiques, list) else [],
+        "executor_type": _text_value(frame.attrs.get("databao_executor_type")),
+        "shape": {
+            "row_count": row_count,
+            "column_count": column_count,
+            "columns": [str(column) for column in frame.columns[:20]],
+        },
+        "code_observation": observation,
+        "column_families": {
+            "id_columns": id_columns[:20],
+            "display_columns": display_columns[:20],
+            "metric_columns": metric_columns[:20],
+        },
+        "answer_contract_kind": answer_contract.kind if answer_contract is not None else None,
+        "risk_flags": list(dict.fromkeys(risk_flags)),
+        "shadow_recommendations": list(dict.fromkeys(recommendations)),
+        "shadow_only": True,
     }
 
 
@@ -1114,23 +1226,65 @@ def _clean_identifier_display_value(value: str) -> str:
     return value.strip(" .,:;\"'`")
 
 
+_DISPLAY_NAME_TOKEN = r"[A-Z][A-Za-z0-9'’.-]*"
+
+
+def _clean_identifier_display_candidate(value: str) -> str | None:
+    value = _clean_identifier_display_value(value)
+    value = re.sub(
+        r"\b(?:who|whose|which|that|this|the|a|an)\b.*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;\"'`")
+    value = re.sub(
+        r"\s+(?:has|have|is|was|were|serves|acts|plays|works|recently|currently)\b.*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip(" .,:;\"'`")
+    if not value:
+        return None
+    if re.fullmatch(r"(?:record|entry|id|identifier|code|reference|asset|unit|individual|profile)", value, flags=re.I):
+        return None
+    if len(value) > 100:
+        return None
+    return value
+
+
 def _extract_display_value_for_identifier(paragraph: str, identifier_value: str) -> str | None:
     if not identifier_value:
         return None
     escaped_identifier = re.escape(identifier_value)
     id_label = r"(?:Registry ID|ID|identifier|record id|code|reference)"
-    patterns = (
+    after_patterns = (
+        rf"\b{escaped_identifier}\b[^.;\n]{{0,180}}?\b(?:is|was|corresponds to|pertains to|points to|refers to|"
+        rf"identified as|confirmed as|verified as|documented as|recorded as|named|listed as)\s+"
+        rf"(?:that of\s+|the\s+)?(({_DISPLAY_NAME_TOKEN})(?:\s+{_DISPLAY_NAME_TOKEN}){{0,5}})",
+        rf"\b(?:asset|record|entry|profile|unit|individual)[^.;\n]{{0,80}}\b{escaped_identifier}\b[^.;\n]{{0,160}}?"
+        rf"\b(?:is|was|as)\s+(?:that of\s+)?(({_DISPLAY_NAME_TOKEN})(?:\s+{_DISPLAY_NAME_TOKEN}){{0,5}})",
+    )
+    candidates: list[str] = []
+    for pattern in after_patterns:
+        for match in re.finditer(pattern, paragraph, flags=re.IGNORECASE):
+            candidate = _clean_identifier_display_candidate(match.group(1))
+            if candidate:
+                candidates.append(candidate)
+
+    before_patterns = (
         rf"([^.;()\n]{{2,140}}?)\s*\(\s*{id_label}\s*:?\s*{escaped_identifier}\s*\)",
         rf"([^.;()\n]{{2,140}}?)\s*\(\s*{escaped_identifier}\s*\)",
         rf"([^.;\n]{{2,140}}?)\b{escaped_identifier}\b",
     )
-    for pattern in patterns:
+    for pattern in before_patterns:
         match = re.search(pattern, paragraph, flags=re.IGNORECASE)
         if not match:
             continue
-        value = _clean_identifier_display_value(match.group(1))
-        if value and not re.fullmatch(r"(?:record|entry|id|identifier|code|reference)", value, flags=re.IGNORECASE):
-            return value
+        value = _clean_identifier_display_candidate(match.group(1))
+        if value:
+            candidates.append(value)
+    if candidates:
+        return max(candidates, key=_display_value_score)
     return None
 
 
@@ -1220,10 +1374,9 @@ def _generic_document_rows_for_path(
             row = dict(base)
             row["record_id_kind"] = identifier_kind
             row["record_id"] = identifier_value
-            if "name" not in row:
-                display_value = _extract_display_value_for_identifier(paragraph, identifier_value)
-                if display_value:
-                    row["name"] = display_value
+            display_value = _extract_display_value_for_identifier(paragraph, identifier_value)
+            if display_value and _display_value_score(display_value) > _display_value_score(_text_value(row.get("name"))):
+                row["name"] = display_value
             rows.append(row)
     return rows
 
@@ -1560,12 +1713,29 @@ def _text_value(value: Any) -> str:
     return str(value).strip()
 
 
+def _identifier_value(value: Any) -> str:
+    text = _text_value(value)
+    if not text:
+        return ""
+    try:
+        numeric = float(text)
+    except ValueError:
+        return text
+    if numeric.is_integer():
+        return str(int(numeric))
+    return text
+
+
 def _looks_like_record_id(value: Any) -> bool:
     return bool(RECORD_ID_PATTERN.match(_text_value(value)))
 
 
 def _column_nonempty_values(series: pd.Series) -> list[str]:
     return [text for text in (_text_value(value) for value in series.tolist()) if text]
+
+
+def _identifier_nonempty_values(series: pd.Series) -> list[str]:
+    return [text for text in (_identifier_value(value) for value in series.tolist()) if text]
 
 
 def _column_is_record_id_like(series: pd.Series) -> bool:
@@ -1578,10 +1748,16 @@ def _identifier_column_hint(column_name: str) -> str | None:
     if lowered.startswith("link_to_"):
         return lowered.removeprefix("link_to_").removesuffix("s")
     if lowered.endswith("_id"):
-        return lowered.removesuffix("_id").removesuffix("s")
+        hint = lowered.removesuffix("_id").removesuffix("s")
+        if hint.endswith("user"):
+            return "user"
+        return hint
     camel_match = re.search(r"([A-Za-z][A-Za-z0-9]*)Id$", column_name)
     if camel_match:
-        return camel_match.group(1).lower().removesuffix("s")
+        hint = camel_match.group(1).lower().removesuffix("s")
+        if hint.endswith("user"):
+            return "user"
+        return hint
     if lowered == "id":
         return None
     return None
@@ -1723,6 +1899,37 @@ def _make_unique_column_name(
     return f"{column_name}_{suffix}"
 
 
+def _column_all_blank(series: pd.Series) -> bool:
+    return not any(_text_value(value) for value in series.tolist())
+
+
+def _blank_companion_display_column(frame: pd.DataFrame, id_column: str) -> str | None:
+    candidates: list[str] = []
+    camel_user = re.search(r"^(.*)UserId$", id_column)
+    if camel_user:
+        prefix = camel_user.group(1)
+        candidates.extend([f"{prefix}DisplayName", f"{prefix}Name"])
+    camel_id = re.search(r"^(.*)Id$", id_column)
+    if camel_id:
+        prefix = camel_id.group(1)
+        candidates.extend([f"{prefix}Name", f"{prefix}Title", f"{prefix}Label"])
+    snake_user = re.search(r"^(.*)_user_id$", id_column.lower())
+    if snake_user:
+        prefix = snake_user.group(1)
+        candidates.extend([f"{prefix}_display_name", f"{prefix}_name"])
+    snake_id = re.search(r"^(.*)_id$", id_column.lower())
+    if snake_id:
+        prefix = snake_id.group(1)
+        candidates.extend([f"{prefix}_name", f"{prefix}_title", f"{prefix}_label"])
+
+    lowered_to_original = {str(column).lower(): str(column) for column in frame.columns}
+    for candidate in candidates:
+        original = lowered_to_original.get(candidate.lower())
+        if original and original != id_column and _column_all_blank(frame[original]):
+            return original
+    return None
+
+
 def _match_context_identifier(
     *,
     context_tables: list[ContextTable],
@@ -1733,6 +1940,7 @@ def _match_context_identifier(
         return None
 
     hint = _identifier_column_hint(column_name)
+    value_set = set(values)
     best_match: ContextIdentifierMatch | None = None
 
     for table in context_tables:
@@ -1745,13 +1953,19 @@ def _match_context_identifier(
             target_hint = _identifier_column_hint(id_column)
             if hint and target_hint and hint != target_hint:
                 continue
+            if hint and target_hint is None:
+                table_identity = f"{table.name} {table.path}".lower()
+                if hint not in table_identity and f"{hint}s" not in table_identity:
+                    continue
             lookup: dict[str, str] = {}
             lookup_scores: dict[str, int] = {}
-            for raw_id, raw_display in zip(
-                table.frame[id_column].tolist(),
-                display_values.tolist(),
-                strict=False,
-            ):
+            id_values = table.frame[id_column].map(_identifier_value)
+            matching_mask = id_values.isin(value_set)
+            if not bool(matching_mask.any()):
+                continue
+            matching_display_values = display_values[matching_mask].tolist()
+            matching_id_values = id_values[matching_mask].tolist()
+            for raw_id, raw_display in zip(matching_id_values, matching_display_values, strict=False):
                 record_id = _text_value(raw_id)
                 display_value = _text_value(raw_display)
                 if record_id and display_value:
@@ -1771,7 +1985,12 @@ def _match_context_identifier(
             table_hint_text = f"{table.name} {id_column}".lower()
             if hint and hint in table_hint_text:
                 score += 25
-            if display_name.lower().endswith("_name") or display_name.lower() == "full_name":
+            display_lower = display_name.lower()
+            if display_lower in {"displayname", "display_name"}:
+                score += 40
+            elif display_lower in {"name", "label"} or display_lower.endswith("_name") or display_lower == "full_name":
+                score += 25
+            elif display_lower == "title":
                 score += 10
 
             match = ContextIdentifierMatch(
@@ -1805,8 +2024,15 @@ def resolve_identifier_columns(
         series = current_frame[column]
         if not (_is_id_like_column(column_name) or _column_is_record_id_like(series)):
             continue
+        if column_name.lower() == "id" and any(
+            str(other) != column_name
+            and _is_display_like_column(str(other))
+            and not _column_all_blank(current_frame[other])
+            for other in current_frame.columns
+        ):
+            continue
 
-        values = _column_nonempty_values(series)
+        values = _identifier_nonempty_values(series)
         if not values:
             continue
 
@@ -1819,8 +2045,24 @@ def resolve_identifier_columns(
             continue
 
         resolved = series.map(
-            lambda value: best_match.lookup.get(_text_value(value), _text_value(value))
+            lambda value: best_match.lookup.get(_identifier_value(value), _text_value(value))
         )
+        companion_column = _blank_companion_display_column(current_frame, column_name)
+        if companion_column is not None:
+            current_frame[companion_column] = resolved
+            current_frame = current_frame.drop(columns=[column])
+            transformations.append(
+                {
+                    "kind": "identifier_resolution",
+                    "source_column": column_name,
+                    "output_column": companion_column,
+                    "lookup_table": best_match.table.path,
+                    "lookup_id_column": best_match.id_column,
+                    "filled_existing_display_column": True,
+                    "dropped_source_column": True,
+                }
+            )
+            continue
         new_column_name = _make_unique_column_name(
             best_match.display_name,
             [str(existing) for existing in current_frame.columns],
@@ -2520,6 +2762,10 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
     asks_textual_answer = bool(re.search(r"\b(?:comment|text|body|content)\b", lowered_question))
     asks_name_answer = bool(re.search(r"\b(?:name|user|author|owner|editor|person|people)\b", lowered_question))
     asks_count_answer = _question_asks_count_metric(question)
+    features = extract_question_features(question)
+    asks_count_or_total_answer = asks_count_answer or (
+        not features.asks_ratio_or_percentage and "total" in features.strong_terms
+    )
     superlative_direction = _superlative_direction(question)
     metric_sort_terms = {"score", "cost", "price", "amount", "count", "total", "value", "views", "view"}
     scored: list[tuple[int, str]] = []
@@ -2537,6 +2783,7 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         column_name = str(column)
         column_lower = column_name.lower()
         aliases = _column_question_aliases(column_name)
+        nonempty_count = sum(1 for value in frame[column].tolist() if _text_value(value))
         score = 0
         focus_match = _column_matches_answer_focus(column_name, aliases, focus_fragments)
         if focus_match:
@@ -2577,6 +2824,8 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
             aliases & {"comment", "text", "body", "content"}
         ):
             score -= 60
+        if nonempty_count == 0 and (_is_display_like_column(column_name) or aliases & {"name", "display", "text"}):
+            score -= 100
         if score > 0:
             scored.append((score * 1000 - index, column_name))
     scored.sort(reverse=True)
@@ -2596,15 +2845,55 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         ]
         if text_columns:
             return (text_columns[0],)
-    if _question_mentions_attribute_pair(question) and not asks_identifier and not asks_count_answer:
-        multi_columns = tuple(dict.fromkeys(column for _, column in scored[:3]))
+    if asks_count_or_total_answer and re.search(r"\bname\b", lowered_question) and not asks_identifier:
+        count_columns = [
+            column
+            for _, column in scored
+            if (
+                _column_question_aliases(column) & {"count", "total", "view", "views"}
+                or column.lower().endswith("count")
+                or column.lower().endswith("_count")
+            )
+        ]
+        display_columns = [
+            column
+            for _, column in scored
+            if _is_display_like_column(column)
+            and not _is_id_like_column(column)
+            and any(_text_value(value) for value in frame[column].tolist())
+        ]
+        if count_columns and display_columns:
+            return tuple(dict.fromkeys([display_columns[0], count_columns[0]]))
+    if asks_count_or_total_answer and not asks_identifier and not _question_mentions_attribute_pair(question):
+        count_columns = [
+            column
+            for _, column in scored
+            if (
+                _column_question_aliases(column) & {"count", "total"}
+                or column.lower().endswith("count")
+                or column.lower().endswith("_count")
+            )
+        ]
+        if count_columns:
+            return (count_columns[0],)
+    if _question_mentions_attribute_pair(question) and not asks_identifier:
+        multi_columns = tuple(
+            dict.fromkeys(
+                column
+                for _, column in scored[:3]
+                if not (
+                    _is_display_like_column(column)
+                    and not any(_text_value(value) for value in frame[column].tolist())
+                )
+            )
+        )
         if len(multi_columns) >= 2:
             return multi_columns
     entity = _infer_generic_target_entity(lowered_question)
     if (
         entity
         and not asks_identifier
-        and not asks_count_answer
+        and not asks_count_or_total_answer
         and not asks_textual_answer
         and not _question_mentions_attribute_pair(question)
     ):
@@ -2626,7 +2915,7 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         id_columns = [column for _, column in scored if _is_id_like_column(column)]
         if id_columns:
             return (max(id_columns, key=lambda column: _identifier_answer_column_priority(column, question)),)
-    if asks_count_answer:
+    if asks_count_or_total_answer:
         count_columns = [
             column
             for _, column in scored
@@ -5455,6 +5744,47 @@ def _question_looks_list_answer(question: str) -> bool:
     return extract_question_features(question).asks_entity_or_list
 
 
+def _blank_answer_columns(frame: pd.DataFrame) -> list[str]:
+    if len(frame.columns) <= 1:
+        return []
+    nonblank_columns = [
+        str(column)
+        for column in frame.columns
+        if any(_text_value(value) for value in frame[column].tolist())
+    ]
+    if not nonblank_columns:
+        return []
+    return [
+        str(column)
+        for column in frame.columns
+        if not any(_text_value(value) for value in frame[column].tolist())
+    ]
+
+
+def _normalize_answer_cell(value: Any) -> str:
+    text = _text_value(value).strip().lower()
+    if re.fullmatch(r"-?\d+(?:\.0+)?", text):
+        return text.split(".", 1)[0]
+    return re.sub(r"\s+", " ", text)
+
+
+def _duplicate_answer_value_columns(frame: pd.DataFrame) -> list[str]:
+    if len(frame.columns) <= 1:
+        return []
+    seen_by_base: dict[tuple[str, tuple[str, ...]], str] = {}
+    duplicate_columns: list[str] = []
+    for column in frame.columns:
+        column_name = str(column)
+        base_name = re.sub(r"_\d+$", "", column_name).lower()
+        values = tuple(_normalize_answer_cell(value) for value in frame[column].tolist())
+        key = (base_name, values)
+        if key in seen_by_base:
+            duplicate_columns.append(column_name)
+        else:
+            seen_by_base[key] = column_name
+    return duplicate_columns
+
+
 def final_answer_shape_guard(
     *,
     task: PublicTask,
@@ -5483,6 +5813,32 @@ def final_answer_shape_guard(
                 "kind": "metadata_column_removal",
                 "removed_columns": metadata_columns,
                 "reason": "debug_metadata_columns",
+            }
+        )
+
+    blank_columns = _blank_answer_columns(current)
+    if blank_columns and len(blank_columns) < len(current.columns):
+        current = current.drop(columns=blank_columns)
+        removed_columns.extend(blank_columns)
+        transformations.append(
+            {
+                "kind": "final_answer_shape_guard",
+                "action": "drop_blank_columns",
+                "removed_columns": blank_columns,
+                "reason": "all_values_blank_with_nonblank_answer_columns",
+            }
+        )
+
+    duplicate_columns = _duplicate_answer_value_columns(current)
+    if duplicate_columns and len(duplicate_columns) < len(current.columns):
+        current = current.drop(columns=duplicate_columns)
+        removed_columns.extend(duplicate_columns)
+        transformations.append(
+            {
+                "kind": "final_answer_shape_guard",
+                "action": "drop_duplicate_value_columns",
+                "removed_columns": duplicate_columns,
+                "reason": "same_column_family_and_identical_values",
             }
         )
 
@@ -6116,6 +6472,12 @@ def try_deterministic_candidate(task_context: TaskContext, intent: TaskIntent) -
     return None
 
 
+def _databao_state_has_salvageable_frame(state: Any) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    return isinstance(state.get("df"), pd.DataFrame) or isinstance(state.get("last_non_empty_df"), pd.DataFrame)
+
+
 def _make_lighthouse_salvage_executor() -> Any:
     from databao.agent.core import ExecutionResult
     from databao.agent.core.executor import OutputModalityHints
@@ -6127,6 +6489,9 @@ def _make_lighthouse_salvage_executor() -> Any:
             config = kwargs.get("config")
             stream_kwargs = {key: value for key, value in kwargs.items() if key not in {"config", "stream", "writer"}}
             last_state = None
+            diagnostics = _CURRENT_DIAGNOSTICS.get()
+            if diagnostics is not None:
+                diagnostics.checkpoint("databao_graph_stream_start")
             try:
                 for mode, chunk in compiled_graph.stream(
                     start_state,
@@ -6135,9 +6500,20 @@ def _make_lighthouse_salvage_executor() -> Any:
                     **stream_kwargs,
                 ):
                     if mode == "values":
+                        if last_state is None and diagnostics is not None:
+                            diagnostics.checkpoint(
+                                "databao_graph_first_state",
+                                state_keys=sorted(str(key) for key in chunk.keys()) if isinstance(chunk, Mapping) else [],
+                            )
                         last_state = chunk
-            except Exception:
-                if isinstance(last_state, dict) and last_state.get("df") is not None:
+            except Exception as exc:
+                if diagnostics is not None:
+                    diagnostics.checkpoint(
+                        "databao_graph_stream_exception",
+                        exception_type=type(exc).__name__,
+                        salvageable=_databao_state_has_salvageable_frame(last_state),
+                    )
+                if _databao_state_has_salvageable_frame(last_state):
                     return last_state
                 raise
             if last_state is None:
@@ -6149,17 +6525,27 @@ def _make_lighthouse_salvage_executor() -> Any:
                 return self._graph.get_result(state)
             except Exception:
                 df = state.get("df")
+                sql = state.get("sql", "")
+                salvaged_previous_non_empty = False
+                if df is None:
+                    df = state.get("last_non_empty_df")
+                    sql = state.get("last_non_empty_sql", "")
+                    salvaged_previous_non_empty = df is not None
                 if df is None:
                     raise
                 return ExecutionResult(
                     text="Salvaged the latest successful SQL result after Databao did not submit a final result.",
                     df=df,
-                    code=state.get("sql", ""),
+                    code=sql,
                     meta={
                         "visualization_prompt": state.get("visualization_prompt"),
                         ExecutionResult.META_MESSAGES_KEY: state.get("messages", []),
                         "submit_called": False,
                         "salvaged_latest_query_result": True,
+                        "salvaged_previous_non_empty_result": salvaged_previous_non_empty,
+                        "salvaged_previous_non_empty_query_id": state.get("last_non_empty_query_id")
+                        if salvaged_previous_non_empty
+                        else None,
                     },
                 )
 
@@ -6176,9 +6562,19 @@ def _make_lighthouse_salvage_executor() -> Any:
             writer: Any = None,
         ) -> Any:
             del stream
+            diagnostics = _CURRENT_DIAGNOSTICS.get()
+            if diagnostics is not None:
+                diagnostics.checkpoint("databao_lighthouse_init_sources_start")
             self._init_sources_from_domain(domain)
+            if diagnostics is not None:
+                diagnostics.checkpoint("databao_lighthouse_init_sources_done")
+                diagnostics.checkpoint("databao_lighthouse_render_prompt_start")
             system_prompt = self.render_system_prompt(self._duckdb_connection, domain, agent_config.recursion_limit)
+            if diagnostics is not None:
+                diagnostics.checkpoint("databao_lighthouse_render_prompt_done", prompt_chars=len(system_prompt))
             init_state = self._graph.init_state([], limit_max_rows=rows_limit)
+            if diagnostics is not None:
+                diagnostics.checkpoint("databao_lighthouse_execute_core_start")
             execution_result, _ = self._execute_core(
                 opas,
                 cache,
@@ -6488,6 +6884,7 @@ def _write_task_log(
     failure_reason: str | None = None,
     context_payload_profile: dict[str, Any] | None = None,
     databao_failure_type: str | None = None,
+    databao_internal_observation: dict[str, Any] | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -6522,6 +6919,7 @@ def _write_task_log(
         "failure_reason": failure_reason,
         "context_payload_profile": context_payload_profile,
         "databao_failure_type": databao_failure_type,
+        "databao_internal_observation": databao_internal_observation,
     }
     log_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -6588,6 +6986,126 @@ def _timeout_task_artifact(
     )
 
 
+def _ask_databao_candidate_child(
+    result_queue: multiprocessing.Queue,
+    task: PublicTask,
+    logs_dir: Path,
+    databao_env: DatabaoEnvironment,
+) -> None:
+    previous_ask_timeout = os.environ.pop(DATABAO_ASK_STAGE_TIMEOUT_SECONDS_ENV, None)
+    diagnostics = TaskDiagnostics(task=task, logs_dir=logs_dir, databao_env=databao_env)
+    diagnostics_token = _CURRENT_DIAGNOSTICS.set(diagnostics)
+    try:
+        frame = _ask_databao_candidate(
+            task,
+            databao_env,
+            build_databao_agent,
+            diagnostics,
+            stage_name="databao_ask_watchdog_child",
+        )
+        result_queue.put(
+            {
+                "ok": True,
+                "frame": frame,
+                "timings": diagnostics.timings,
+                "llm_calls": diagnostics.llm_calls,
+                "checkpoints": diagnostics.checkpoints,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        result_queue.put(
+            {
+                "ok": False,
+                "error": _safe_exception_summary(exc, (databao_env.model_api_key,)),
+                "timings": diagnostics.timings,
+                "llm_calls": diagnostics.llm_calls,
+                "checkpoints": diagnostics.checkpoints,
+            }
+        )
+    finally:
+        _CURRENT_DIAGNOSTICS.reset(diagnostics_token)
+        if previous_ask_timeout is not None:
+            os.environ[DATABAO_ASK_STAGE_TIMEOUT_SECONDS_ENV] = previous_ask_timeout
+
+
+def _ask_databao_candidate_with_watchdog(
+    task: PublicTask,
+    databao_env: DatabaoEnvironment,
+    diagnostics: TaskDiagnostics,
+    timeout_seconds: int,
+) -> pd.DataFrame:
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_ask_databao_candidate_child,
+        args=(result_queue, task, diagnostics.logs_dir, databao_env),
+        daemon=False,
+    )
+    started_at = perf_counter()
+    diagnostics.checkpoint("databao_ask_watchdog_start", timeout_seconds=timeout_seconds)
+    process.start()
+    deadline_at = started_at + timeout_seconds
+    while True:
+        try:
+            payload = result_queue.get(timeout=0.2)
+        except queue.Empty:
+            payload = None
+        if payload is not None:
+            process.join(2)
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(5)
+            diagnostics.timings.update(
+                {
+                    f"ask_child_{key}": value
+                    for key, value in dict(payload.get("timings") or {}).items()
+                    if isinstance(value, int | float)
+                }
+            )
+            diagnostics.llm_calls.extend(list(payload.get("llm_calls") or []))
+            for key, value in dict(payload.get("checkpoints") or {}).items():
+                diagnostics.checkpoints[f"ask_child_{key}"] = value
+            diagnostics.checkpoint(
+                "databao_ask_watchdog_done",
+                elapsed_seconds=round(perf_counter() - started_at, 3),
+                child_ok=bool(payload.get("ok")),
+            )
+            if payload.get("ok") and isinstance(payload.get("frame"), pd.DataFrame):
+                return payload["frame"]
+            raise RuntimeError(str(payload.get("error") or "Databao ask watchdog child failed."))
+
+        if not process.is_alive():
+            break
+        if perf_counter() >= deadline_at:
+            process.terminate()
+            process.join(5)
+            if process.is_alive():
+                process.kill()
+                process.join(5)
+            diagnostics.checkpoint(
+                "databao_ask_watchdog_timeout",
+                timeout_seconds=timeout_seconds,
+                elapsed_seconds=round(perf_counter() - started_at, 3),
+            )
+            raise TimeoutError(f"Databao ask-stage watchdog exceeded {timeout_seconds} seconds.")
+
+    try:
+        payload = result_queue.get_nowait()
+    except queue.Empty as exc:
+        diagnostics.checkpoint(
+            "databao_ask_watchdog_child_exit_without_payload",
+            exitcode=process.exitcode,
+            elapsed_seconds=round(perf_counter() - started_at, 3),
+        )
+        raise RuntimeError(f"Databao ask watchdog child exited with code {process.exitcode}.") from exc
+    if payload.get("ok") and isinstance(payload.get("frame"), pd.DataFrame):
+        return payload["frame"]
+    raise RuntimeError(str(payload.get("error") or "Databao ask watchdog child failed."))
+
+
 def _ask_databao_candidate(
     task: PublicTask,
     databao_env: DatabaoEnvironment,
@@ -6596,14 +7114,30 @@ def _ask_databao_candidate(
     *,
     stage_name: str = "databao_ask",
 ) -> pd.DataFrame:
+    ask_stage_timeout = _env_int(DATABAO_ASK_STAGE_TIMEOUT_SECONDS_ENV, 0)
+    if ask_stage_timeout > 0 and agent_builder is build_databao_agent:
+        return _ask_databao_candidate_with_watchdog(
+            task,
+            databao_env,
+            diagnostics,
+            ask_stage_timeout,
+        )
     with diagnostics.stage(stage_name):
+        diagnostics.checkpoint("databao_agent_build_start")
         agent = agent_builder(task, databao_env)
+        diagnostics.checkpoint("databao_agent_build_done")
         thread = agent.thread(stream_ask=False, stream_plot=False, auto_output_modality=False)
+        diagnostics.checkpoint("databao_thread_created")
+        diagnostics.checkpoint("databao_thread_ask_start")
         thread.ask(_build_question_prompt(task), stream=False)
+        diagnostics.checkpoint("databao_thread_ask_done")
+        diagnostics.checkpoint("databao_thread_df_start")
         frame = thread.df()
         try:
+            diagnostics.checkpoint("databao_thread_code_meta_start")
             code = thread.code()
             meta = thread.meta()
+            diagnostics.checkpoint("databao_thread_code_meta_done")
         except Exception:  # noqa: BLE001
             code = None
             meta = {}
@@ -6616,6 +7150,16 @@ def _ask_databao_candidate(
             frame.attrs["databao_submit_called"] = bool(meta.get("submit_called"))
         if "salvaged_latest_query_result" in meta:
             frame.attrs["databao_salvaged_latest_query_result"] = bool(meta.get("salvaged_latest_query_result"))
+        if "salvaged_previous_non_empty_result" in meta:
+            frame.attrs["databao_salvaged_previous_non_empty_result"] = bool(
+                meta.get("salvaged_previous_non_empty_result")
+            )
+        if "salvaged_previous_non_empty_query_id" in meta:
+            frame.attrs["databao_salvaged_previous_non_empty_query_id"] = _text_value(
+                meta.get("salvaged_previous_non_empty_query_id")
+            )
+        if "submit_critiques" in meta:
+            frame.attrs["databao_submit_critiques"] = meta.get("submit_critiques")
     frame.attrs["databao_executor_type"] = _databao_executor_type()
     diagnostics.checkpoint(
         "databao_frame_received",
@@ -6659,6 +7203,7 @@ def run_databao_task(
     provisional_written_stage: str | None = None
     missing_prediction_reason: str | None = None
     databao_failure_type: str | None = None
+    databao_internal_observation: dict[str, Any] | None = None
     effective_heuristic_level = _heuristic_level()
     enabled_strategies: list[dict[str, Any]] = []
     applied_strategies: list[dict[str, Any]] = []
@@ -7085,6 +7630,19 @@ def run_databao_task(
                         f"{missing_prediction_reason} Databao: {databao_failure_reason}"
                     ) from exc
             else:
+                databao_internal_observation = _databao_submit_critique(
+                    task=task,
+                    frame=databao_frame,
+                    answer_contract=answer_contract,
+                )
+                applied_strategies.append(
+                    {
+                        "strategy_name": "databao_internal_observation",
+                        "strategy_kind": "diagnostic",
+                        "result": databao_internal_observation,
+                        "applied_to_final_answer": False,
+                    }
+                )
                 databao_candidate = record_candidate(
                     build_candidate_from_frame(
                         databao_frame,
@@ -7218,6 +7776,7 @@ def run_databao_task(
             timeout_budget=timeout_budget_payload(),
             context_payload_profile=context_payload_profile,
             databao_failure_type=databao_failure_type,
+            databao_internal_observation=databao_internal_observation,
         )
         return DatabaoTaskArtifacts(
             task_id=task.task_id,
@@ -7285,6 +7844,7 @@ def run_databao_task(
             failure_reason=failure_reason,
             context_payload_profile=context_payload_profile,
             databao_failure_type=databao_failure_type or _databao_failure_type(failure_reason),
+            databao_internal_observation=databao_internal_observation,
         )
         traceback_path = logs_dir / f"{task.task_id}.traceback.txt"
         traceback_path.write_text(
