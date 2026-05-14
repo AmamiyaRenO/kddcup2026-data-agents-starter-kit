@@ -1579,6 +1579,9 @@ def _identifier_column_hint(column_name: str) -> str | None:
         return lowered.removeprefix("link_to_").removesuffix("s")
     if lowered.endswith("_id"):
         return lowered.removesuffix("_id").removesuffix("s")
+    camel_match = re.search(r"([A-Za-z][A-Za-z0-9]*)Id$", column_name)
+    if camel_match:
+        return camel_match.group(1).lower().removesuffix("s")
     if lowered == "id":
         return None
     return None
@@ -1739,6 +1742,9 @@ def _match_context_identifier(
         display_name, display_values = display
 
         for id_column in _identifier_columns(table.frame):
+            target_hint = _identifier_column_hint(id_column)
+            if hint and target_hint and hint != target_hint:
+                continue
             lookup: dict[str, str] = {}
             lookup_scores: dict[str, int] = {}
             for raw_id, raw_display in zip(
@@ -2517,6 +2523,16 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
     superlative_direction = _superlative_direction(question)
     metric_sort_terms = {"score", "cost", "price", "amount", "count", "total", "value", "views", "view"}
     scored: list[tuple[int, str]] = []
+
+    def display_column_rank(column_name: str) -> tuple[int, int]:
+        lowered = column_name.lower()
+        for index, preferred in enumerate(ENTITY_DISPLAY_COLUMN_PRIORITY):
+            if lowered == preferred.lower():
+                return (index, 0)
+        if lowered.endswith("_name") or lowered.endswith(" name"):
+            return (0, 1)
+        return (len(ENTITY_DISPLAY_COLUMN_PRIORITY), 0)
+
     for index, column in enumerate(frame.columns):
         column_name = str(column)
         column_lower = column_name.lower()
@@ -2580,6 +2596,26 @@ def _question_target_columns(question: str, frame: pd.DataFrame) -> tuple[str, .
         ]
         if text_columns:
             return (text_columns[0],)
+    if _question_mentions_attribute_pair(question) and not asks_identifier and not asks_count_answer:
+        multi_columns = tuple(dict.fromkeys(column for _, column in scored[:3]))
+        if len(multi_columns) >= 2:
+            return multi_columns
+    entity = _infer_generic_target_entity(lowered_question)
+    if (
+        entity
+        and not asks_identifier
+        and not asks_count_answer
+        and not asks_textual_answer
+        and not _question_mentions_attribute_pair(question)
+    ):
+        display_columns = [
+            str(column)
+            for column in frame.columns
+            if _is_display_like_column(str(column)) and not _is_id_like_column(str(column))
+        ]
+        if display_columns:
+            display_columns.sort(key=display_column_rank)
+            return (display_columns[0],)
     strongly_scored = [(score_key, column) for score_key, column in scored if score_key >= 100_000]
     if strongly_scored:
         if len(strongly_scored) == 1 or strongly_scored[0][0] - strongly_scored[1][0] >= 30_000:
@@ -3238,6 +3274,8 @@ def apply_databao_observed_detail_aggregate_compactor(
         numeric_columns = _non_identifier_numeric_columns(frame)
         if not numeric_columns:
             return frame, []
+        if len(frame) == 1 and len(numeric_columns) > 1 and operations.get("aggregate"):
+            return frame, []
         metric_column = _question_matched_numeric_column(
             numeric_columns,
             task.question,
@@ -3740,6 +3778,17 @@ def postprocess_answer_table(
 
     current_frame, question_column_transforms = apply_answer_column_verifier(task, current_frame)
     transformations.extend(question_column_transforms)
+
+    deduplicated_frame = current_frame.drop_duplicates().reset_index(drop=True)
+    if len(deduplicated_frame) != len(current_frame):
+        transformations.append(
+            {
+                "kind": "duplicate_answer_row_removal",
+                "input_rows": len(current_frame),
+                "output_rows": len(deduplicated_frame),
+            }
+        )
+        current_frame = deduplicated_frame
 
     return current_frame, DeterministicPostprocessReport(
         applied=bool(transformations),

@@ -1374,6 +1374,30 @@ class DatabaoDemoTests(unittest.TestCase):
             self.assertEqual(output.to_dict(orient="list"), {"count": [3]})
             self.assertEqual(transforms[0]["count_basis"], "distinct_column")
 
+    def test_databao_observed_detail_aggregate_counts_distinct_ids_from_filtered_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Among matching patients, how many have an abnormal measurement?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame(
+                {
+                    "ID": [1, 1, 2, 3],
+                    "FG": [36.1, 36.1, 43.8, 12.0],
+                    "SEX": ["M", "M", "M", "M"],
+                    "WBC": [7.7, 7.7, 9.5, 8.0],
+                }
+            )
+            frame.attrs["databao_code"] = (
+                "SELECT l.ID, l.FG, p.SEX, l.WBC FROM lab l JOIN patient p ON l.ID = p.ID "
+                "WHERE p.SEX = 'M' AND l.WBC >= 4.5 AND (l.FG < 2.0 OR l.FG > 4.0)"
+            )
+
+            output, transforms = apply_databao_observed_detail_aggregate_compactor(task, frame)
+
+            self.assertEqual(output.to_dict(orient="list"), {"count": [3]})
+            self.assertEqual(transforms[0]["count_column"], "ID")
+
     def test_databao_observed_detail_aggregate_averages_filtered_metric(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1390,6 +1414,20 @@ class DatabaoDemoTests(unittest.TestCase):
 
             self.assertEqual(output.to_dict(orient="list"), {"avg_unique_bonds": [2.0]})
             self.assertEqual(transforms[0]["operation"], "average")
+
+    def test_databao_observed_detail_aggregate_keeps_existing_multi_metric_aggregate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="What are the average up votes and average age?")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+            frame = pd.DataFrame({"avg_up_votes": [182.2], "avg_age": [34.1]})
+            frame.attrs["databao_code"] = "SELECT AVG(up_votes) AS avg_up_votes, AVG(age) AS avg_age FROM users"
+
+            output, transforms = apply_databao_observed_detail_aggregate_compactor(task, frame)
+
+            self.assertTrue(output.equals(frame))
+            self.assertEqual(transforms, [])
 
     def test_databao_observed_detail_aggregate_does_not_override_identifier_questions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1508,6 +1546,22 @@ class DatabaoDemoTests(unittest.TestCase):
             )
             self.assertEqual(attribute_frame.to_dict(orient="list"), {"eye_colour": ["Brown"]})
 
+            write_task(input_root, task_id="task_entity", question="Which record was selected?")
+            entity_task = DABenchPublicDataset(input_root).get_task("task_entity")
+            entity_frame, _ = apply_answer_column_verifier(
+                entity_task,
+                pd.DataFrame({"name": ["Selected Name"], "positionText": ["2"], "position": [2]}),
+            )
+            self.assertEqual(entity_frame.to_dict(orient="list"), {"name": ["Selected Name"]})
+
+            write_task(input_root, task_id="task_entity_order", question="Which event was selected?")
+            entity_order_task = DABenchPublicDataset(input_root).get_task("task_entity_order")
+            entity_order_frame, _ = apply_answer_column_verifier(
+                entity_order_task,
+                pd.DataFrame({"positionText": ["2"], "name": ["Selected Event"], "date": ["2026-01-01"]}),
+            )
+            self.assertEqual(entity_order_frame.to_dict(orient="list"), {"name": ["Selected Event"]})
+
             write_task(
                 input_root,
                 task_id="task_finish_time",
@@ -1549,6 +1603,62 @@ class DatabaoDemoTests(unittest.TestCase):
 
         self.assertEqual(frame.to_dict(orient="list"), {"DisplayName": ["mbq"]})
         self.assertTrue(any(transform["kind"] == "identifier_resolution" for transform in report.transformations))
+
+    def test_identifier_resolution_rejects_conflicting_camel_case_id_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="Which event was selected?")
+            context_dir = input_root / "task_1" / "context"
+            csv_dir = context_dir / "csv"
+            csv_dir.mkdir()
+            (csv_dir / "standings.csv").write_text(
+                "driverStandingsId,positionText\n1,first\n",
+                encoding="utf-8",
+            )
+            (csv_dir / "events.csv").write_text(
+                "eventId,name\n10,Selected Event\n",
+                encoding="utf-8",
+            )
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            frame, report = postprocess_answer_table(
+                task,
+                pd.DataFrame({"driverId": [1], "eventId": [10]}),
+            )
+
+        self.assertEqual(frame.to_dict(orient="list"), {"name": ["Selected Event"]})
+        self.assertTrue(any(transform["kind"] == "identifier_resolution" for transform in report.transformations))
+        self.assertFalse(
+            any(
+                transform.get("source_column") == "driverId"
+                and transform.get("lookup_id_column") == "driverStandingsId"
+                for transform in report.transformations
+            )
+        )
+
+    def test_postprocessor_removes_exact_duplicate_answer_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_root = root / "input"
+            write_task(input_root, question="List the school name and funding type.")
+            task = DABenchPublicDataset(input_root).get_task("task_1")
+
+            frame, report = postprocess_answer_table(
+                task,
+                pd.DataFrame(
+                    {
+                        "School Name": ["A", "A", "B"],
+                        "Funding Type": ["Direct", "Direct", "Indirect"],
+                    }
+                ),
+            )
+
+        self.assertEqual(
+            frame.to_dict(orient="list"),
+            {"School Name": ["A", "B"], "Funding Type": ["Direct", "Indirect"]},
+        )
+        self.assertTrue(any(transform["kind"] == "duplicate_answer_row_removal" for transform in report.transformations))
 
     def test_ranker_prefers_display_candidate_over_id_helper_with_display(self) -> None:
         contract = AnswerContract(
