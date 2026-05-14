@@ -744,3 +744,74 @@ variance on a single run.
 Next directions remain the same: an internal lookup tool for `link_to_*`/`*_id` resolution and
 better grounding evidence in critique suggestions would unlock the `task_89`/`task_344`/`task_408`
 family where the gate fires but the model cannot self-correct.
+
+## Databao Internal Patch: Grounding Probe (Opt-in After Stage 3 Ablation)
+
+Date: 2026-05-15
+
+Patch location:
+
+- `src/data_agent_baseline/_vendor/databao_patches/lighthouse_graph.py`
+
+What was tried:
+
+- When the `numeric_identifier_filter_needs_grounding` or
+  `numeric_code_filter_needs_value_grounding` gate fired, the executor auto-probed the matching
+  table with two queries:
+  - `SELECT * FROM <table> WHERE <col> = <value> LIMIT 3` — shows the actual matching row(s) so
+    the model can compare its filter against the question's natural-language entity.
+  - `SELECT DISTINCT <col> FROM <table> ORDER BY <col> LIMIT 20` — shows the full enum/domain for
+    categorical filters so the model can see whether the chosen code is in range.
+- Helpers added: `_grounding_qualified_equalities`, `_resolve_alias_to_table`,
+  `_build_grounding_probe_sql`, `_build_distinct_domain_probe_sql`.
+- Probe results were embedded in the reject suggestion text along with explicit guidance to
+  compare the matched row against the question text.
+
+Default-on ablation outcome (`DATABAO_INTERNAL_GROUNDING_PROBE` implicitly enabled in the early
+Stage 3 sweep before the env knob was introduced):
+
+| Difficulty | Stage 2 avg | Stage 3 default-on avg | Δ | Stage 2 exact | Stage 3 exact | Missing pred |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Easy   | `0.717` | `0.800` | `+0.083` | `10/15` | `12/15` | `0/15`  |
+| Medium | `0.826` | `0.652` | `-0.174` | `19/23` | `15/23` | `0/23`  |
+| Hard   | `0.545` | `0.386` | `-0.159` | `6/11`  | `4/11`  | **`4/11`** |
+
+`task_344`, `task_352`, `task_396`, `task_408` all crossed the 180 s task timeout on Hard. The
+probe itself is fast (<1 s per call), but the extra agent turns triggered by the larger reject
+suggestion plus the verbose probe text inflated the LLM-call count and pushed those tasks past
+their budget. On Medium the extra reject turns also pushed several tasks into suboptimal revised
+submits that the adapter could not rescue.
+
+Targeted smoke before rollback:
+
+| Task | Probe ran? | Match | Notes |
+| --- | --- | --- | --- |
+| `task_11` | Yes | `False` | Probe showed `Thrombosis` domain is `{0,1,2,3}` and `=3` matches real rows. Model still mapped "severe" → 3 instead of 1, ignoring knowledge.md's explicit 1=most-severe mapping. Probe didn't unlock semantic reasoning. |
+| `task_89` | Yes | `False` | Probe matched on the wrong table (`csv_results`, the fact table). The actual lookup table that has race name/year is `csv_races`, which isn't in the failing SQL's FROM, so the alias-resolution heuristic couldn't reach it. Model didn't revise. |
+| `task_257` | Yes | `False` | Probe correctly showed `Id=88` → `DisplayName='mbq'`, but the model's revised SQL switched to a different user (`'Menno'`). Probe noise plausibly distracted the model from the right answer. |
+| `task_86` | Yes | `True` | Score preserved; the cleaner revised SQL stripped the extra `positionText` column. |
+
+Decision:
+
+- Move the grounding probe behind `DATABAO_INTERNAL_GROUNDING_PROBE` (default `0`). Helpers stay
+  in the codebase for opt-in ablations and future evolution.
+- Keep the empty-result probe default-on. It produced an unambiguous mechanism win (`task_173`
+  pivoted to a different data source after seeing real date samples) without timeout cost.
+- The Stage 3 lesson is concrete: enriched executor-side feedback only helps when the model can
+  act on the evidence cheaply. The empty-result probe gives a one-step fix ("rewrite the literal").
+  The grounding probe asks the model to do multi-step entity validation, which on Qwen3.5-35B-A3B
+  takes additional turns and frequently destabilizes the revised submit.
+
+After rollback, repeated Easy/Medium/Hard sweeps are within run-to-run variance of Stage 2
+numbers (single-run sample noise is ~3 task flips per Medium sweep). The empty-result probe
+remains the durable structural win from Stage 2.
+
+Next plausible directions if grounding probe is revisited:
+
+1. Resolve `*Id`-suffix columns against an external entity-lookup table (e.g. `raceId` → `races`)
+   even when that table is not in the failing SQL's FROM clause; this requires schema-graph
+   integration outside the Databao graph.
+2. Shorten the reject suggestion so the model is not flooded with raw CSV; consider compressing
+   probe results into a one-line summary (`raceId=34 → name='Spanish Grand Prix', year=2008`).
+3. Skip the distinct-domain probe by default (heavier output, lower hit rate); only run the
+   match-row probe.

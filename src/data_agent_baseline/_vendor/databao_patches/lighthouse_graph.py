@@ -105,6 +105,18 @@ def _p0_ratio_reject_enabled() -> bool:
     }
 
 
+def _grounding_probe_enabled() -> bool:
+    # Off by default: executor-side auto-probe for grounding flags helps a few
+    # tasks but adds extra agent turns and verbose reject suggestions, which
+    # pushed several Hard tasks past the task timeout. Opt-in for ablation.
+    return os.environ.get("DATABAO_INTERNAL_GROUNDING_PROBE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _latest_user_question(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -328,6 +340,79 @@ def _anchored_lookup_flags(
         evidence.append({"kind": "link_resolution", "columns": columns[:20], "link_samples": link_samples})
 
     return list(dict.fromkeys(flags)), list(dict.fromkeys(suggestions)), evidence
+
+
+def _grounding_qualified_equalities(sql: str | None) -> list[dict[str, str | None]]:
+    """Return numeric equality filters with alias information preserved.
+
+    Differs from ``_sql_filter_equalities`` which strips the alias prefix. We
+    need the alias here to resolve which actual table the probe should hit.
+    """
+
+    if not sql:
+        return []
+    pattern = re.compile(
+        r"(?:(?P<alias>[A-Za-z_]\w*)\.)?[`\"]?(?P<column>[A-Za-z_]\w*)[`\"]?\s*=\s*"
+        r"(?P<value>'[^']*'|\"[^\"]*\"|-?\d+(?:\.\d+)?)",
+        flags=re.IGNORECASE,
+    )
+    results: list[dict[str, str | None]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for match in pattern.finditer(sql):
+        alias = match.group("alias")
+        column = match.group("column")
+        raw_value = match.group("value").strip()
+        key = ((alias or "").lower(), column.lower(), raw_value)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(
+            {
+                "alias": alias,
+                "column": column,
+                "value": raw_value.strip("'\""),
+                "raw_value": raw_value,
+                "value_kind": "numeric" if re.fullmatch(r"-?\d+(?:\.\d+)?", raw_value) else "text",
+            }
+        )
+    return results
+
+
+def _resolve_alias_to_table(sql: str | None, alias: str | None) -> str | None:
+    """Given a SQL alias, return the underlying table reference from FROM/JOIN.
+
+    If ``alias`` is None and the SQL only references a single table in its
+    FROM clause, return that table — common case for bare queries like
+    ``SELECT * FROM <table> WHERE <id_col> = <value>``.
+    """
+
+    if not sql:
+        return None
+    if alias:
+        pattern = re.compile(
+            rf"\b(?:from|join)\s+(?P<table>(?:[A-Za-z_][\w.]*|`[^`]+`|\"[^\"]+\"))\s+(?:as\s+)?{re.escape(alias)}\b",
+            flags=re.IGNORECASE,
+        )
+        match = pattern.search(sql)
+        if not match:
+            return None
+        return match.group("table").strip("`\"")
+    tables = re.findall(
+        r"\b(?:from|join)\s+(?P<table>(?:[A-Za-z_][\w.]*|`[^`]+`|\"[^\"]+\"))",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    if len(tables) == 1:
+        return tables[0].strip("`\"")
+    return None
+
+
+def _build_grounding_probe_sql(table: str, column: str, raw_value: str) -> str:
+    return f'SELECT * FROM {table} WHERE "{column}" = {raw_value} LIMIT 3'
+
+
+def _build_distinct_domain_probe_sql(table: str, column: str) -> str:
+    return f'SELECT DISTINCT "{column}" FROM {table} ORDER BY "{column}" LIMIT 20'
 
 
 def _date_filter_qualified_columns(sql: str | None) -> list[str]:
@@ -1020,6 +1105,75 @@ class ExecuteSubmit:
                     sql = state["query_ids"][query_id].artifact["sql"]
                     df = state["query_ids"][query_id].artifact["df"]
                     critique = _critique_submit_result(state["messages"], query_id, sql, df)
+                    grounding_flags_present = _grounding_probe_enabled() and any(
+                        flag in critique.get("flags", [])
+                        for flag in (
+                            "numeric_identifier_filter_needs_grounding",
+                            "numeric_code_filter_needs_value_grounding",
+                        )
+                    )
+                    if grounding_flags_present:
+                        question_lower = (critique.get("question_text") or "").lower()
+                        question_numbers = _question_numeric_groundings(question_lower)
+                        ground_probes: list[dict[str, Any]] = []
+                        for equality in _grounding_qualified_equalities(sql)[:3]:
+                            if equality.get("value_kind") != "numeric":
+                                continue
+                            value = equality.get("value") or ""
+                            normalized = value[:-2] if value.endswith(".0") else value
+                            if normalized in question_numbers:
+                                continue
+                            table = _resolve_alias_to_table(sql, equality.get("alias"))
+                            if not table:
+                                continue
+                            probe_sql = _build_grounding_probe_sql(
+                                table, equality["column"], equality["raw_value"]
+                            )
+                            entry: dict[str, Any] = {
+                                "column_ref": f"{equality.get('alias')+'.' if equality.get('alias') else ''}{equality['column']}",
+                                "filter_value": equality["raw_value"],
+                                "table": table,
+                            }
+                            try:
+                                match_res = _run_sql_query(
+                                    probe_sql,
+                                    con=self._connection,
+                                    sql_row_limit=3,
+                                    display_row_limit=3,
+                                    display_cell_char_limit=200,
+                                )
+                                match_csv = (match_res.get("csv") or "").strip()
+                                match_err = match_res.get("error")
+                                entry["match_csv"] = match_csv[:500] if match_csv else ""
+                                entry["matched"] = bool(match_csv) and not match_err
+                                if match_err:
+                                    entry["match_error"] = str(match_err)[:200]
+                            except Exception as exc:
+                                entry["match_error"] = str(exc)[:200]
+                            try:
+                                domain_res = _run_sql_query(
+                                    _build_distinct_domain_probe_sql(table, equality["column"]),
+                                    con=self._connection,
+                                    sql_row_limit=20,
+                                    display_row_limit=20,
+                                    display_cell_char_limit=80,
+                                )
+                                domain_csv = (domain_res.get("csv") or "").strip()
+                                if domain_csv and not domain_res.get("error"):
+                                    entry["domain_csv"] = domain_csv[:400]
+                            except Exception:
+                                pass
+                            ground_probes.append(entry)
+                        if ground_probes:
+                            critique = {**critique, "grounding_probes": ground_probes}
+                            critique["suggestions"] = list(critique.get("suggestions", [])) + [
+                                "Grounding probe results (actual rows from the entity table for each "
+                                f"ungrounded numeric filter): {ground_probes}. "
+                                "Compare each match against the question text — if the matched row's "
+                                "name/date/year does not match what the question asked for, rewrite the SQL "
+                                "with the correct ID/value. If no row matched (empty match_csv), the filter "
+                                "value does not exist in the table."
+                            ]
                     if "empty_submit_result" in critique.get("flags", []):
                         probe_results: list[dict[str, Any]] = []
                         for qualified_col in _date_filter_qualified_columns(sql)[:2]:
