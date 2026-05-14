@@ -70,10 +70,54 @@ def _anchored_lookup_reject_enabled() -> bool:
     }
 
 
+def _p0_gates_enabled() -> bool:
+    value = os.environ.get("DATABAO_INTERNAL_P0_GATES", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _p0_max_rejections() -> int:
+    raw = os.environ.get("DATABAO_INTERNAL_P0_MAX_REJECTIONS", "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(0, value)
+
+
+P0_REJECT_FLAGS = frozenset(
+    {
+        "empty_submit_result",
+        "numeric_identifier_filter_needs_grounding",
+        "blank_display_needs_join",
+    }
+)
+
+
+def _p0_ratio_reject_enabled() -> bool:
+    # Off by default: when the adapter's aggregate/ratio verifier can rescue
+    # a count-detail submit into a percentage, rejecting that submit destroys
+    # the rescue input. Opt-in for ablations only.
+    return os.environ.get("DATABAO_INTERNAL_P0_RATIO_REJECT", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _latest_user_question(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
-            return str(message.content)
+            content = str(message.content)
+            # Strip system instructions; the actual question is the trailing
+            # text after the last "Question:" marker. The prefix often contains
+            # words like "display", "name", "title", "ratio" that would otherwise
+            # spuriously trigger question-keyword critiques.
+            marker = "Question:"
+            idx = content.rfind(marker)
+            if idx >= 0:
+                return content[idx + len(marker):].strip()
+            return content
     return ""
 
 
@@ -286,6 +330,247 @@ def _anchored_lookup_flags(
     return list(dict.fromkeys(flags)), list(dict.fromkeys(suggestions)), evidence
 
 
+def _date_filter_qualified_columns(sql: str | None) -> list[str]:
+    """Return qualified column references that appear in a date-like comparison.
+
+    Used by the empty-result probe to generate ``SELECT DISTINCT <col>`` queries
+    against the same FROM clause Databao tried, so the model can see the real
+    on-disk date format instead of having to guess at the literal shape.
+    """
+
+    if not sql:
+        return []
+    pattern = re.compile(
+        r"((?:[A-Za-z_]\w*\.)?[`\"]?\w*(?:date|time|day|month|year)\w*[`\"]?)"
+        r"\s*(?:[<>=!]+|between|like|in\s*\()",
+        flags=re.IGNORECASE,
+    )
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(sql):
+        column = match.group(1).strip("`\"")
+        key = column.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(column)
+    return deduped
+
+
+def _extract_from_clause(sql: str | None) -> str | None:
+    if not sql:
+        return None
+    match = re.search(
+        r"\bfrom\b(.+?)(?:\bwhere\b|\bgroup\s+by\b|\border\s+by\b|\blimit\b|;|$)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _build_date_probe_sql(original_sql: str, qualified_col: str) -> str | None:
+    from_clause = _extract_from_clause(original_sql)
+    if not from_clause:
+        return None
+    return f"SELECT DISTINCT {qualified_col} FROM {from_clause} LIMIT 5"
+
+
+def _empty_date_filter_hint(sql: str | None) -> str | None:
+    if not sql:
+        return None
+    lowered = sql.lower()
+    if not re.search(
+        r"\b(?:date|datetime|created_at|updated_at|posted_at|day|month|year|\w*date\w*|\w*time\w*)\b\s*"
+        r"(?:[<>=!]+|between|in\s*\()",
+        lowered,
+    ):
+        return None
+    return (
+        " Before re-submitting an empty result, inspect the filtered column's dtype and a few distinct "
+        "sample values via a separate SELECT; the literal format may not match (string '2013-06-01' vs "
+        "integer 20130601 vs other format)."
+    )
+
+
+def _blank_display_critique(
+    question: str,
+    df: pd.DataFrame | None,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    flags: list[str] = []
+    suggestions: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return flags, suggestions, evidence
+    lowered = question.lower()
+    asks_display = bool(
+        re.search(
+            r"\b(?:who|name|names|full\s+name|display|title|user|member|person|individual|"
+            r"posted\s+by|author|owner|customer)\b",
+            lowered,
+        )
+    )
+    if not asks_display:
+        return flags, suggestions, evidence
+    columns = [str(column) for column in df.columns]
+    display_pat = re.compile(
+        r"(?:^|_|(?<=[a-z]))(?:name|title|label|display|displayname|fullname|username|ownername|"
+        r"firstname|lastname)(?:$|_|(?=[A-Z]))",
+        flags=re.IGNORECASE,
+    )
+    id_pat = re.compile(
+        r"(?:^|_|(?<=[a-z]))(?:id|userid|ownerid|authorid|editorid|"
+        r"user_id|owner_id|author_id|editor_id|posted_by|postedby)(?:$|_|(?=[A-Z]))"
+        r"|link_to_\w+",
+        flags=re.IGNORECASE,
+    )
+    display_cols = [column for column in columns if display_pat.search(column)]
+    id_cols = [
+        column for column in columns if id_pat.search(column) and column not in display_cols
+    ]
+
+    blank_display_cols: list[str] = []
+    for column in display_cols:
+        try:
+            series = df[column]
+            sample = series.dropna().astype(str).str.strip()
+            non_blank = sample[sample != ""]
+            if len(non_blank) == 0:
+                blank_display_cols.append(column)
+        except Exception:
+            continue
+
+    def _id_samples() -> dict[str, list[str]]:
+        samples: dict[str, list[str]] = {}
+        for column in id_cols[:3]:
+            try:
+                values = [
+                    str(value)
+                    for value in df[column].dropna().astype(str).unique().tolist()[:5]
+                ]
+                if values:
+                    samples[column] = values
+            except Exception:
+                continue
+        return samples
+
+    if blank_display_cols:
+        id_samples = _id_samples()
+        flags.append("blank_display_needs_join")
+        sample_hint = (
+            f" Identifier values available to resolve through a join: {id_samples}."
+            if id_samples
+            else ""
+        )
+        suggestions.append(
+            f"The submitted result has blank display column(s) {blank_display_cols}; the question asks for a display/name. "
+            f"Join the related name/user/title table to resolve the display value before submitting."
+            + sample_hint
+        )
+        evidence.append(
+            {
+                "kind": "blank_display",
+                "blank_columns": blank_display_cols,
+                "id_columns": id_cols[:10],
+            }
+        )
+    elif not display_cols and id_cols:
+        id_samples = _id_samples()
+        flags.append("blank_display_needs_join")
+        suggestions.append(
+            f"The question asks for a display/name but the result only contains identifier column(s) {id_cols[:5]}. "
+            f"Join the lookup table to resolve a display/name column. Identifier samples: {id_samples}."
+        )
+        evidence.append(
+            {
+                "kind": "id_only_no_display",
+                "id_columns": id_cols[:10],
+                "id_samples": id_samples,
+            }
+        )
+    return flags, suggestions, evidence
+
+
+def _unit_time_granularity_critique(
+    question: str,
+    sql: str | None,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    flags: list[str] = []
+    suggestions: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    if not question or not sql:
+        return flags, suggestions, evidence
+    lowered_q = question.lower()
+    lowered_sql = sql.lower()
+    asks_monthly = bool(
+        re.search(r"\b(?:per\s+month|monthly|each\s+month|average\s+monthly|by\s+month)\b", lowered_q)
+    )
+    asks_annual = bool(
+        re.search(r"\b(?:per\s+year|annual|annually|each\s+year|yearly|by\s+year)\b", lowered_q)
+    )
+    sql_year_field = bool(re.search(r"\b\w*year\w*\b", lowered_sql))
+    sql_month_field = bool(re.search(r"\b\w*month\w*\b", lowered_sql))
+    sql_divide_12 = bool(re.search(r"/\s*12\b", lowered_sql))
+    sql_times_12 = bool(re.search(r"\*\s*12\b", lowered_sql))
+
+    if asks_monthly and sql_year_field and not sql_month_field and not sql_divide_12:
+        flags.append("unit_time_granularity_mismatch")
+        suggestions.append(
+            "The question asks for a monthly value but the SQL uses a year-level field without dividing by 12. "
+            "Use a month-level column if available, or convert the annual value to monthly explicitly."
+        )
+        evidence.append({"kind": "monthly_vs_annual"})
+    if asks_annual and sql_month_field and not sql_year_field and not sql_times_12:
+        flags.append("unit_time_granularity_mismatch")
+        suggestions.append(
+            "The question asks for an annual value but the SQL uses a month-level field without aggregating to year. "
+            "Sum the monthly values across the year or use an annual column."
+        )
+        evidence.append({"kind": "annual_vs_monthly"})
+    return flags, suggestions, evidence
+
+
+def _filter_audit_critique(
+    question: str,
+    sql: str | None,
+    df: pd.DataFrame | None,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    flags: list[str] = []
+    suggestions: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    if not question or not sql or not isinstance(df, pd.DataFrame):
+        return flags, suggestions, evidence
+    row_count = int(len(df))
+    if row_count <= 12:
+        return flags, suggestions, evidence
+    lowered_q = question.lower()
+    constraint_phrases = re.findall(
+        r"\b(?:more than|greater than|less than|fewer than|at least|at most|over|under|above|below|"
+        r"between|after|before|equal to|equals)\s+[^,;.?]{1,60}",
+        lowered_q,
+    )
+    if len(constraint_phrases) < 2:
+        return flags, suggestions, evidence
+    sql_clause_count = len(re.findall(r"\b(?:where|and|or)\b", (sql or "").lower()))
+    if sql_clause_count < len(constraint_phrases):
+        flags.append("filter_audit_missing_constraint")
+        suggestions.append(
+            f"The question lists {len(constraint_phrases)} constraint phrase(s) but the SQL only has "
+            f"{sql_clause_count} WHERE/AND/OR clause(s). Audit which constraints are translated to SQL "
+            f"and which remain unaccounted for before submitting detail rows."
+        )
+        evidence.append(
+            {
+                "kind": "constraint_count_mismatch",
+                "question_constraints": constraint_phrases[:6],
+                "where_count": sql_clause_count,
+                "row_count": row_count,
+            }
+        )
+    return flags, suggestions, evidence
+
+
 def _critique_submit_result(
     messages: list[BaseMessage],
     query_id: str,
@@ -307,7 +592,10 @@ def _critique_submit_result(
 
     if df is None or df.empty:
         flags.append("empty_submit_result")
-        suggestions.append("The submitted query is empty; revise filters or submit a previous non-empty query.")
+        date_hint = _empty_date_filter_hint(sql) or ""
+        suggestions.append(
+            "The submitted query is empty; revise filters or submit a previous non-empty query." + date_hint
+        )
     if asks_ratio and not operations["ratio"]:
         numeric_columns = [
             column
@@ -348,6 +636,19 @@ def _critique_submit_result(
     anchored_flags, anchored_suggestions, anchored_evidence = _anchored_lookup_flags(question, sql, df)
     flags.extend(anchored_flags)
     suggestions.extend(anchored_suggestions)
+    blank_display_flags, blank_display_suggestions, blank_display_evidence = _blank_display_critique(
+        question, df
+    )
+    flags.extend(blank_display_flags)
+    suggestions.extend(blank_display_suggestions)
+    unit_flags, unit_suggestions, unit_evidence = _unit_time_granularity_critique(question, sql)
+    flags.extend(unit_flags)
+    suggestions.extend(unit_suggestions)
+    filter_audit_flags, filter_audit_suggestions, filter_audit_evidence = _filter_audit_critique(
+        question, sql, df
+    )
+    flags.extend(filter_audit_flags)
+    suggestions.extend(filter_audit_suggestions)
 
     should_reject = any(
         flag in {
@@ -374,20 +675,34 @@ def _critique_submit_result(
         for flag in flags
     ):
         should_reject = True
+
+    p0_flags = [flag for flag in flags if flag in P0_REJECT_FLAGS]
+    if _p0_ratio_reject_enabled() and "ratio_question_without_ratio_evidence" in flags:
+        p0_flags.append("ratio_question_without_ratio_evidence")
+    p0_should_reject = bool(p0_flags) and _p0_gates_enabled()
+
     return {
         "query_id": query_id,
         "mode": _submit_critique_mode(),
         "flags": flags,
         "suggestions": suggestions,
         "should_reject": should_reject,
+        "p0_flags": p0_flags,
+        "p0_should_reject": p0_should_reject,
+        "p0_gates_enabled": _p0_gates_enabled(),
         "row_count": row_count,
         "column_count": column_count,
         "columns": columns[:20],
         "sql_operations": operations,
+        "sql_text": (sql or "")[:1000],
+        "question_text": question[:300],
         "grounding_evidence": grounding_evidence,
         "grounding_reject_enabled": _grounding_reject_enabled(),
         "anchored_lookup_evidence": anchored_evidence,
         "anchored_lookup_reject_enabled": _anchored_lookup_reject_enabled(),
+        "blank_display_evidence": blank_display_evidence,
+        "unit_time_granularity_evidence": unit_evidence,
+        "filter_audit_evidence": filter_audit_evidence,
     }
 
 
@@ -705,15 +1020,52 @@ class ExecuteSubmit:
                     sql = state["query_ids"][query_id].artifact["sql"]
                     df = state["query_ids"][query_id].artifact["df"]
                     critique = _critique_submit_result(state["messages"], query_id, sql, df)
-                    if critique["flags"]:
-                        submit_critiques.append(critique)
+                    if "empty_submit_result" in critique.get("flags", []):
+                        probe_results: list[dict[str, Any]] = []
+                        for qualified_col in _date_filter_qualified_columns(sql)[:2]:
+                            probe_sql = _build_date_probe_sql(sql, qualified_col)
+                            if not probe_sql:
+                                continue
+                            try:
+                                probe_res = _run_sql_query(
+                                    probe_sql,
+                                    con=self._connection,
+                                    sql_row_limit=5,
+                                    display_row_limit=5,
+                                    display_cell_char_limit=200,
+                                )
+                                csv_text = (probe_res.get("csv") or "").strip()
+                                if csv_text:
+                                    probe_results.append({"column": qualified_col, "samples_csv": csv_text})
+                                elif probe_res.get("error"):
+                                    probe_results.append(
+                                        {"column": qualified_col, "error": str(probe_res.get("error"))[:200]}
+                                    )
+                            except Exception as exc:
+                                probe_results.append({"column": qualified_col, "error": str(exc)[:200]})
+                        if probe_results:
+                            critique = {**critique, "empty_result_probe": probe_results}
+                            critique["suggestions"] = list(critique.get("suggestions", [])) + [
+                                "Probe results show the ACTUAL stored date format for the filtered column(s) "
+                                f"on the same FROM clause: {probe_results}. "
+                                "Rewrite the date literal in WHERE to match this format, re-run the ORIGINAL "
+                                "question's query via run_sql_query, then submit the new query result. "
+                                "Do not submit these probe samples."
+                            ]
+                    submit_critiques.append(critique)
                     mode = _submit_critique_mode()
                     already_rejected = any(
                         item.get("query_id") == query_id and item.get("action") == "reject"
                         for item in submit_critiques
                     )
-                    if mode == "reject" and critique["should_reject"] and not already_rejected:
-                        critique = {**critique, "action": "reject"}
+                    total_rejections = sum(
+                        1 for item in submit_critiques if item.get("action") == "reject"
+                    )
+                    p0_reject = critique.get("p0_should_reject") and total_rejections < _p0_max_rejections()
+                    mode_reject = mode == "reject" and critique["should_reject"]
+                    if (mode_reject or p0_reject) and not already_rejected:
+                        reject_source = "p0_gate" if p0_reject and not mode_reject else "mode_reject"
+                        critique = {**critique, "action": "reject", "reject_source": reject_source}
                         submit_critiques[-1:] = [critique] if submit_critiques else [critique]
                         tool_messages.append(
                             ToolMessage(

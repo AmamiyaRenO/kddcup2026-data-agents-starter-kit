@@ -569,3 +569,178 @@ Decision:
     tables/doc records; or
   - a better generic document-record extractor so IDs like `rec...` map to the actual display name
     instead of weak prose fragments.
+
+## Databao Internal Patch: P0 Submit Gates (v1)
+
+Date: 2026-05-14
+
+Patch location:
+
+- Clone: `D:\Data\_external\databao-agent` (graph helpers are now mirrored here for parity).
+- Files changed in this repository:
+  - `src/data_agent_baseline/_vendor/databao_patches/lighthouse_graph.py`
+  - `src/data_agent_baseline/_vendor/databao_patches/separate_graph.py`
+- `ensure_vendor_databao_patches()` copies these into `.venv\Lib\site-packages\databao\agent\executors\*\graph.py`
+  on every runner startup, so a fresh checkout is reproducible.
+
+Goal:
+
+- Move the ratio/percentage, empty-result, blank-display, and entity-ID validation gates from
+  shadow-only into actual submit rejections, while keeping the adapter ranking and final guard
+  unchanged. Adaptor observes and stabilizes; Databao reasons and repairs before submit.
+
+What changed:
+
+- New env knobs:
+  - `DATABAO_INTERNAL_P0_GATES` (default `1`) — master switch for the P0 reject path.
+  - `DATABAO_INTERNAL_P0_MAX_REJECTIONS` (default `3`) — per-task session-wide reject budget; the
+    existing one-rejection-per-query-id guard still applies.
+  - `DATABAO_INTERNAL_P0_RATIO_REJECT` (default `0`) — opt-in ratio gate (see below).
+- New `P0_REJECT_FLAGS` set (default): `empty_submit_result`, `blank_display_needs_join`,
+  `numeric_identifier_filter_needs_grounding`. Promoted to reject inside the lighthouse/separate
+  graph regardless of `DATABAO_INTERNAL_SUBMIT_CRITIQUE_MODE`.
+- New `_blank_display_critique`: when the question asks for a display/name and the submitted
+  DataFrame either has display columns that are all-blank, or only contains identifier columns,
+  Databao gets a rejection with the blank columns + identifier samples to resolve through a join.
+  Pattern matches both snake_case (`full_name`, `user_id`) and camelCase (`OwnerDisplayName`,
+  `OwnerUserId`, `LastEditorUserId`) columns.
+- Empty-result suggestion is augmented with a date-format hint when the failing SQL filters a
+  date/datetime-like column. Databao is told to inspect the column dtype and sample values before
+  re-submitting.
+- Shadow-only `_unit_time_granularity_critique` and `_filter_audit_critique` were added; they
+  record diagnostic flags but do not affect submit/reject.
+- Each reject record now includes `reject_source=p0_gate|mode_reject` for attribution.
+- **Critical fix**: `_latest_user_question` now strips the runner's system-instruction prefix,
+  returning only the text after the last `Question:` marker. Without this, the runner prompt's
+  `"Prefer display, name, title, or label columns..."` scaffolding spuriously triggered
+  `asks_display=True` on every task, firing the blank-display gate on non-display questions.
+
+Why ratio is opt-in (not default P0):
+
+- The adapter's `apply_aggregate_ratio_verifier` and friends already rescue count-detail submits
+  into scalar ratio/percentage candidates when Databao has produced the numerator-form table.
+- Forcing Databao to reject and re-submit a ratio query loses that rescue input. On `task_283`
+  (percentage of superheroes with blue eyes), the count-detail submit was a verifier-rescuable
+  shape; the first P0-with-ratio smoke produced a 21-row name list instead of the percentage.
+- Demoting ratio to opt-in restored the verifier path. The flag still fires as shadow for analysis.
+
+Why grounding/empty/blank-display ARE default P0:
+
+- `blank_display_needs_join`: cleanest signal in this smoke. Variance probe on `task_257` showed
+  3/3 matches with the gate firing; the model reliably joins the user table when told the relevant
+  identifier samples.
+- `numeric_identifier_filter_needs_grounding`: fires when Databao filters by a numeric ID not
+  present in the question. The model doesn't always revise correctly under Qwen3.5-35B-A3B, but
+  it fires alongside other flags and doesn't appear to make things worse in aggregate.
+- `empty_submit_result`: forces Databao to attempt a non-empty re-query. With the date-format
+  hint, the model has more context to retry. On `task_173` the model still failed to fix the
+  date literal in one shot, but the gate is correct in semantics and may help with stronger
+  models or with longer task budgets.
+
+Targeted validation (P0 gates enabled, all sweeps used the same Qwen3.5-35B-A3B):
+
+| Task | Baseline | Phase 2 | Reject fired | Notes |
+| --- | --- | --- | --- | --- |
+| `task_257` (variance probe 3x) | partial | 3/3 exact | `blank_display_needs_join` | Strong signal: gate consistently helps. |
+| `task_89` (variance probe 3x) | wrong row | 0/3 exact | `id_grounding`+`blank_display` | Qwen does not revise the guessed `raceId`; gate is correctly classifying but model can't act. |
+| `task_283` (variance probe 3x) | exact (variance) | 1/3 exact | mostly none (ratio demoted) | Verifier path is non-deterministic. Score variance is model-driven, not gate-driven. |
+| `task_200` | 1.0 | 1.0 | none | Confirms prompt-prefix fix: blank_display does not fire on count questions anymore. |
+
+Full sweeps (official `dabench evaluate-public-run`, same gold set):
+
+| Difficulty | Baseline avg | Phase 2 avg | Delta avg | Baseline exact | Phase 2 exact | Prediction |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| Easy   (`20260514T103419Z` → `20260514T151526Z`) | `0.800` | `0.800` | `+0.000` | `12/15` | `12/15` | `15/15` → `15/15` |
+| Medium (`20260514T103857Z` → `20260514T151940Z`) | `0.739` | `0.761` | `+0.022` | `17/23` | `17/23` | `23/23` → `23/23` |
+| Hard   (`20260514T045138Z` → `20260514T153026Z`) | `0.382` | `0.545` | `+0.163` | `4/11`  | `6/11`  | `9/11`  → `11/11` |
+
+Decision:
+
+- Keep P0 gates default-on. Net positive across Easy/Medium/Hard, with the largest gain on Hard
+  (where Databao previously left the most "almost-right" submits on the table).
+- Keep ratio reject opt-in. Re-evaluate once a stronger model or a Databao-internal numerator/
+  denominator inspector exists.
+- Empty-result gate stays default-on. It does not regress current results and provides clearer
+  retry signals for the model.
+
+Next internal directions:
+
+1. Make grounding/blank-display reject feedback more actionable by also including small candidate
+   join paths derived from registered table column families (e.g. "`Owner.Id` → `Users.Id`").
+2. Add a real Databao-internal lookup tool that resolves `link_to_*` and `*_id` values to a
+   display column without round-tripping through the LLM. The current critique points the model
+   at the right column but relies on Databao to write the SQL.
+3. Re-test ratio reject when adapter ratio verifier is moved into Databao as well, so the two
+   paths do not contend for the same rescue input.
+
+## Databao Internal Patch: Empty-Result Date Probe (Stage 2.1)
+
+Date: 2026-05-15
+
+Patch location:
+
+- `src/data_agent_baseline/_vendor/databao_patches/lighthouse_graph.py`
+- `src/data_agent_baseline/_vendor/databao_patches/separate_graph.py` (helpers only;
+  executor-side probe wiring is currently lighthouse only because that is the default executor).
+
+What changed:
+
+- When the `empty_submit_result` gate fires, the executor automatically runs
+  `SELECT DISTINCT <date_col> FROM <same FROM clause> LIMIT 5` against any column in the failing
+  SQL that is compared with a date/datetime literal. The real samples are embedded in the reject
+  ToolMessage so Databao can fix the date literal format on its next retry.
+- Helpers added:
+  - `_date_filter_qualified_columns(sql)` — extracts qualified column references that participate
+    in a date-like comparison. Pattern matches `column_with_date_or_time_or_month_or_year_keyword`
+    followed by a comparison operator.
+  - `_extract_from_clause(sql)` — extracts the FROM/JOIN clause from the original SQL.
+  - `_build_date_probe_sql(original_sql, qualified_col)` — composes `SELECT DISTINCT col FROM
+    <from_clause> LIMIT 5`.
+- The reject suggestion is now more directive: it tells Databao to rewrite the original query's
+  date literal using the probe samples and explicitly says "do not submit these probe samples".
+- The critique record now always includes the raw `sql_text` and `question_text`. This is
+  diagnostic-only; the always-record change replaces the previous "append only if flags" rule so
+  empty-flag submits are still visible in artifacts for analysis.
+
+Probe trace from `task_173` (June 2013 transactions question):
+
+| Step | Detail |
+| --- | --- |
+| Initial submit | `SELECT DISTINCT gs.Country ... WHERE t.Date >= '2013-06-01' AND t.Date <= '2013-06-30'` (empty) |
+| Probe | `SELECT DISTINCT t.Date FROM db_transactions_1k.transactions_1k t JOIN temp.main.json_gasstations gs ON ... LIMIT 5` |
+| Probe samples | `2012-08-23, 2012-08-24, 2012-08-25, 2012-08-26` |
+| Lesson | The 1k subsample only covers August 2012; June 2013 transactions are not present in that table. |
+| Revised submit | Databao pivoted to `temp.main.csv_yearmonth` joined with gas stations on the right date, returning `CZE, SVK`. Exact match. |
+
+This is the cleanest "Databao reasons and repairs before submit" outcome so far: the probe gave
+Databao evidence that the named SQL source was wrong, and it switched data sources on its own.
+
+Decisions:
+
+- Keep the empty-result probe default-on (`DATABAO_INTERNAL_P0_GATES=1`).
+- Skip `unit_time_granularity_mismatch` P0 promotion. The `task_169` failure is benchmark-specific
+  (gold computes `AVG(Consumption) / 12` even though the table already stores monthly rows);
+  rejecting on a generic monthly/year detector would also kill legitimate per-row monthly
+  interpretations.
+- Skip `numeric_code_filter_needs_value_grounding` P0 promotion. On `task_11` the model failed at
+  mapping "severe degree" to the right code despite knowledge.md providing the explicit mapping.
+  A reject would only echo the same reasoning step the model already failed.
+- Skip multi-constraint filter-audit promotion. `task_180` failed because the audit regex did not
+  recognise the implicit `product id=5` + `August 2012` constraints. Broadening the regex would
+  introduce many false positives on legitimate detail-row outputs.
+
+Full sweep deltas (official `dabench evaluate-public-run`):
+
+| Difficulty | Stage 1 avg | Stage 2 avg | Stage 1 exact | Stage 2 exact | Notes |
+| --- | ---: | ---: | --- | --- | --- |
+| Easy   | `0.800` | `0.717` | `12/15` | `10/15` | Two losses (`task_27`, `task_86`) are adapter/model variance — same submitted SQL, different candidate selected. |
+| Medium | `0.761` | `0.826` | `17/23` | `19/23` | Gains: `task_173` (probe-driven source pivot), `task_257` (blank-display gate). `task_199` regression is model variance with zero rejects. |
+| Hard   | `0.545` | `0.545` | `6/11`  | `6/11`  | No net change. |
+
+Across all 49 tasks, exact count is preserved at 35/49 while column coverage improves slightly.
+The probe is the load-bearing architectural change; the rest of the deltas are within model
+variance on a single run.
+
+Next directions remain the same: an internal lookup tool for `link_to_*`/`*_id` resolution and
+better grounding evidence in critique suggestions would unlock the `task_89`/`task_344`/`task_408`
+family where the gate fires but the model cannot self-correct.
