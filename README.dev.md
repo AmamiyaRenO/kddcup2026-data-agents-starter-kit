@@ -700,3 +700,15 @@ High-yield generic cleanup follow-up:
   - Hard `20260514T105041Z`: prediction `11/11`, exact `6/11`, avg `0.545`.
 - Decision: keep this patch. It is the best recent score/complexity tradeoff: broad enough to help
   multiple tasks, but conservative enough to avoid source-row semantic rewrites.
+
+Vendored Databao patch:
+
+- The modified Databao graph files are now stored inside this repository under
+  `src/data_agent_baseline/_vendor/databao_patches/`.
+- `build_databao_agent()` and the Lighthouse salvage executor call `ensure_vendor_databao_patches()`
+  before importing/constructing Databao internals. The function copies the vendored graph files into
+  the active installed `databao` package when they differ.
+- Default behavior is to apply these patches. Set `DATABAO_APPLY_VENDOR_PATCHES=0` only for
+  debugging against the unmodified upstream PyPI package.
+- This makes a fresh checkout reproduce the local Databao behavior without manually copying files
+  into `.venv`.

@@ -59,6 +59,7 @@ from data_agent_baseline.run.databao_demo import (
     run_databao_tasks,
     validate_answer_contract,
 )
+from data_agent_baseline.run.databao_vendor import ensure_vendor_databao_patches
 from data_agent_baseline.tools.public_eval import evaluate_public_task
 
 
@@ -284,6 +285,15 @@ class DatabaoDemoTests(unittest.TestCase):
         )
         self.assertTrue(observation["submit_critiques"][0]["no_submit"])
         self.assertEqual(observation["code_observation"]["code_kind"], "sql")
+
+    def test_vendor_databao_patch_is_available(self) -> None:
+        result = ensure_vendor_databao_patches()
+
+        from databao.agent.executors.lighthouse import graph
+
+        self.assertEqual(result["enabled"], "true")
+        self.assertTrue(hasattr(graph, "_anchored_lookup_flags"))
+        self.assertTrue(hasattr(graph, "_no_submit_critique"))
 
     def test_databao_state_has_salvageable_frame_accepts_previous_non_empty_result(self) -> None:
         self.assertFalse(_databao_state_has_salvageable_frame({"df": None}))

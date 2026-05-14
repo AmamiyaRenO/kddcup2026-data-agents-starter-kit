@@ -21,6 +21,7 @@ from sqlalchemy import create_engine
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.benchmark.schema import PublicTask
+from data_agent_baseline.run.databao_vendor import ensure_vendor_databao_patches
 from data_agent_baseline.run.runner import create_run_id, resolve_run_id
 
 MODEL_API_URL_ENV = "MODEL_API_URL"
@@ -6479,6 +6480,7 @@ def _databao_state_has_salvageable_frame(state: Any) -> bool:
 
 
 def _make_lighthouse_salvage_executor() -> Any:
+    ensure_vendor_databao_patches()
     from databao.agent.core import ExecutionResult
     from databao.agent.core.executor import OutputModalityHints
     from databao.agent.executors.lighthouse.executor import LighthouseExecutor
@@ -6614,6 +6616,7 @@ def choose_route_policy(
 
 
 def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> Any:
+    ensure_vendor_databao_patches()
     import databao.agent as bao
 
     domain = bao.domain()
