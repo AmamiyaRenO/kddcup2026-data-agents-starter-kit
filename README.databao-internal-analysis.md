@@ -808,10 +808,68 @@ remains the durable structural win from Stage 2.
 
 Next plausible directions if grounding probe is revisited:
 
-1. Resolve `*Id`-suffix columns against an external entity-lookup table (e.g. `raceId` → `races`)
-   even when that table is not in the failing SQL's FROM clause; this requires schema-graph
-   integration outside the Databao graph.
+1. Resolve `*Id`-suffix columns against an external entity-lookup table even when that table is
+   not in the failing SQL's FROM clause; this requires schema-graph integration outside the
+   Databao graph.
 2. Shorten the reject suggestion so the model is not flooded with raw CSV; consider compressing
-   probe results into a one-line summary (`raceId=34 → name='Spanish Grand Prix', year=2008`).
+   probe results into a one-line summary like `<id_col>=<value> → name='X', year=Y`.
 3. Skip the distinct-domain probe by default (heavier output, lower hit rate); only run the
    match-row probe.
+
+## Variance Probe Outcome (Stop Decision)
+
+Date: 2026-05-15
+
+Setup:
+
+- Same code as `f8de993` (P0 gates default-on, empty-result probe default-on, grounding probe
+  opt-in default-off, ratio reject opt-in default-off).
+- Three full Easy/Medium/Hard sweeps. Scoring uses the official `evaluate_public_run` column
+  signatures with `normalize_cell` (numeric tolerance for `"1"` vs `"1.0"`).
+
+Per-sweep exact counts:
+
+| Difficulty | n | Run A | Run B | Run C | Mean | Stdev | Range |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Easy   | 15 | `13` | `12` | `12` | `12.33` | `0.58` | `[12-13]` |
+| Medium | 23 | `16` | `14` | `17` | `15.67` | `1.53` | `[14-17]` |
+| Hard   | 11 | `5`  | `6`  | `4`  | `5.00`  | `1.00` | `[4-6]`  |
+| **Total** | **49** | **34** | **32** | **33** | **33.0** | **1.0** | **[32-34]** |
+
+Per-task stability:
+
+- **Stable wins (3/3)**: 11 Easy, 12 Medium, 3 Hard. 26 tasks consistently right.
+- **Stable losses (0/3)**:
+  - Easy: `task_11`, `task_89`
+  - Medium: `task_163`, `task_169`, `task_173`, `task_180`
+  - Hard: `task_344`, `task_355`, `task_379`, `task_396`, `task_408`
+- **Flaky (1-2/3)**: 2 Easy (`task_19`, `task_80`), 7 Medium (`task_199`, `task_200`, `task_214`,
+  `task_218`, `task_250`, `task_257`, `task_283`), 3 Hard (`task_330`, `task_415`, `task_420`).
+
+Lessons used for the stop decision:
+
+1. Many earlier "Stage X improved by N tasks" claims fell inside the run-to-run variance window.
+   Stage 2 Medium 19/23 was the lucky high (mean 15.67); Stage 2 Hard 6/11 was on the high side
+   too (mean 5.00). The probe-driven `task_173` pivot was a Stage-2 outlier and did not
+   reproduce in any of the 3 probe runs.
+2. Stable losses are model-reasoning limited or data-limited:
+   - `task_11`: categorical mapping ignores knowledge.md mapping.
+   - `task_89`: entity-ID lookup table not in SQL FROM.
+   - `task_163`, `task_169`: benchmark-specific aggregate/granularity semantics.
+   - `task_173`: subsampled table doesn't cover the asked time range.
+   - `task_180`: multi-constraint coverage.
+   - Hard family: no-submit / wrong-percentage-formula / ordinal-per-group.
+3. Best plausible single-iteration gain from re-trying the grounding probe with compressed
+   output is +1-2 tasks on stable losses, with risk of re-introducing the Stage-3 timeouts.
+   That expected delta is well inside the ±1 stdev variance band.
+4. Competition is a single-shot submission; the submitted run will be a random sample from this
+   distribution. Stabilising the existing pipeline is more valuable than chasing edge gains.
+
+Decision:
+
+- Stop at commit `f8de993` for this development branch. Document variance honestly so future
+  iterations don't chase phantom improvements.
+- Next real lift requires either (a) a stronger upstream model, (b) ensemble across multiple
+  runs (not permitted by competition single-shot rules), or (c) a Databao-internal schema-graph
+  lookup that can reach `csv_races`-style entity tables outside the failing SQL's FROM clause.
+  All three are out of scope for incremental P0-gate work.
