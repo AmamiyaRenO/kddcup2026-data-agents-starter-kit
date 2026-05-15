@@ -1555,13 +1555,20 @@ def register_context_sources(
         domain.add_description(retrieved_description)
         summary["document_files"].append("retrieved_document_snippets")
 
+    # Always register knowledge.md if it exists, even when retrieval produced
+    # snippets. Retrieval can miss the key disambiguation sentence (e.g. a
+    # categorical value mapping that does not literally appear in the question),
+    # and knowledge.md is small (~5 KB on the public set) so the token cost is
+    # bounded.
     knowledge_path = context_dir / "knowledge.md"
-    if retrieved_context is None and knowledge_path.exists():
+    if knowledge_path.exists():
         domain.add_description(
             _description_from_file(knowledge_path, context_dir, max_chars=description_max_chars)
         )
         summary["document_files"].append(_relative_posix(knowledge_path, context_dir))
 
+    # For ``doc/`` files we still defer to retrieval when present, because
+    # individual doc files can be much larger (10s of KB) than knowledge.md.
     doc_dir = context_dir / "doc"
     if retrieved_context is None and doc_dir.is_dir():
         for path in sorted(item for item in doc_dir.rglob("*") if item.is_file()):
@@ -6663,7 +6670,9 @@ def _build_question_prompt(task: PublicTask) -> str:
         "If the question asks for a list of entities, return exactly one column.\n"
         "If the question asks for a table with multiple attributes, return only the explicitly requested attributes.\n"
         "Prefer display, name, title, or label columns for entity answers unless the question explicitly asks for ID or code.\n"
-        "Never output metadata or debug columns.\n\n"
+        "Never output metadata or debug columns.\n"
+        "If the registered documentation defines mappings between natural-language labels and numeric codes, use those mappings exactly.\n"
+        "For ratio or percentage questions, compute the ratio in one query; do not submit a numerator count alone.\n\n"
         f"Question: {task.question}"
     )
 
