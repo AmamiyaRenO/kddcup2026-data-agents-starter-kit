@@ -1001,3 +1001,69 @@ What stays in production:
 
 Cleanup diff: 412 deletions / 0 insertions across `lighthouse_graph.py` and `separate_graph.py`.
 Default behavior unchanged (verified on smoke and 100/100 unit tests).
+
+## Adapter Fix: Always Include knowledge.md + Proactive Prompt Hints
+
+Date: 2026-05-15
+
+Patch location:
+
+- `src/data_agent_baseline/run/databao_demo.py` — `register_context_sources` and
+  `_build_question_prompt`.
+
+What changed:
+
+1. `register_context_sources` previously skipped `knowledge.md` whenever `retrieved_context`
+   produced any snippet (line 1559 had `if retrieved_context is None and knowledge_path.exists():`).
+   The assumption was that retrieval is a strict superset of the document, but retrieval can
+   miss the key disambiguation sentence — for example, a categorical-value mapping that does
+   not literally appear in the question's text never gets ranked into the top retrieved
+   snippets. The model then never sees the mapping. knowledge.md is ~5 KB on the public set, so
+   the token cost is bounded; always include it alongside retrieval snippets.
+
+   `doc/` files (which can be tens of KB on some tasks) remain under retrieval control to avoid
+   blowing the prompt budget.
+
+2. `_build_question_prompt` got two proactive bullets after the existing shape rules:
+
+   ```
+   If the registered documentation defines mappings between natural-language labels and
+   numeric codes, use those mappings exactly.
+   For ratio or percentage questions, compute the ratio in one query; do not submit a
+   numerator count alone.
+   ```
+
+   An earlier 8-bullet rewrite was tried first and produced destabilized outputs on the weaker
+   Qwen3.5-35B-A3B (e.g. `task_89` returning 15 rows instead of 1). Pared back to the two
+   highest-impact bullets that do not contradict the existing one-row/one-column shape rules.
+
+3-run variance probe vs the probe-OFF baseline (same official `evaluate_public_run` scoring):
+
+| Difficulty | Baseline mean | New mean | Δ | Baseline stdev | New stdev |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Easy   | `12.33` | `13.67` | `+1.34` | `0.58` | `0.58` |
+| Medium | `15.67` | `15.67` | `+0.00` | `1.53` | `0.58` |
+| Hard   | `5.00`  | `5.00`  | `+0.00` | `1.00` | `1.00` |
+| **Total** | **33.00** | **34.33** | **+1.33** | — | — |
+
+Both improvements are real signal:
+
+- Easy mean delta `+1.34` is larger than the Easy stdev (`0.58`), clearing the variance band.
+- Medium stdev collapsed from `1.53` to `0.58`. The pipeline is now substantially more stable
+  on Medium even though its mean is unchanged — fewer tasks flip between sweeps.
+
+Per-task stability shifts across the three sweeps (baseline trio vs new trio):
+
+- Gains: `task_19` (2/3 → 3/3), `task_80` (2/3 → 3/3), `task_89` (0/3 → 2/3 — the only stable
+  loss converted), `task_200` (1/3 → 3/3), `task_257` (1/3 → 3/3), `task_330` (2/3 → 3/3).
+- Losses: `task_196` (3/3 → 1/3), `task_199` (1/3 → 0/3), `task_283` (2/3 → 1/3), `task_420`
+  (2/3 → 1/3).
+- Net `+9 / -5 = +4` task-runs across 3 sweeps, matching the mean `Δ +1.33`.
+
+The biggest single shift is `task_89`. The prompt hint about consulting documentation
+mappings, combined with knowledge.md always being in the prompt, lets the model resolve the
+entity-ID family that the schema-graph probe never reliably cracked.
+
+`task_196` regression suggests the ratio bullet is over-aggressive for the "average of a ratio
+of counts" family. Worth examining if a future iteration shortens or qualifies that bullet,
+but the current net delta is clearly positive.
