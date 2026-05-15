@@ -117,6 +117,21 @@ def _grounding_probe_enabled() -> bool:
     }
 
 
+def _schema_graph_probe_enabled() -> bool:
+    # Off by default while we validate against variance baseline. When on, the
+    # grounding probe looks for candidate lookup tables across all registered
+    # sources via ``information_schema.columns`` (not just tables in the
+    # failing SQL's FROM clause) and emits compressed one-line probe summaries
+    # to avoid the Stage 3 timeout regression caused by verbose raw-CSV
+    # suggestions.
+    return os.environ.get("DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _latest_user_question(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -413,6 +428,146 @@ def _build_grounding_probe_sql(table: str, column: str, raw_value: str) -> str:
 
 def _build_distinct_domain_probe_sql(table: str, column: str) -> str:
     return f'SELECT DISTINCT "{column}" FROM {table} ORDER BY "{column}" LIMIT 20'
+
+
+_INFORMATION_SCHEMA_CACHE: dict[int, dict[str, list[str]]] = {}
+
+
+def _information_schema_columns(connection: Any) -> dict[str, list[str]]:
+    """Enumerate ``schema.table -> [column...]`` for every registered table.
+
+    The result is cached per connection id so repeated probes do not re-query
+    DuckDB metadata. Returns an empty dict on any failure (probe is best
+    effort).
+    """
+
+    cache_key = id(connection)
+    cached = _INFORMATION_SCHEMA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    result: dict[str, list[str]] = {}
+    try:
+        cursor = connection.execute(
+            "SELECT table_catalog, table_schema, table_name, column_name "
+            "FROM information_schema.columns "
+            "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+            "ORDER BY table_catalog, table_schema, table_name, ordinal_position"
+        )
+        rows = cursor.fetchall()
+    except Exception:
+        _INFORMATION_SCHEMA_CACHE[cache_key] = result
+        return result
+    for catalog, schema, table, column in rows:
+        if not table or not column:
+            continue
+        parts = [str(p) for p in (catalog, schema, table) if p]
+        # Skip the leading catalog if it is the DuckDB default ("memory" / "temp")
+        # and the schema is unique enough; we still want both schema-qualified
+        # and bare names available for matching.
+        qualified = ".".join(parts)
+        result.setdefault(qualified, []).append(str(column))
+    _INFORMATION_SCHEMA_CACHE[cache_key] = result
+    return result
+
+
+def _find_lookup_tables(
+    connection: Any,
+    column: str,
+    exclude_tables: set[str],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """Find candidate lookup tables that have ``column`` defined.
+
+    Tables already used in the failing SQL's FROM clause are excluded so the
+    probe targets entity/lookup tables outside that scope.
+    """
+
+    if not column:
+        return []
+    catalog = _information_schema_columns(connection)
+    excluded_lower = {t.lower() for t in exclude_tables}
+    excluded_short = {t.split(".")[-1].lower() for t in exclude_tables}
+    column_lower = column.lower()
+    candidates: list[tuple[int, str]] = []
+    for table, columns in catalog.items():
+        if any(col.lower() == column_lower for col in columns):
+            table_lower = table.lower()
+            short = table.split(".")[-1].lower()
+            if table_lower in excluded_lower or short in excluded_short:
+                continue
+            # Prefer tables whose name starts with the column's stem
+            # (e.g. an "<entity>Id" column maps to its "<entity>s" table);
+            # fall back to alphabetical.
+            score = 0
+            stem = re.sub(r"(_id|Id)$", "", column).lower()
+            if stem and (short.startswith(stem) or stem.startswith(short.rstrip("s"))):
+                score -= 100
+            # Prefer tables that ALSO carry a display-like column (name/title/...)
+            if any(
+                re.search(r"(?i)(?:^|_)(?:name|title|label|display)(?:$|_)", col)
+                for col in columns
+            ):
+                score -= 10
+            candidates.append((score, table))
+    candidates.sort()
+    return [table for _, table in candidates[:limit]]
+
+
+def _select_key_columns(row: dict[str, Any]) -> dict[str, str]:
+    """Pick display-like columns from a row for a one-liner summary.
+
+    Always prefers ``name``, ``title``, ``label``, ``display_name``, ``year``,
+    ``date`` etc. If none are present, fall back to the first three non-id
+    non-blank columns.
+    """
+
+    preferred: dict[str, str] = {}
+    fallback: dict[str, str] = {}
+    preferred_keywords = ("name", "title", "label", "display", "year", "date")
+    for col, val in row.items():
+        if val is None:
+            continue
+        value_str = str(val).strip()
+        if not value_str or value_str.lower() in {"none", "nan"}:
+            continue
+        if len(value_str) > 60:
+            value_str = value_str[:57] + "..."
+        col_lower = str(col).lower()
+        if any(kw in col_lower for kw in preferred_keywords):
+            preferred[str(col)] = value_str
+        elif not re.search(r"(?:^|_)id(?:$|_)|^id$|Id$|link_to_", str(col)):
+            if len(fallback) < 3:
+                fallback[str(col)] = value_str
+    if preferred:
+        # Limit to 3 keys to keep the line short
+        return dict(list(preferred.items())[:3])
+    return fallback
+
+
+def _format_probe_one_liner(table: str, column: str, value: str, row: dict[str, Any] | None) -> str:
+    """Compress a probe row into a single descriptive line."""
+
+    if not row:
+        return f"{column}={value} → {table}: no matching row"
+    key_cols = _select_key_columns(row)
+    if not key_cols:
+        return f"{column}={value} → {table}: row exists (no display columns identified)"
+    pieces = [f"{k}='{v}'" for k, v in key_cols.items()]
+    return f"{column}={value} → {table}: " + ", ".join(pieces)
+
+
+def _from_tables_in_sql(sql: str | None) -> set[str]:
+    """Return all distinct table references (including aliases) in FROM/JOIN."""
+
+    if not sql:
+        return set()
+    matches = re.findall(
+        r"\b(?:from|join)\s+(?P<table>(?:[A-Za-z_][\w.]*|`[^`]+`|\"[^\"]+\"))",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return {t.strip("`\"") for t in matches}
 
 
 def _date_filter_qualified_columns(sql: str | None) -> list[str]:
@@ -1105,14 +1260,92 @@ class ExecuteSubmit:
                     sql = state["query_ids"][query_id].artifact["sql"]
                     df = state["query_ids"][query_id].artifact["df"]
                     critique = _critique_submit_result(state["messages"], query_id, sql, df)
-                    grounding_flags_present = _grounding_probe_enabled() and any(
+                    schema_probe_on = _schema_graph_probe_enabled()
+                    legacy_probe_on = _grounding_probe_enabled() and not schema_probe_on
+                    grounding_flags_present = (schema_probe_on or legacy_probe_on) and any(
                         flag in critique.get("flags", [])
                         for flag in (
                             "numeric_identifier_filter_needs_grounding",
                             "numeric_code_filter_needs_value_grounding",
                         )
                     )
-                    if grounding_flags_present:
+                    if schema_probe_on and grounding_flags_present:
+                        question_lower = (critique.get("question_text") or "").lower()
+                        question_numbers = _question_numeric_groundings(question_lower)
+                        from_tables = _from_tables_in_sql(sql)
+                        one_liners: list[str] = []
+                        ground_probes: list[dict[str, Any]] = []
+                        for equality in _grounding_qualified_equalities(sql)[:3]:
+                            if equality.get("value_kind") != "numeric":
+                                continue
+                            value = equality.get("value") or ""
+                            normalized = value[:-2] if value.endswith(".0") else value
+                            if normalized in question_numbers:
+                                continue
+                            column = equality["column"]
+                            raw_value = equality["raw_value"]
+                            # First: probe the alias-resolved FROM table (whatever the SQL is
+                            # actually filtering against).
+                            primary_table = _resolve_alias_to_table(sql, equality.get("alias"))
+                            primary_row: dict[str, Any] | None = None
+                            if primary_table:
+                                try:
+                                    res = _run_sql_query(
+                                        _build_grounding_probe_sql(primary_table, column, raw_value),
+                                        con=self._connection,
+                                        sql_row_limit=1,
+                                        display_row_limit=1,
+                                        display_cell_char_limit=120,
+                                    )
+                                    if res.get("df") is not None and len(res["df"]) > 0:
+                                        primary_row = res["df"].iloc[0].to_dict()
+                                except Exception:
+                                    pass
+                                one_liners.append(
+                                    _format_probe_one_liner(primary_table, column, raw_value, primary_row)
+                                )
+                            # Second: cross-table lookup via information_schema. Skips tables
+                            # already in FROM so we surface entity/lookup tables outside the
+                            # failing SQL's scope.
+                            for lookup_table in _find_lookup_tables(
+                                self._connection,
+                                column,
+                                exclude_tables=from_tables,
+                                limit=2,
+                            ):
+                                lookup_row: dict[str, Any] | None = None
+                                try:
+                                    res = _run_sql_query(
+                                        _build_grounding_probe_sql(lookup_table, column, raw_value),
+                                        con=self._connection,
+                                        sql_row_limit=1,
+                                        display_row_limit=1,
+                                        display_cell_char_limit=120,
+                                    )
+                                    if res.get("df") is not None and len(res["df"]) > 0:
+                                        lookup_row = res["df"].iloc[0].to_dict()
+                                except Exception:
+                                    pass
+                                one_liners.append(
+                                    _format_probe_one_liner(lookup_table, column, raw_value, lookup_row)
+                                )
+                            ground_probes.append(
+                                {
+                                    "column_ref": f"{equality.get('alias')+'.' if equality.get('alias') else ''}{column}",
+                                    "filter_value": raw_value,
+                                    "primary_table": primary_table,
+                                }
+                            )
+                        if one_liners:
+                            critique = {**critique, "schema_graph_probes": one_liners}
+                            critique["suggestions"] = list(critique.get("suggestions", [])) + [
+                                "Schema-graph grounding probe: "
+                                + " | ".join(one_liners[:5])
+                                + " — compare each match against the question's entity/value. "
+                                "If the matched row's name/year/date does not align with the question, "
+                                "rewrite the SQL with the correct ID by joining the entity table."
+                            ]
+                    elif legacy_probe_on and grounding_flags_present:
                         question_lower = (critique.get("question_text") or "").lower()
                         question_numbers = _question_numeric_groundings(question_lower)
                         ground_probes: list[dict[str, Any]] = []

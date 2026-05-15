@@ -871,5 +871,103 @@ Decision:
   iterations don't chase phantom improvements.
 - Next real lift requires either (a) a stronger upstream model, (b) ensemble across multiple
   runs (not permitted by competition single-shot rules), or (c) a Databao-internal schema-graph
-  lookup that can reach `csv_races`-style entity tables outside the failing SQL's FROM clause.
+  lookup that can reach entity-lookup tables outside the failing SQL's FROM clause.
   All three are out of scope for incremental P0-gate work.
+
+## Databao Internal Patch: Schema-Graph Lookup Probe (Opt-in)
+
+Date: 2026-05-15
+
+Patch location:
+
+- `src/data_agent_baseline/_vendor/databao_patches/lighthouse_graph.py`
+
+What was added:
+
+- `DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE` (default `0`). When enabled, the grounding probe path
+  now uses DuckDB's `information_schema.columns` to find candidate lookup tables for an
+  ungrounded numeric equality, even when those tables are NOT in the failing SQL's FROM clause.
+  This is the direct response to the Stage 3 finding that the previous grounding probe could
+  only reach tables already referenced in the failing SQL.
+- New helpers:
+  - `_information_schema_columns(connection)` — enumerates all `catalog.schema.table -> [columns]`
+    via DuckDB metadata. Cached per-connection.
+  - `_find_lookup_tables(connection, column, exclude_tables, limit)` — returns candidate tables
+    that contain ``column`` and are not already in the failing SQL's FROM clause. Prefers tables
+    whose name matches the column's stem (e.g. an `<entity>Id` column prefers the `<entity>s`
+    table) and tables that also expose a display-like column (name/title/label/display).
+  - `_select_key_columns(row)` — picks display-like columns (name/title/year/date/...) from a
+    probe row for the one-liner summary. Falls back to the first 3 non-id non-blank columns.
+  - `_format_probe_one_liner(table, column, value, row)` — compresses a match row into a
+    single descriptive line such as ``<id_col>=<value> → <table>: name='...', year='...'``.
+  - `_from_tables_in_sql(sql)` — gathers all table references in FROM/JOIN so the cross-table
+    lookup can exclude them.
+- The reject suggestion is now one short paragraph composed of one-liner probe results joined
+  with ``|``. This replaces the verbose raw CSV that caused the Stage 3 timeouts.
+
+Smoke validation (`DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE=1`):
+
+| Task | Probe found | Match | Notes |
+| --- | --- | --- | --- |
+| `task_89` | `raceId=34 → temp.main.json_races: year='2008', name='<entity>', date='2008-10-19'` | `False` | Probe correctly surfaced the lookup row from a table NOT in FROM. The ID was actually right; the wrong answer was a semantic interpretation of "finish time" (gap vs absolute). |
+| `task_86` | `driverId=62 → temp.main.json_drivers: forename='Alex', surname='Yoong'` | `True`  | Probe reached the drivers lookup table; submission preserved exact score. |
+| `task_257` | (only `blank_display_needs_join` flag, schema-graph probe path not triggered) | `True`  | Match from the existing blank-display gate alone. |
+| `task_11` | `Thrombosis=3 → temp.main.json_Examination: ...` | `False` | Probe surfaced a matching row, but the categorical mapping ("severe" → which code) is a model-reasoning failure, not a missing-evidence failure. |
+
+3-run variance probe (probe ON vs probe OFF on the same code base):
+
+| Difficulty | Probe OFF mean | Probe ON mean | Δ mean | Probe OFF stdev | Probe ON stdev |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Easy   | `12.33` | `11.33` | `-1.00` | `0.58` | `1.15` |
+| Medium | `15.67` | `16.33` | `+0.67` | `1.53` | `1.15` |
+| Hard   | `5.00`  | `4.67`  | `-0.33` | `1.00` | `0.58` |
+| **Total** | **33.00** | **32.33** | **-0.67** | — | — |
+
+Per-task changes (3 sweeps each):
+
+- Wins (probe ON > probe OFF): `task_200`, `task_214`, `task_218`, `task_250`, `task_257`,
+  `task_420` — most of these are flaky tasks moving to 3/3 wins, but the gains are within the
+  variance band rather than a clean structural fix.
+- Losses (probe ON < probe OFF): `task_75` (3/3 → 1/3), `task_350` (3/3 → 1/3), `task_80`,
+  `task_194`, `task_199`, `task_283`. Inspection of `task_75` showed the OFF run used a proper
+  ``JOIN`` (no ungrounded equality) while the ON run took a shorter ``WHERE driverId = 8`` path
+  that triggered probe — i.e. the loss is from the model picking a different SQL path, not from
+  the probe degrading a known-good submit.
+
+Decision:
+
+- Keep `DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE` default `0`. The probe is mechanically correct and
+  occasionally lands the right cross-table lookup, but on this corpus the per-task wins balance
+  the per-task losses inside the ±1 stdev variance window.
+- Do NOT remove or simplify the adapter-side `resolve_identifier_columns`, ratio verifier, or
+  salvaged-result repair functions. The schema-graph probe was the architecturally cleanest
+  candidate to replace them inside Databao, and it does not reliably do so on this model. Those
+  adapter functions remain load-bearing rescue paths.
+- For competition single-shot submission, leave the probe OFF: probe-OFF distribution has a
+  slightly higher mean (33.00 vs 32.33) and a higher floor (worst-case 32 vs 30).
+- Keep the implementation in the tree so future iterations (stronger model, finer reject
+  gating, dedicated blank-display probe variant) can opt in via env var without re-implementing
+  the helpers.
+
+Adapter audit (informational):
+
+| Adapter function | Could be Databao? | Status |
+| --- | --- | --- |
+| `resolve_identifier_columns` | Yes (schema-graph probe variant) | **Keep**: schema-graph probe does not reliably replace it. |
+| `apply_aggregate_ratio_verifier` | Yes (P0 ratio reject) | **Keep**: ratio reject is opt-in because it conflicts with this verifier. |
+| `apply_salvaged_boolean_percentage_compactor` | Yes (Databao salvaged result handling) | **Keep**: salvages a useful intermediate that Databao itself sometimes drops. |
+| `apply_salvaged_detail_count_compactor` | Yes | **Keep**: same reason. |
+| `apply_databao_observed_detail_aggregate_compactor` | Yes | **Keep**: same reason. |
+| `apply_context_superlative_verifier` | No (needs registered context) | **Keep**. |
+| `apply_superlative_verifier` | Borderline | **Keep**: cheap and safe. |
+| `apply_ratio_scale_compactor` | No (shape job) | **Keep**. |
+| `apply_salvaged_context_boolean_percentage_repair` | No (needs context) | **Keep**. |
+| `apply_quoted_entity_ratio_repair` | No (parses question) | **Keep**. |
+| `apply_answer_column_verifier` | No (shape job) | **Keep**. |
+| `apply_question_column_pruner` | No (shape job) | **Keep**. |
+| `_cheap_count_fallback_candidate` | No (Databao-failed branch) | **Keep**. |
+
+Conclusion: with Qwen3.5-35B-A3B the adapter is not redundant. The verifier/compactor functions
+are doing real work that Databao does not yet reliably perform in a single submit cycle.
+Removing any of them without a stronger model or a proven Databao-internal replacement would
+likely regress the corpus.
