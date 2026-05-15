@@ -86,15 +86,6 @@ P0_REJECT_FLAGS = frozenset(
 )
 
 
-def _p0_ratio_reject_enabled() -> bool:
-    return os.environ.get("DATABAO_INTERNAL_P0_RATIO_REJECT", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def _latest_user_question(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
@@ -656,8 +647,6 @@ def _critique_submit_result(
         should_reject = True
 
     p0_flags = [flag for flag in flags if flag in P0_REJECT_FLAGS]
-    if _p0_ratio_reject_enabled() and "ratio_question_without_ratio_evidence" in flags:
-        p0_flags.append("ratio_question_without_ratio_evidence")
     p0_should_reject = bool(p0_flags) and _p0_gates_enabled()
 
     return {

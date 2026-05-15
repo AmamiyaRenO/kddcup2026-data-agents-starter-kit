@@ -971,3 +971,33 @@ Conclusion: with Qwen3.5-35B-A3B the adapter is not redundant. The verifier/comp
 are doing real work that Databao does not yet reliably perform in a single submit cycle.
 Removing any of them without a stronger model or a proven Databao-internal replacement would
 likely regress the corpus.
+
+## Cleanup: Removed Opt-in Experiments (2026-05-15)
+
+After the audit and variance probe above showed that none of the three opt-in Databao-side
+experiments reliably moved the corpus mean past noise, all three were removed from the vendored
+graph files. They are documented above (kept in the section history) so future iterations don't
+re-implement the same path without first considering what the model variance ceiling will allow.
+
+Removed code:
+
+| Feature | Env knob | Removed helpers | Why removed |
+| --- | --- | --- | --- |
+| Ratio P0 reject | `DATABAO_INTERNAL_P0_RATIO_REJECT` | (none — single env helper) | Destroys adapter aggregate-ratio verifier's rescue input on `task_283` family. |
+| Legacy grounding probe (verbose CSV) | `DATABAO_INTERNAL_GROUNDING_PROBE` | `_grounding_qualified_equalities`, `_resolve_alias_to_table`, `_build_grounding_probe_sql`, `_build_distinct_domain_probe_sql` | Default-on ablation caused 4 Hard task_timeouts; default-off kept the helpers dormant for two release cycles with no validated win. |
+| Schema-graph grounding probe (one-liner) | `DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE` | `_information_schema_columns`, `_find_lookup_tables`, `_select_key_columns`, `_format_probe_one_liner`, `_from_tables_in_sql` | 3-run variance ablation showed -0.67 mean inside the ±1 stdev noise band. Mechanism worked (cross-table lookup verified on `task_86`) but on this model the per-task wins balanced per-task losses. |
+
+What stays in production:
+
+- All three P0 reject flags (`empty_submit_result`, `blank_display_needs_join`,
+  `numeric_identifier_filter_needs_grounding`) default-on via `DATABAO_INTERNAL_P0_GATES=1`.
+- Empty-result date probe (always runs when the empty gate fires on a date-filtered SQL). It
+  produced the only durable structural win in this entire investigation (`task_173`
+  cross-source pivot in Stage 2) and adds no measurable runtime cost.
+- Shadow-only critiques: `_blank_display_critique` (also P0), `_unit_time_granularity_critique`,
+  `_filter_audit_critique`, anchored-lookup critique, original numeric grounding flags.
+- All adapter postprocess/verifier/repair functions identified in the audit above as
+  load-bearing.
+
+Cleanup diff: 412 deletions / 0 insertions across `lighthouse_graph.py` and `separate_graph.py`.
+Default behavior unchanged (verified on smoke and 100/100 unit tests).
