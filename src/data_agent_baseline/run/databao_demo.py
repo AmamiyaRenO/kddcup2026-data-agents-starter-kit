@@ -4060,6 +4060,132 @@ def apply_quoted_entity_ratio_repair(
     return output, [transform]
 
 
+def _question_asks_for_explicit_identifier(question: str) -> bool:
+    """Narrower than ``_question_asks_for_identifier``.
+
+    Returns True only when the question explicitly requests an ID number /
+    identifier / code value. ``reference`` is intentionally excluded because
+    questions like "reference name" use it as part of a column name, not as
+    a request for the row's identifier.
+    """
+
+    lowered = question.lower()
+    return bool(re.search(r"\b(?:id\s*number|identifier|primary\s*key)\b", lowered)) or bool(
+        re.search(r"\b(?:what\s+is\s+the\s+id|give\s+the\s+id)\b", lowered)
+    )
+
+
+def apply_redundant_id_with_display_pruner(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Drop ``<X>Id``-style columns when a ``<X>Ref/Code/Name`` companion exists.
+
+    Targets the failure mode where the model includes BOTH the numeric ID and
+    the natural-language reference column (e.g. ``constructorId`` together
+    with ``constructorRef`` for a "constructor reference name" question).
+    Scoring penalises extra columns, so dropping the redundant ID column
+    converts a 1-extra-column failure into an exact match.
+    """
+
+    if _question_asks_for_explicit_identifier(task.question):
+        return frame, []
+    columns = [str(c) for c in frame.columns]
+    columns_lower = {c.lower(): c for c in columns}
+    transformations: list[dict[str, Any]] = []
+    current_frame = frame.copy()
+    to_drop: list[str] = []
+    for column in columns:
+        # Match camelCase ``<X>Id`` (e.g. ``constructorId``) or snake ``<x>_id``.
+        m = re.match(r"^(?P<stem>[A-Za-z][A-Za-z0-9]*?)(?:Id|_id)$", column)
+        if not m:
+            continue
+        stem = m.group("stem")
+        # Skip when the column is literally just "Id" or "id" (no entity stem).
+        if not stem:
+            continue
+        companion_suffixes = ("Ref", "Code", "Name", "_ref", "_code", "_name")
+        companion_present = False
+        for suffix in companion_suffixes:
+            cand_lower = f"{stem.lower()}{suffix.lower()}"
+            if cand_lower in columns_lower and columns_lower[cand_lower] != column:
+                companion_present = True
+                break
+        if not companion_present:
+            continue
+        to_drop.append(column)
+        transformations.append(
+            {
+                "kind": "redundant_id_with_display_prune",
+                "dropped_column": column,
+                "stem": stem,
+            }
+        )
+    if to_drop:
+        current_frame = current_frame.drop(columns=to_drop)
+    return current_frame, transformations
+
+
+def apply_full_name_split(
+    task: PublicTask,
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Split a single ``<X>_name`` column into ``first_name`` / ``last_name``.
+
+    Triggers only when the question explicitly asks for full name (or
+    first/last name), the frame does NOT already have first_name+last_name
+    columns, and the values in the candidate column look like
+    ``Firstname Lastname`` (two alphabetic tokens, both capitalised).
+    """
+
+    question = task.question.lower()
+    if not re.search(r"\bfull\s+name\b|\bfirst\s+name\b|\blast\s+name\b", question):
+        return frame, []
+    columns = [str(c) for c in frame.columns]
+    has_first = any(re.search(r"(?i)(?:^|_)first[_ ]?name(?:$|_)", c) for c in columns)
+    has_last = any(re.search(r"(?i)(?:^|_)last[_ ]?name(?:$|_)", c) for c in columns)
+    if has_first and has_last:
+        return frame, []
+    candidate_pattern = re.compile(
+        r"(?i)(?:^|_)(?:full[_ ]?name|member[_ ]?name|user[_ ]?name|"
+        r"display[_ ]?name|person[_ ]?name|name)(?:$|_)"
+    )
+    candidate = None
+    for column in columns:
+        if candidate_pattern.search(column):
+            candidate = column
+            break
+    if candidate is None:
+        return frame, []
+    series = frame[candidate].astype(str)
+    if len(series) == 0:
+        return frame, []
+    parts_list: list[list[str]] = []
+    for value in series:
+        value_stripped = value.strip()
+        if not value_stripped:
+            return frame, []
+        parts = value_stripped.split()
+        # Require exactly two tokens, both alphabetic and capitalised.
+        if len(parts) != 2:
+            return frame, []
+        if not all(p.isalpha() and p[0].isupper() for p in parts):
+            return frame, []
+        parts_list.append(parts)
+    current_frame = frame.copy()
+    current_frame["first_name"] = [p[0] for p in parts_list]
+    current_frame["last_name"] = [p[1] for p in parts_list]
+    current_frame = current_frame.drop(columns=[candidate])
+    return current_frame, [
+        {
+            "kind": "full_name_split",
+            "source_column": candidate,
+            "output_columns": ["first_name", "last_name"],
+            "row_count": len(parts_list),
+        }
+    ]
+
+
 def postprocess_answer_table(
     task: PublicTask,
     frame: pd.DataFrame,
@@ -4073,8 +4199,27 @@ def postprocess_answer_table(
     current_frame, resolver_transforms = resolve_identifier_columns(task, current_frame)
     transformations.extend(resolver_transforms)
 
+    # Drop ``<X>Id`` columns redundant with a ``<X>Ref/Code/Name`` companion
+    # BEFORE the answer-column verifier runs. If the verifier sees the raw
+    # frame with both columns, it can incorrectly pick the ID column as the
+    # "best match" for a question like "constructor reference name" and drop
+    # the actually-requested ``constructorRef`` + ``url`` columns.
+    current_frame, redundant_id_transforms = apply_redundant_id_with_display_pruner(task, current_frame)
+    transformations.extend(redundant_id_transforms)
+
     current_frame, question_column_transforms = apply_answer_column_verifier(task, current_frame)
     transformations.extend(question_column_transforms)
+
+    current_frame, name_split_transforms = apply_full_name_split(task, current_frame)
+    transformations.extend(name_split_transforms)
+    if name_split_transforms:
+        # The split turned one column into two; signal the final shape guard
+        # that the contract's ``max_columns`` should be bumped by 1 for this
+        # frame so the new ``last_name`` column is not pruned away.
+        current_frame.attrs["expected_max_columns_extra"] = max(
+            int(current_frame.attrs.get("expected_max_columns_extra") or 0),
+            1,
+        )
 
     deduplicated_frame = current_frame.drop_duplicates().reset_index(drop=True)
     if len(deduplicated_frame) != len(current_frame):
@@ -5876,6 +6021,14 @@ def final_answer_shape_guard(
             max_rows = 1
             max_columns = 1
 
+        # Postprocess transforms (e.g. ``apply_full_name_split``) can legally
+        # increase the frame's column count beyond the contract by replacing
+        # one logical attribute with multiple physical columns. They signal
+        # the expected slack via ``frame.attrs["expected_max_columns_extra"]``.
+        extra = current.attrs.get("expected_max_columns_extra")
+        if isinstance(extra, int) and extra > 0 and max_columns is not None:
+            max_columns = max_columns + extra
+
         if max_columns is not None and len(current.columns) > max_columns:
             selected_columns = _select_columns_by_priority(
                 current,
@@ -7546,6 +7699,39 @@ def run_databao_task(
                 databao_frame = ask_databao_candidate()
                 with diagnostics.stage("raw_provisional_csv_write"):
                     write_raw_provisional(databao_frame, stage="databao_raw_provisional")
+                # Apply pure shape repairs (drop redundant <X>Id columns when
+                # a <X>Ref/Code/Name companion exists; split combined
+                # ``<X>_name='First Last'`` into ``first_name``/``last_name``)
+                # BEFORE candidate generation so both the raw and postprocessed
+                # candidates begin from the cleaned shape. Otherwise the
+                # ranker can pick the un-repaired raw candidate over the
+                # repaired postprocessed one and lose the fix.
+                _pre_cand_transforms: list[dict[str, Any]] = []
+                try:
+                    databao_frame, _rid_transforms = apply_redundant_id_with_display_pruner(
+                        task, databao_frame
+                    )
+                    _pre_cand_transforms.extend(_rid_transforms)
+                    databao_frame, _name_transforms = apply_full_name_split(task, databao_frame)
+                    _pre_cand_transforms.extend(_name_transforms)
+                    if _name_transforms:
+                        databao_frame.attrs["expected_max_columns_extra"] = max(
+                            int(databao_frame.attrs.get("expected_max_columns_extra") or 0),
+                            1,
+                        )
+                except Exception:  # noqa: BLE001
+                    # Shape repairs are best-effort; never fail the run on a
+                    # transform exception.
+                    _pre_cand_transforms = []
+                for _transform in _pre_cand_transforms:
+                    applied_strategies.append(
+                        {
+                            "strategy_name": str(_transform.get("kind", "pre_candidate_shape_repair")),
+                            "strategy_kind": "generic",
+                            "result": _transform,
+                            "applied_to_final_answer": False,
+                        }
+                    )
             except Exception as exc:
                 databao_failure_reason = _safe_exception_summary(exc, (databao_env.model_api_key,))
                 databao_failure_type = _databao_failure_type(databao_failure_reason)
