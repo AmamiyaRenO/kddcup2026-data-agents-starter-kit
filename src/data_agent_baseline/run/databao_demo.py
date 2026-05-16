@@ -8053,7 +8053,13 @@ def run_databao_task(
                     retry_token = _CURRENT_RETRY_TEMPERATURE.set(retry_temp)
                     started = perf_counter()
                     try:
-                        retry_frame = ask_databao_candidate()
+                        # The outer ``with _openai_api_key_from_model_env`` block
+                        # ends before this retry block. Re-enter it so the LLM
+                        # call has OPENAI_API_KEY set; without this, Databao
+                        # rebuilds the agent and hits the model endpoint with no
+                        # Authorization header (401).
+                        with _openai_api_key_from_model_env(databao_env):
+                            retry_frame = ask_databao_candidate()
                         try:
                             retry_frame, _retry_rid = apply_redundant_id_with_display_pruner(task, retry_frame)
                             retry_frame, _retry_name = apply_full_name_split(task, retry_frame)
