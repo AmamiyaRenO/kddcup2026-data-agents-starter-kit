@@ -59,6 +59,10 @@ _CURRENT_RETRIEVED_CONTEXT: ContextVar["RetrievedContext | None"] = ContextVar(
     "databao_retrieved_context",
     default=None,
 )
+_CURRENT_RETRY_TEMPERATURE: ContextVar[float | None] = ContextVar(
+    "databao_retry_temperature",
+    default=None,
+)
 _CURRENT_TASK_DEADLINE: ContextVar[float | None] = ContextVar(
     "databao_task_deadline",
     default=None,
@@ -725,6 +729,74 @@ def _databao_executor_type(value: str | None = None) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Conditional retry / self-consistency env knobs.
+#
+# Default OFF. When enabled, after the first Databao attempt produces a
+# clearly low-quality candidate (no submit, empty frame, P0 critique flag,
+# wrong shape for the question), we run Databao at most one additional time
+# at a different temperature and add those candidates to the ranker pool. The
+# ranker is *not* replaced by majority voting -- it just gets a small
+# consensus_bonus for candidates whose value-signature matches another
+# candidate's value-signature.
+#
+# References:
+#   - Databricks RLVR text-to-SQL: BIRD 73.56% -> 75.68% with self-consistency
+#   - CSC-SQL: corrective self-consistency + self-correction on Qwen2.5-Coder
+#   - Cheaper, Better, Faster, Stronger: warns blanket temperature sampling
+#     adds noise, recommends quality-gated retry instead.
+# --------------------------------------------------------------------------- #
+
+
+def _conditional_retry_enabled() -> bool:
+    return os.environ.get("DATABAO_CONDITIONAL_RETRY", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _retry_max_attempts() -> int:
+    raw = os.environ.get("DATABAO_RETRY_MAX_ATTEMPTS", "2").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2
+    return max(1, min(value, 4))
+
+
+def _retry_only_on_bad_signal() -> bool:
+    return os.environ.get("DATABAO_RETRY_ONLY_ON_BAD_SIGNAL", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _retry_temperatures() -> list[float]:
+    raw = os.environ.get("DATABAO_RETRY_TEMPERATURES", "0.0,0.35").strip()
+    out: list[float] = []
+    for piece in raw.split(","):
+        try:
+            temp = float(piece.strip())
+        except ValueError:
+            continue
+        if 0.0 <= temp <= 1.5:
+            out.append(temp)
+    return out or [0.0, 0.35]
+
+
+def _consensus_min_matches() -> int:
+    raw = os.environ.get("DATABAO_CONSENSUS_MIN_MATCHES", "2").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 2
+    return max(2, value)
+
+
 class StructuredPlanError(ValueError):
     """Raised when a structured query plan is not safe or executable."""
 
@@ -824,6 +896,139 @@ def _databao_source_kind(frame: pd.DataFrame) -> str:
     if frame.attrs.get("databao_salvaged_latest_query_result") or frame.attrs.get("databao_submit_called") is False:
         return "databao_salvaged_intermediate"
     return "databao_final"
+
+
+# --------------------------------------------------------------------------- #
+# Conditional-retry helpers (Codex-spec).
+# --------------------------------------------------------------------------- #
+
+
+def _frame_value_signature(frame: pd.DataFrame) -> tuple[tuple[str, ...], ...] | None:
+    """Compute a column-name-blind, row-order-blind value signature.
+
+    Mirrors the official scorer's ``column_signatures`` semantics: each column
+    is normalised cell-by-cell, sorted, and turned into a hashable tuple. The
+    full signature is the SORTED tuple-of-tuples so two candidates that
+    permute their column order produce the same signature. Returns ``None``
+    when the frame is empty/invalid (which intentionally never matches any
+    other candidate's signature).
+    """
+
+    if not isinstance(frame, pd.DataFrame):
+        return None
+    if frame.shape[0] == 0 or frame.shape[1] == 0:
+        return None
+    try:
+        from data_agent_baseline.tools.public_eval import normalize_cell  # type: ignore
+    except Exception:  # pragma: no cover
+        normalize_cell = lambda value: ("" if value is None else str(value).strip())
+
+    column_sigs: list[tuple[str, ...]] = []
+    for column_index in range(frame.shape[1]):
+        try:
+            values = frame.iloc[:, column_index].tolist()
+            column_sigs.append(tuple(sorted(normalize_cell(value) for value in values)))
+        except Exception:
+            return None
+    column_sigs.sort()
+    return tuple(column_sigs)
+
+
+def _candidate_has_bad_signal(
+    *,
+    databao_frame: pd.DataFrame | None,
+    candidates: list["Candidate"],
+    answer_contract: "AnswerContract",
+    task: "PublicTask",
+) -> tuple[bool, list[str]]:
+    """Return ``(should_retry, reasons)`` for conditional retry decision.
+
+    Quality-gate predicates (any one triggers retry):
+        - Databao raised an exception (databao_frame is None).
+        - Submitted frame is empty.
+        - ``databao_submit_called`` is False (no submit_result).
+        - Submit critiques contain a P0 reject flag.
+        - All candidates fail the AnswerContract validation.
+        - Question asks for a ratio/percentage but no candidate's frame matches
+          the contract.
+
+    Conservative by design: only retries when there is a clear bad signal.
+    Tasks where the first attempt already produced a valid contract-passing
+    candidate are NOT retried.
+    """
+
+    reasons: list[str] = []
+    if databao_frame is None:
+        reasons.append("databao_no_frame")
+        return True, reasons
+    try:
+        if len(databao_frame) == 0 and answer_contract.kind not in {"empty"}:
+            reasons.append("databao_empty_frame")
+    except Exception:
+        pass
+
+    attrs = getattr(databao_frame, "attrs", {}) or {}
+    if attrs.get("databao_submit_called") is False:
+        reasons.append("no_submit_called")
+    critiques = attrs.get("databao_submit_critiques") or []
+    if isinstance(critiques, list):
+        for crit in critiques:
+            if not isinstance(crit, Mapping):
+                continue
+            if crit.get("no_submit"):
+                reasons.append("no_submit_critique")
+                break
+            if crit.get("p0_should_reject"):
+                reasons.append(f"p0_reject:{','.join(crit.get('p0_flags') or [])}")
+                break
+
+    # Is there any contract-valid candidate already?
+    valid_present = False
+    for candidate in candidates:
+        try:
+            report = validate_answer_contract(
+                answer_contract,
+                candidate.frame,
+                candidate_source=candidate.source,
+            )
+            if report.valid and len(candidate.frame) > 0:
+                valid_present = True
+                break
+        except Exception:
+            continue
+    if not valid_present:
+        reasons.append("no_valid_candidate")
+
+    return bool(reasons), reasons
+
+
+def _compute_consensus_bonuses(candidates: list["Candidate"]) -> dict[int, int]:
+    """For each candidate, return a small score bonus if its value-signature
+    matches at least ``DATABAO_CONSENSUS_MIN_MATCHES`` other candidates'
+    signatures. Returns ``{id(candidate): bonus}``.
+
+    The bonus is intentionally small (15) so it nudges ranking rather than
+    overriding evidence-based scoring.
+    """
+
+    if len(candidates) < 2:
+        return {}
+    from collections import Counter
+
+    sigs: dict[int, tuple] = {}
+    for candidate in candidates:
+        sig = _frame_value_signature(getattr(candidate, "frame", None))
+        if sig is not None:
+            sigs[id(candidate)] = sig
+    if not sigs:
+        return {}
+    counts = Counter(sigs.values())
+    min_matches = _consensus_min_matches()
+    bonuses: dict[int, int] = {}
+    for cid, sig in sigs.items():
+        if counts[sig] >= min_matches:
+            bonuses[cid] = 15
+    return bonuses
 
 
 def _databao_submit_critique(
@@ -6024,6 +6229,7 @@ def rank_candidates(
     contract: AnswerContract,
     question: str,
     retrieved_context: RetrievedContext | None,
+    consensus_bonuses: dict[int, int] | None = None,
 ) -> tuple[Candidate | None, CandidateRankingReport]:
     scored: list[tuple[int, Candidate, list[str]]] = []
     features = extract_question_features(question)
@@ -6032,6 +6238,9 @@ def rank_candidates(
         for columns in (retrieved_context.relevant_columns.values() if retrieved_context else [])
         for column in columns
     }
+    # Optional consensus bonuses keyed by ``id(candidate)``. Set to {} if not
+    # supplied so the bonus loop is a no-op in single-attempt runs.
+    consensus_bonuses = consensus_bonuses or {}
     has_valid_non_verifier_candidate = any(
         isinstance(candidate.frame, pd.DataFrame)
         and len(candidate.frame.columns) > 0
@@ -6323,6 +6532,10 @@ def rank_candidates(
         if len(candidate.frame) == 0 and not contract.allow_empty:
             score -= 100
             reasons.append("empty_required_answer")
+        bonus = consensus_bonuses.get(id(candidate), 0)
+        if bonus:
+            score += bonus
+            reasons.append(f"consensus_bonus:{bonus}")
         scored.append((score, candidate, reasons))
 
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -6705,10 +6918,14 @@ def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> An
     if diagnostics is not None:
         model_kwargs["callbacks"] = [DatabaoLangChainCallback(diagnostics)]
     model_kwargs["max_retries"] = 0
+    temperature_override = _CURRENT_RETRY_TEMPERATURE.get()
+    effective_temperature = (
+        float(temperature_override) if temperature_override is not None else 0.0
+    )
     llm_config = bao.LLMConfig(
         name=databao_env.model_name,
         api_base_url=databao_env.model_api_url,
-        temperature=0.0,
+        temperature=effective_temperature,
         max_tokens=MAX_DATABAO_TOKENS,
         timeout=_databao_timeout_seconds(),
         use_responses_api=False,
@@ -7798,11 +8015,111 @@ def run_databao_task(
                 best_candidate=selected_candidate,
             )
 
+        # --------------------------------------------------------------- #
+        # Conditional retry / quality-gated self-consistency.
+        #
+        # Default OFF (DATABAO_CONDITIONAL_RETRY=0). When enabled, if the
+        # first Databao attempt's candidates show clear bad-signal symptoms
+        # (no submit, empty frame, P0 critique, no contract-valid candidate),
+        # we run Databao at most (max_attempts - 1) more times at a different
+        # temperature, add those candidates to the pool, and pass a
+        # consensus_bonus map to ``rank_candidates`` so candidates whose
+        # value-signatures agree across attempts get a small ranking boost.
+        # The existing ranker is NOT replaced -- only nudged.
+        # --------------------------------------------------------------- #
+        consensus_bonuses: dict[int, int] = {}
+        retry_diag: dict[str, Any] = {"enabled": _conditional_retry_enabled()}
+        if _conditional_retry_enabled():
+            attempt_1_frame = locals().get("databao_frame") if isinstance(locals().get("databao_frame"), pd.DataFrame) else None
+            try:
+                should_retry, retry_reasons = _candidate_has_bad_signal(
+                    databao_frame=attempt_1_frame,
+                    candidates=candidates,
+                    answer_contract=answer_contract,
+                    task=task,
+                )
+            except Exception as exc:  # noqa: BLE001
+                should_retry, retry_reasons = False, [f"retry_gate_error:{exc!s:.120}"]
+            retry_diag["should_retry"] = should_retry
+            retry_diag["reasons"] = retry_reasons
+            if should_retry and (not _retry_only_on_bad_signal() or retry_reasons):
+                max_attempts = _retry_max_attempts()
+                retry_temperatures = [t for t in _retry_temperatures() if t > 0.0][: max_attempts - 1]
+                if not retry_temperatures:
+                    retry_temperatures = [0.35][: max_attempts - 1]
+                retry_diag["retry_temperatures"] = retry_temperatures
+                retry_diag["retry_attempts"] = []
+                for retry_index, retry_temp in enumerate(retry_temperatures, start=2):
+                    retry_token = _CURRENT_RETRY_TEMPERATURE.set(retry_temp)
+                    started = perf_counter()
+                    try:
+                        retry_frame = ask_databao_candidate()
+                        try:
+                            retry_frame, _retry_rid = apply_redundant_id_with_display_pruner(task, retry_frame)
+                            retry_frame, _retry_name = apply_full_name_split(task, retry_frame)
+                            if _retry_name:
+                                retry_frame.attrs["expected_max_columns_extra"] = max(
+                                    int(retry_frame.attrs.get("expected_max_columns_extra") or 0),
+                                    1,
+                                )
+                        except Exception:  # noqa: BLE001
+                            pass
+                        retry_candidate = record_candidate(
+                            build_candidate_from_frame(
+                                retry_frame,
+                                source=f"databao_raw_retry_{retry_index}",
+                                confidence=0.5,
+                                diagnostics_payload={
+                                    "stage": "databao_ask_retry",
+                                    "retry_temperature": retry_temp,
+                                    "retry_reasons": retry_reasons,
+                                    **_databao_frame_execution_payload(retry_frame),
+                                },
+                                elapsed_seconds=round(perf_counter() - started, 3),
+                            )
+                        )
+                        attempt_meta = {
+                            "attempt_index": retry_index,
+                            "temperature": retry_temp,
+                            "elapsed_seconds": round(perf_counter() - started, 3),
+                            "candidate_added": retry_candidate is not None,
+                        }
+                        if retry_candidate is not None:
+                            try:
+                                add_postprocessed_candidate(retry_candidate)
+                            except Exception as exc:  # noqa: BLE001
+                                attempt_meta["postprocess_error"] = str(exc)[:120]
+                        retry_diag["retry_attempts"].append(attempt_meta)
+                    except Exception as exc:  # noqa: BLE001
+                        retry_diag["retry_attempts"].append(
+                            {
+                                "attempt_index": retry_index,
+                                "temperature": retry_temp,
+                                "error": str(exc)[:200],
+                            }
+                        )
+                    finally:
+                        _CURRENT_RETRY_TEMPERATURE.reset(retry_token)
+                try:
+                    consensus_bonuses = _compute_consensus_bonuses(candidates)
+                except Exception:  # noqa: BLE001
+                    consensus_bonuses = {}
+                retry_diag["consensus_match_count"] = len(consensus_bonuses)
+        applied_strategies.append(
+            {
+                "strategy_name": "conditional_retry",
+                "strategy_kind": "generic",
+                "result": retry_diag,
+                "applied_to_final_answer": bool(retry_diag.get("should_retry")),
+            }
+        )
+
         selected_candidate, ranking_report = rank_candidates(
             candidates=candidates,
             contract=answer_contract,
             question=task.question,
             retrieved_context=retrieved_context,
+            consensus_bonuses=consensus_bonuses,
         )
         if selected_candidate is None:
             raise ValueError("No candidate dataframe was produced.")
