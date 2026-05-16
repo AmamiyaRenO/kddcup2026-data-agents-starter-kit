@@ -3414,113 +3414,6 @@ def _boolean_indicator_series(series: pd.Series) -> pd.Series | None:
     return mapped.astype("Float64")
 
 
-def apply_salvaged_boolean_percentage_compactor(
-    task: PublicTask,
-    frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    if not bool(frame.attrs.get("databao_salvaged_latest_query_result")):
-        return frame, []
-    lowered_question = task.question.lower()
-    if not re.search(r"\b(?:percentage|percent|proportion|share)\b", lowered_question):
-        return frame, []
-
-    question_tokens = _normalized_question_tokens(task.question)
-    negated_have = bool(
-        re.search(r"\b(?:do|does|did)\s+not\s+have\b", lowered_question)
-        or re.search(r"\bwithout\b", lowered_question)
-    )
-    positive_have = bool(re.search(r"\b(?:have|has|with)\b", lowered_question))
-    if not (negated_have or positive_have):
-        return frame, []
-
-    boolean_candidates: list[tuple[str, pd.Series, int]] = []
-    for column in frame.columns:
-        column_name = str(column)
-        if _is_id_like_column(column_name):
-            continue
-        aliases = _column_question_aliases(column_name)
-        overlap = aliases & question_tokens
-        if not overlap:
-            continue
-        indicator = _boolean_indicator_series(frame[column])
-        if indicator is None:
-            continue
-        boolean_candidates.append((column_name, indicator, len(overlap)))
-
-    if not boolean_candidates:
-        return frame, []
-
-    column_name, indicator, overlap_count = max(boolean_candidates, key=lambda item: item[2])
-    valid_values = indicator.dropna()
-    denominator = int(len(valid_values))
-    if denominator == 0:
-        return frame, []
-    target_value = 0 if negated_have else 1
-    numerator = int((valid_values.astype(int) == target_value).sum())
-    percentage = numerator * 100.0 / denominator
-    output = pd.DataFrame({"percentage": [percentage]})
-    output.attrs.update(frame.attrs)
-    transform = {
-        "kind": "salvaged_boolean_percentage_compaction",
-        "source_boolean_column": column_name,
-        "target_value": target_value,
-        "numerator": numerator,
-        "denominator": denominator,
-        "denominator_nonzero": True,
-        "matched_column_alias_count": overlap_count,
-        "databao_salvaged_latest_query_result": True,
-        "operation": "percentage",
-    }
-    return output, [transform]
-
-
-def apply_salvaged_detail_count_compactor(
-    task: PublicTask,
-    frame: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    if frame.empty or len(frame.columns) == 0:
-        return frame, []
-    if _question_asks_for_identifier(task.question):
-        return frame, []
-    if frame.attrs.get("databao_submit_called") is not False and not frame.attrs.get(
-        "databao_salvaged_latest_query_result"
-    ):
-        return frame, []
-    if not _question_asks_count_metric(task.question):
-        return frame, []
-    if extract_question_features(task.question).asks_ratio_or_percentage:
-        return frame, []
-    count_like_columns = [
-        str(column)
-        for column in frame.columns
-        if any(term in str(column).lower() for term in ("answer", "count", "total", "number"))
-    ]
-    if count_like_columns and len(frame.columns) <= 2:
-        return frame, []
-    id_columns = [str(column) for column in frame.columns if _is_id_like_column(str(column))]
-    display_columns = _display_candidate_columns(frame)
-    distinct_columns = id_columns + display_columns
-    if distinct_columns:
-        count_column = distinct_columns[0]
-        count_value = int(frame[count_column].dropna().nunique())
-        count_basis = "distinct_column"
-    else:
-        count_value = int(len(frame))
-        count_basis = "row_count"
-        count_column = None
-    output = pd.DataFrame({"count": [count_value]})
-    output.attrs.update(frame.attrs)
-    transform = {
-        "kind": "salvaged_detail_count_compaction",
-        "operation": "count",
-        "count_basis": count_basis,
-        "count_column": count_column,
-        "input_rows": int(len(frame)),
-        "input_columns": [str(column) for column in frame.columns],
-    }
-    return output, [transform]
-
-
 def apply_databao_observed_detail_aggregate_compactor(
     task: PublicTask,
     frame: pd.DataFrame,
@@ -4265,23 +4158,12 @@ def generate_verifier_candidate_frames(
     if ratio_transforms and not ratio_frame.equals(frame):
         candidates.append((ratio_frame, ratio_transforms, 0.66))
 
-    salvaged_percentage_frame, salvaged_percentage_transforms = apply_salvaged_boolean_percentage_compactor(
-        task,
-        frame,
-    )
-    if salvaged_percentage_transforms and not salvaged_percentage_frame.equals(frame):
-        candidates.append((salvaged_percentage_frame, salvaged_percentage_transforms, 0.74))
-
     context_percentage_frame, context_percentage_transforms = apply_salvaged_context_boolean_percentage_repair(
         task,
         frame,
     )
     if context_percentage_transforms and not context_percentage_frame.equals(frame):
         candidates.append((context_percentage_frame, context_percentage_transforms, 0.68))
-
-    detail_count_frame, detail_count_transforms = apply_salvaged_detail_count_compactor(task, frame)
-    if detail_count_transforms and not detail_count_frame.equals(frame):
-        candidates.append((detail_count_frame, detail_count_transforms, 0.7))
 
     observed_aggregate_frame, observed_aggregate_transforms = apply_databao_observed_detail_aggregate_compactor(
         task,
@@ -6105,7 +5987,6 @@ def rank_candidates(
     )
     percentage_repair_kinds = {
         "ratio_scale_compaction",
-        "salvaged_boolean_percentage_compaction",
         "salvaged_context_boolean_percentage_repair",
         "quoted_entity_ratio_repair",
     }
@@ -6332,16 +6213,6 @@ def rank_candidates(
                 score -= 35
                 reasons.append("databao_observed_detail_aggregate_shape_mismatch")
         if any(
-            str(transform.get("kind", "")) == "salvaged_boolean_percentage_compaction"
-            for transform in candidate.transformations
-        ):
-            if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
-                score += 35
-                reasons.append("salvaged_boolean_percentage_evidence")
-            else:
-                score -= 35
-                reasons.append("salvaged_boolean_percentage_sanity_failed")
-        if any(
             str(transform.get("kind", "")) == "salvaged_context_boolean_percentage_repair"
             for transform in candidate.transformations
         ):
@@ -6351,16 +6222,6 @@ def rank_candidates(
             else:
                 score -= 45
                 reasons.append("salvaged_context_percentage_sanity_failed")
-        if any(
-            str(transform.get("kind", "")) == "salvaged_detail_count_compaction"
-            for transform in candidate.transformations
-        ):
-            if report.valid and not extract_question_features(question).asks_ratio_or_percentage:
-                score += 35
-                reasons.append("salvaged_detail_count_evidence")
-            else:
-                score -= 35
-                reasons.append("salvaged_detail_count_sanity_failed")
         if any(str(transform.get("kind", "")) == "quoted_entity_ratio_repair" for transform in candidate.transformations):
             if not _aggregate_candidate_value_is_suspicious(candidate.frame, question) and report.valid:
                 score += 30
