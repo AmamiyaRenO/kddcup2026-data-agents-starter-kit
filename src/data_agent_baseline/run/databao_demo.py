@@ -3997,7 +3997,32 @@ def apply_redundant_id_with_display_pruner(
         # Skip when the column is literally just "Id" or "id" (no entity stem).
         if not stem:
             continue
-        companion_suffixes = ("Ref", "Code", "Name", "_ref", "_code", "_name")
+        companion_suffixes = (
+            # CamelCase companions
+            "Ref",
+            "Code",
+            "Name",
+            "Title",
+            "Label",
+            "Slug",
+            "Caption",
+            "Abbr",
+            "Symbol",
+            "Description",
+            "DisplayName",
+            # snake_case companions
+            "_ref",
+            "_code",
+            "_name",
+            "_title",
+            "_label",
+            "_slug",
+            "_caption",
+            "_abbr",
+            "_symbol",
+            "_description",
+            "_display_name",
+        )
         companion_present = False
         for suffix in companion_suffixes:
             cand_lower = f"{stem.lower()}{suffix.lower()}"
@@ -4054,15 +4079,24 @@ def apply_full_name_split(
     if len(series) == 0:
         return frame, []
     parts_list: list[list[str]] = []
+    # Accept letters plus the common name-internal punctuation: hyphen, apostrophe,
+    # period (middle initial). Token must start with an uppercase letter so
+    # all-lowercase usernames like ``elijah_allen`` do not trigger the split.
+    name_token = re.compile(r"^[A-Z][A-Za-z'’\-.]*$")
     for value in series:
         value_stripped = value.strip()
         if not value_stripped:
             return frame, []
-        parts = value_stripped.split()
-        # Require exactly two tokens, both alphabetic and capitalised.
-        if len(parts) != 2:
+        # Drop a single trailing middle initial like "Robert F. Kennedy" → split as
+        # ("Robert F.", "Kennedy") or ("Robert", "Kennedy"). Allow either reading.
+        raw_parts = value_stripped.split()
+        if len(raw_parts) == 3 and len(raw_parts[1]) <= 2 and raw_parts[1].rstrip(".").isalpha():
+            parts = [raw_parts[0], raw_parts[2]]
+        elif len(raw_parts) == 2:
+            parts = raw_parts
+        else:
             return frame, []
-        if not all(p.isalpha() and p[0].isupper() for p in parts):
+        if not all(name_token.match(p) for p in parts):
             return frame, []
         parts_list.append(parts)
     current_frame = frame.copy()
@@ -4793,7 +4827,21 @@ def _infer_generic_target_entity(question: str) -> str | None:
     return entity or None
 
 
-STRONG_AGGREGATION_TERMS = ("average", "avg", "mean", "sum", "total", "count", "how many")
+STRONG_AGGREGATION_TERMS = (
+    "average",
+    "avg",
+    "mean",
+    "sum",
+    "total",
+    "count",
+    "how many",
+    "tally",
+    "enumerate",
+    "give the number",
+    "find all",
+    "number of",
+    "how much",
+)
 RATIO_TERMS = ("ratio", "percentage", "percent", "proportion", "share", "how many times", "compared to")
 VALUE_METRIC_TERMS = ("amount", "cost", "price", "score", "points")
 WEAK_METRIC_TERMS = ("number", "rate", "value", "view count")
@@ -5325,7 +5373,13 @@ def build_complexity_profile(
     has_multiple_sources = len({kind for kind in source_kinds if kind != "unknown"}) > 1
     has_many_tables = len(tables) >= 4
     has_join_candidates = bool(task_context.schema_graph.get("join_candidates"))
-    question_mentions_aggregation = bool(re.search(r"\b(?:count|sum|total|average|avg|mean|how many)\b", question.lower()))
+    question_mentions_aggregation = bool(
+        re.search(
+            r"\b(?:count|sum|total|average|avg|mean|how many|tally|enumerate|"
+            r"give the number|find all|number of|how much)\b",
+            question.lower(),
+        )
+    )
     question_mentions_ratio_or_percentage = bool(re.search(r"\b(?:ratio|percentage|percent|proportion)\b", question.lower()))
     question_mentions_superlative = _superlative_direction(question) is not None
     question_mentions_filter = _question_mentions_filter_or_condition(question)
