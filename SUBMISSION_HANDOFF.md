@@ -28,7 +28,7 @@ The runner currently writes to `artifacts/databao-demo/<run_id>/task_<id>/`, **n
 | `DATABAO_INTERNAL_SUBMIT_CRITIQUE_MODE` | `shadow` | **Keep.** Diagnostic-only by default. |
 | `DATABAO_EXECUTOR_TYPE` | `lighthouse_salvage` | **Keep.** `separate` and `lighthouse` (non-salvage) are unsupported in this pipeline. |
 | `DATABAO_TASK_TIMEOUT_SECONDS` | unset → uses CLI flag | **Set `600`.** ⭐ Earlier 110s recommendation was wrong: A-board total wall-clock (7200s) is not the bottleneck; per-task partial credit is. 110s killed slow-Hard partial credit (cost ~−0.03 score). With `--max-workers=4`, 600s easily fits. |
-| `DATABAO_DATABAO_TIMEOUT_SECONDS` | `100` | **Set `180`.** ⭐ Inner LLM-call timeout. With thinking on, reasoning tokens lengthen each call; 100s can clip a complex Hard call. 180s leaves headroom; still capped at `task_timeout - 20s`. |
+| `DATABAO_DATABAO_TIMEOUT_SECONDS` | `100` | **Keep default `100`.** Inner LLM-call timeout. Capped dynamically at `task_timeout - 20s`. Earlier guidance suggested 180s as buffer for thinking-mode reasoning tokens, but the dedicated vLLM is fast enough that 100s is comfortable; raising it only adds risk of compounding into the outer task timeout. |
 | `DATABAO_CONDITIONAL_RETRY` | `0` (off) | **Leave off.** Stacks badly with thinking + concurrency; budget gets tight under combined load. Re-enable only after an ablation that shows headroom. |
 | `DATABAO_RETRY_MAX_ATTEMPTS` | `2` | Only used when retry is on. |
 | `DATABAO_RETRY_ONLY_ON_BAD_SIGNAL` | `1` | Only used when retry is on. |
@@ -66,7 +66,6 @@ Installed via `uv pip install -e .` (or any equivalent that exposes `[project.sc
 ```bash
 # ⭐ env vars
 export DATABAO_ENABLE_THINKING=1
-export DATABAO_DATABAO_TIMEOUT_SECONDS=180
 
 dabench run-databao-demo \
   --config configs/react_baseline.local.yaml \
@@ -93,7 +92,6 @@ set the env var:
 ENV DATABAO_ENABLE_THINKING=1
 ENV DATABAO_MAX_WORKERS=4
 ENV DATABAO_TASK_TIMEOUT_SECONDS=600
-ENV DATABAO_DATABAO_TIMEOUT_SECONDS=180
 ```
 
 `run_databao_tasks` now reads `DATABAO_MAX_WORKERS` as a fallback when
