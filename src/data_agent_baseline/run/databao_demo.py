@@ -921,7 +921,8 @@ def _frame_value_signature(frame: pd.DataFrame) -> tuple[tuple[str, ...], ...] |
     try:
         from data_agent_baseline.tools.public_eval import normalize_cell  # type: ignore
     except Exception:  # pragma: no cover
-        normalize_cell = lambda value: ("" if value is None else str(value).strip())
+        def normalize_cell(value: object) -> str:
+            return "" if value is None else str(value).strip()
 
     column_sigs: list[tuple[str, ...]] = []
     for column_index in range(frame.shape[1]):

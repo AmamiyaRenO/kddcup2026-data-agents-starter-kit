@@ -712,3 +712,60 @@ Vendored Databao patch:
   debugging against the unmodified upstream PyPI package.
 - This makes a fresh checkout reproduce the local Databao behavior without manually copying files
   into `.venv`.
+
+Reverted volatile-task adapter stabilization experiment:
+
+- A small adapter-side stabilization pass was tested for cases where Databao already returns a useful
+  detail table but the final answer shape is unstable. It included generic ordinal/rank filtering,
+  superlative row filtering, stronger answer-attribute focus, varying-record-ID preference, and a
+  guard against aggregate compaction overriding superlative attribute lookups.
+- Targeted checks:
+  - `task_38` run `20260517T090149Z`: exact; the adapter selected `trans_id` rather than the constant
+    filtering `client_id`.
+  - `task_89` run `20260517T090214Z`: exact; the rank filter selected the row with the requested
+    ordinal rank when Databao exposed a rank-like column.
+  - `task_218` run `20260517T090659Z`: exact; the answer-column verifier selected `Phone` for
+    "telephone number".
+  - `task_196` run `20260517T090236Z`: still not exact; Databao's submitted SQL already computed the
+    wrong scalar formula, which this adapter pass should not try to repair.
+- Full sweep after the pass:
+  - Easy `20260517T090743Z`: prediction `15/15`, exact `12/15`, avg `0.800`.
+  - Medium `20260517T091101Z`: prediction `23/23`, exact `14/23`, avg `0.630`.
+  - Hard `20260517T091813Z`: prediction `11/11`, exact `6/11`, avg `0.545`.
+- Decision: reverted from active code. The targeted shape fixes were real, but the full sweep was
+  below the recent high-score baseline. The remaining failures are better explained by Databao SQL/path
+  variance: `task_80` salvaged a no-submit `q3` detail result, `task_330` returned the right score
+  columns but lacked enough match filters, and `task_344` submitted a wrong scalar count. These should
+  be handled inside Databao grounding/no-submit behavior, not by broad adapter rescue.
+
+Databao-internal volatility stabilization:
+
+- Implemented a Databao-internal no-submit finality retry in the vendored Lighthouse/Separate graph
+  patches. If the final AI message does not call `submit_result` but a DataFrame exists, Databao adds
+  one internal feedback message asking the model to either submit the latest query or run one corrected
+  SELECT and then submit. This is capped at one retry by `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES`
+  and can be disabled with `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY=0`.
+- Internal feedback messages are ignored by `_latest_user_question()` so submit critiques continue to
+  use the original benchmark question, not the retry instruction. The feedback also avoids replaying
+  potentially misleading critique suggestions such as count hints.
+- Added a narrow P0 submit critique for time precision mismatch: when the question gives a time only
+  to whole-second precision but SQL uses equality against a fractional-second literal, Databao rejects
+  the submit once and asks for a prefix/range/truncation match that includes all rows in that second.
+- Tightened `blank_display_needs_join`: if the submitted result already contains a non-ID attribute
+  column explicitly requested by the question, Databao no longer forces a display/name join merely
+  because the wording contains "who/person/etc.".
+- Targeted validation:
+  - `task_80` run `20260517T101401Z`: exact. The first useful query containing `driverId, q3, number`
+    was no longer wrongly rejected for missing display/name, and the time-granularity critique can
+    recover from over-precise fractional-second equality filters.
+  - Guard tasks `task_38`, `task_214`, `task_218`, `task_250`, `task_257`, and `task_330` all scored
+    exact in targeted runs `20260517T101505Z` through `20260517T101731Z`.
+  - `task_344` remains unresolved; the failure is Databao choosing a different threshold/count formula,
+    not a no-submit/finality issue.
+- Full sweep after this Databao-internal patch:
+  - Easy `20260517T101958Z`: prediction `15/15`, exact `13/15`, avg `0.867`.
+  - Medium `20260517T102258Z`: prediction `23/23`, exact `17/23`, avg `0.761`.
+  - Hard `20260517T103126Z`: prediction `11/11`, exact `6/11`, avg `0.606`.
+- Interpretation: this is the right layer for stabilizing no-submit and time-granularity failures.
+  It improves/maintains easy and medium in this sweep. Hard still varies because remaining misses are
+  mostly Databao grounding/formula choices (`task_344`, `task_355`) rather than finality mechanics.

@@ -42,6 +42,7 @@ class AgentState(TypedDict):
     visualization_prompt: str | None
     ready_for_user: bool
     limit_max_rows: int | None
+    no_submit_retry_count: int
 
 
 def get_query_ids_mapping(messages: list[BaseMessage]) -> dict[str, ToolMessage]:
@@ -84,11 +85,27 @@ def _p0_max_rejections() -> int:
     return max(0, value)
 
 
+def _no_submit_finality_retry_enabled() -> bool:
+    value = os.environ.get("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _no_submit_finality_max_retries() -> int:
+    raw = os.environ.get("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES", "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1
+    return max(0, value)
+
+
 P0_REJECT_FLAGS = frozenset(
     {
         "empty_submit_result",
         "numeric_identifier_filter_needs_grounding",
         "blank_display_needs_join",
+        "time_literal_precision_needs_rounding",
+        "numeric_filter_scale_mismatch",
     }
 )
 
@@ -97,6 +114,8 @@ def _latest_user_question(messages: list[BaseMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
             content = str(message.content)
+            if content.lstrip().startswith("You ended without calling submit_result."):
+                continue
             # Strip system instructions; the actual question is the trailing
             # text after the last "Question:" marker. The prefix often contains
             # words like "display", "name", "title", "ratio" that would otherwise
@@ -365,6 +384,98 @@ def _build_date_probe_sql(original_sql: str, qualified_col: str) -> str | None:
     return f"SELECT DISTINCT {qualified_col} FROM {from_clause} LIMIT 5"
 
 
+def _numeric_filter_columns(sql: str | None) -> list[dict[str, Any]]:
+    if not sql:
+        return []
+    text = sql or ""
+    comparisons: dict[str, list[float]] = {}
+    column_pattern = r"(?:[A-Za-z_]\w*\.)?[`\"]?[A-Za-z_]\w*[`\"]?"
+    number_pattern = r"[-+]?\d+(?:\.\d+)?"
+    for match in re.finditer(
+        rf"({column_pattern})\s*(?:<=|>=|<|>|=)\s*({number_pattern})",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        column = match.group(1).strip("`\"")
+        value = float(match.group(2))
+        comparisons.setdefault(column, []).append(value)
+    for match in re.finditer(
+        rf"({column_pattern})\s+between\s+({number_pattern})\s+and\s+({number_pattern})",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        column = match.group(1).strip("`\"")
+        comparisons.setdefault(column, []).extend([float(match.group(2)), float(match.group(3))])
+
+    candidates: list[dict[str, Any]] = []
+    for column, values in comparisons.items():
+        bare_column = column.split(".")[-1].strip("`\"").lower()
+        if re.search(r"(?:^|_)(?:id|year|month|day|date|time)(?:$|_)", bare_column):
+            continue
+        unique_values = sorted(set(values))
+        if len(unique_values) < 2:
+            continue
+        candidates.append({"column": column, "literals": unique_values})
+    return candidates
+
+
+def _build_numeric_range_probe_sql(original_sql: str, qualified_col: str) -> str | None:
+    from_clause = _extract_from_clause(original_sql)
+    if not from_clause:
+        return None
+    return f"SELECT MIN({qualified_col}) AS min_value, MAX({qualified_col}) AS max_value FROM {from_clause}"
+
+
+def _numeric_filter_scale_flags(
+    question: str,
+    sql: str | None,
+    probe_ranges: list[dict[str, Any]],
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    flags: list[str] = []
+    suggestions: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    if not question or not sql or not probe_ranges:
+        return flags, suggestions, evidence
+    lowered = question.lower()
+    if not re.search(r"\b(?:normal|abnormal|range|level|threshold|between|outside|within)\b", lowered):
+        return flags, suggestions, evidence
+    for item in probe_ranges:
+        literals = [float(value) for value in item.get("literals", [])]
+        min_value = item.get("min_value")
+        max_value = item.get("max_value")
+        if min_value is None or max_value is None or not literals:
+            continue
+        try:
+            observed_min = float(min_value)
+            observed_max = float(max_value)
+        except (TypeError, ValueError):
+            continue
+        if observed_min == observed_max:
+            continue
+        literal_min = min(literals)
+        literal_max = max(literals)
+        observed_abs_max = max(abs(observed_min), abs(observed_max), 1.0)
+        thresholds_above_scale = literal_min > observed_max and literal_min > observed_abs_max * 1.5
+        thresholds_below_scale = literal_max < observed_min and abs(literal_max) * 1.5 < max(abs(observed_min), 1.0)
+        if not thresholds_above_scale and not thresholds_below_scale:
+            continue
+        flags.append("numeric_filter_scale_mismatch")
+        suggestions.append(
+            "The SQL uses numeric filter thresholds that appear outside the observed scale of the filtered column. "
+            "Probe the column min/max or documentation, then adjust the threshold scale before submitting."
+        )
+        evidence.append(
+            {
+                "kind": "numeric_filter_scale",
+                "column": item.get("column"),
+                "sql_literals": literals[:6],
+                "observed_min": observed_min,
+                "observed_max": observed_max,
+            }
+        )
+    return list(dict.fromkeys(flags)), list(dict.fromkeys(suggestions)), evidence
+
+
 def _empty_date_filter_hint(sql: str | None) -> str | None:
     if not sql:
         return None
@@ -402,6 +513,35 @@ def _blank_display_critique(
     if not asks_display:
         return flags, suggestions, evidence
     columns = [str(column) for column in df.columns]
+    question_tokens = set(re.findall(r"[a-z0-9]+", lowered))
+    requested_attribute_terms = {
+        "number",
+        "phone",
+        "telephone",
+        "url",
+        "link",
+        "website",
+        "score",
+        "cost",
+        "amount",
+        "price",
+        "value",
+        "count",
+        "total",
+        "date",
+        "time",
+        "text",
+        "comment",
+        "status",
+        "type",
+        "category",
+    }
+    for column in columns:
+        split_column = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).lower()
+        aliases = {part for part in re.split(r"[^a-z0-9]+", split_column) if part}
+        aliases.add(re.sub(r"[^a-z0-9]+", "", split_column))
+        if aliases & question_tokens & requested_attribute_terms:
+            return flags, suggestions, evidence
     display_pat = re.compile(
         r"(?:^|_|(?<=[a-z]))(?:name|title|label|display|displayname|fullname|username|ownername|"
         r"firstname|lastname)(?:$|_|(?=[A-Z]))",
@@ -501,6 +641,11 @@ def _unit_time_granularity_critique(
     sql_month_field = bool(re.search(r"\b\w*month\w*\b", lowered_sql))
     sql_divide_12 = bool(re.search(r"/\s*12\b", lowered_sql))
     sql_times_12 = bool(re.search(r"\*\s*12\b", lowered_sql))
+    question_whole_second_times = re.findall(r"\b(?:\d{1,2}:)?\d{1,2}:\d{2}\b(?!\.\d)", lowered_q)
+    sql_fractional_equality_times = re.findall(
+        r"(?:=|in\s*\()\s*['\"]((?:\d{1,2}:)?\d{1,2}:\d{2}\.\d+)['\"]",
+        lowered_sql,
+    )
 
     if asks_monthly and sql_year_field and not sql_month_field and not sql_divide_12:
         flags.append("unit_time_granularity_mismatch")
@@ -516,6 +661,20 @@ def _unit_time_granularity_critique(
             "Sum the monthly values across the year or use an annual column."
         )
         evidence.append({"kind": "annual_vs_monthly"})
+    if question_whole_second_times and sql_fractional_equality_times:
+        flags.append("time_literal_precision_needs_rounding")
+        suggestions.append(
+            "The question gives a time only to whole-second precision, but the SQL uses equality against a "
+            "fractional-second literal. Match the whole second with a prefix/range/truncation condition and "
+            "include all rows in that second before submitting."
+        )
+        evidence.append(
+            {
+                "kind": "whole_second_question_vs_fractional_sql_equality",
+                "question_times": question_whole_second_times[:5],
+                "sql_times": sql_fractional_equality_times[:5],
+            }
+        )
     return flags, suggestions, evidence
 
 
@@ -697,6 +856,40 @@ def _submit_critique_message(critique: dict[str, Any]) -> str:
     return "Submit critique: " + " ".join(str(item) for item in suggestions)
 
 
+def _no_submit_finality_feedback_message(critique: dict[str, Any]) -> str:
+    query_id = str(critique.get("query_id") or "latest")
+    flags = ", ".join(str(flag) for flag in critique.get("flags", [])[:8])
+    return (
+        "You ended without calling submit_result. "
+        f"Latest query_id is `{query_id}`. "
+        f"Diagnostic flags: {flags or 'no_submit_result'}. "
+        "If the latest query already answers the question, call submit_result with that query_id now. "
+        "Otherwise run one corrected SELECT query, then call submit_result. Do not answer in prose."
+    )
+
+
+def _state_no_submit_candidate(state: dict[str, Any]) -> tuple[str, str, pd.DataFrame | None, bool]:
+    sql = state.get("sql") or ""
+    df = state.get("df")
+    query_id = "latest"
+    salvaged_previous_non_empty = False
+    if (df is None or df.empty) and state.get("last_non_empty_df") is not None:
+        sql = state.get("last_non_empty_sql") or ""
+        df = state.get("last_non_empty_df")
+        query_id = state.get("last_non_empty_query_id") or "last_non_empty"
+        salvaged_previous_non_empty = True
+    return query_id, sql, df, salvaged_previous_non_empty
+
+
+def _should_attempt_no_submit_finality_retry(state: dict[str, Any]) -> bool:
+    if not _no_submit_finality_retry_enabled():
+        return False
+    if int(state.get("no_submit_retry_count") or 0) >= _no_submit_finality_max_retries():
+        return False
+    _, _, df, _ = _state_no_submit_candidate(state)
+    return isinstance(df, pd.DataFrame)
+
+
 def _no_submit_critique(
     messages: list[BaseMessage],
     query_id: str | None,
@@ -747,6 +940,7 @@ class ExecuteSubmit:
             visualization_prompt=None,
             ready_for_user=False,
             limit_max_rows=limit_max_rows,
+            no_submit_retry_count=0,
         )
 
     def get_result(self, state: AgentState) -> ExecutionResult:
@@ -916,6 +1110,36 @@ class ExecuteSubmit:
             assert isinstance(last_message, AIMessage)
 
             tool_calls = last_message.tool_calls
+            if len(tool_calls) == 0 and _should_attempt_no_submit_finality_retry(state):
+                query_id, sql, df, salvaged_previous_non_empty = _state_no_submit_candidate(state)
+                submit_critiques = list(state.get("submit_critiques", []))
+                critique = _no_submit_critique(
+                    state["messages"],
+                    query_id,
+                    sql,
+                    df,
+                    "final_ai_message_had_no_tool_calls_retry",
+                )
+                critique = {
+                    **critique,
+                    "action": "retry",
+                    "retry_source": "no_submit_finality",
+                    "salvaged_previous_non_empty_result": salvaged_previous_non_empty,
+                }
+                submit_critiques.append(critique)
+                return {
+                    "messages": [HumanMessage(content=_no_submit_finality_feedback_message(critique))],
+                    "query_ids": dict(state.get("query_ids", {})),
+                    "sql": sql,
+                    "df": df,
+                    "last_non_empty_query_id": state.get("last_non_empty_query_id"),
+                    "last_non_empty_sql": state.get("last_non_empty_sql"),
+                    "last_non_empty_df": state.get("last_non_empty_df"),
+                    "submit_critiques": submit_critiques,
+                    "visualization_prompt": state.get("visualization_prompt", ""),
+                    "ready_for_user": False,
+                    "no_submit_retry_count": int(state.get("no_submit_retry_count") or 0) + 1,
+                }
 
             is_ready_for_user = any(tc["name"] == "submit_result" for tc in tool_calls)
             if is_ready_for_user:
@@ -1071,6 +1295,7 @@ class ExecuteSubmit:
                             "submit_critiques": submit_critiques,
                             "visualization_prompt": visualization_prompt,
                             "ready_for_user": False,
+                            "no_submit_retry_count": state.get("no_submit_retry_count", 0),
                         }
                 else:
                     if isinstance(result, dict):
@@ -1089,6 +1314,7 @@ class ExecuteSubmit:
                         "submit_critiques": submit_critiques,
                         "visualization_prompt": visualization_prompt,
                         "ready_for_user": True,
+                        "no_submit_retry_count": state.get("no_submit_retry_count", 0),
                     }
             return {
                 "messages": tool_messages,
@@ -1101,12 +1327,15 @@ class ExecuteSubmit:
                 "submit_critiques": submit_critiques,
                 "visualization_prompt": visualization_prompt,
                 "ready_for_user": False,
+                "no_submit_retry_count": state.get("no_submit_retry_count", 0),
             }
 
         def should_continue(state: AgentState) -> Literal["tool_executor", "end"]:
             # Check if there are tool calls in the last message
             last_message = state["messages"][-1]
             if isinstance(last_message, AIMessage) and last_message.tool_calls:
+                return "tool_executor"
+            if isinstance(last_message, AIMessage) and _should_attempt_no_submit_finality_retry(state):
                 return "tool_executor"
             return "end"
 

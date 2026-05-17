@@ -294,6 +294,74 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertEqual(result["enabled"], "true")
         self.assertTrue(hasattr(graph, "_anchored_lookup_flags"))
         self.assertTrue(hasattr(graph, "_no_submit_critique"))
+        self.assertTrue(hasattr(graph, "_should_attempt_no_submit_finality_retry"))
+
+    def test_vendor_no_submit_finality_retry_is_one_shot_and_toggleable(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        state = {
+            "df": pd.DataFrame({"answer": [1]}),
+            "no_submit_retry_count": 0,
+        }
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY", None)
+            os.environ.pop("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES", None)
+            self.assertTrue(graph._should_attempt_no_submit_finality_retry(state))
+            self.assertFalse(graph._should_attempt_no_submit_finality_retry({**state, "no_submit_retry_count": 1}))
+
+        with patch.dict(os.environ, {"DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY": "0"}):
+            self.assertFalse(graph._should_attempt_no_submit_finality_retry(state))
+
+    def test_vendor_no_submit_finality_feedback_requires_submit(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        message = graph._no_submit_finality_feedback_message(
+            {
+                "query_id": "3-0",
+                "flags": ["no_submit_result", "count_question_without_count_result"],
+                "suggestions": ["The question asks for a count; submit a count result."],
+            }
+        )
+
+        self.assertIn("submit_result", message)
+        self.assertIn("3-0", message)
+        self.assertIn("Do not answer in prose", message)
+        self.assertNotIn("The question asks for a count", message)
+        self.assertEqual(
+            graph._latest_user_question(
+                [
+                    HumanMessage(content="Question: What is the original question?"),
+                    HumanMessage(content=message),
+                ]
+            ),
+            "What is the original question?",
+        )
+
+    def test_vendor_time_granularity_critique_rejects_fractional_equality_for_whole_second_question(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        flags, suggestions, evidence = graph._unit_time_granularity_critique(
+            "Which row finished 0:01:54?",
+            "SELECT number FROM qualifying WHERE q3 = '1:54.455'",
+        )
+
+        self.assertIn("time_literal_precision_needs_rounding", flags)
+        self.assertTrue(any("whole-second precision" in suggestion for suggestion in suggestions))
+        self.assertEqual(evidence[0]["kind"], "whole_second_question_vs_fractional_sql_equality")
+
+    def test_vendor_blank_display_critique_does_not_reject_requested_attribute_column(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        flags, suggestions, evidence = graph._blank_display_critique(
+            "What is his number of the driver who finished in Q3?",
+            pd.DataFrame({"driverId": [1, 2], "q3": ["1:54.455", "1:54.781"], "number": [3, 5]}),
+        )
+
+        self.assertEqual(flags, [])
+        self.assertEqual(suggestions, [])
+        self.assertEqual(evidence, [])
 
     def test_databao_state_has_salvageable_frame_accepts_previous_non_empty_result(self) -> None:
         self.assertFalse(_databao_state_has_salvageable_frame({"df": None}))
