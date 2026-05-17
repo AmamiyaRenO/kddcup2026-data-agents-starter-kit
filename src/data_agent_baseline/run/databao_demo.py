@@ -31,6 +31,7 @@ MODEL_NAME_ENV = "MODEL_NAME"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 DATABAO_DEBUG_LOG_RAW_ENV = "DATABAO_DEBUG_LOG_RAW"
 DATABAO_TASK_TIMEOUT_SECONDS_ENV = "DATABAO_TASK_TIMEOUT_SECONDS"
+DATABAO_MAX_WORKERS_ENV = "DATABAO_MAX_WORKERS"
 DATABAO_DATABAO_TIMEOUT_SECONDS_ENV = "DATABAO_DATABAO_TIMEOUT_SECONDS"
 DATABAO_HEURISTIC_LEVEL_ENV = "DATABAO_HEURISTIC_LEVEL"
 DATABAO_EXECUTOR_TYPE_ENV = "DATABAO_EXECUTOR_TYPE"
@@ -8521,6 +8522,14 @@ def run_databao_tasks(
         agent_builder=agent_builder,
         answer_postprocessor=answer_postprocessor,
     )
+
+    # Env var overrides max_workers when the caller did not pass it explicitly.
+    # This lets the docker entrypoint (main.py) opt into concurrency just by
+    # setting DATABAO_MAX_WORKERS=4, without having to thread a new argument
+    # through every shim.
+    env_max_workers = _env_int(DATABAO_MAX_WORKERS_ENV, 0)
+    if env_max_workers > 0 and max_workers == 1:
+        max_workers = env_max_workers
 
     def _run_one_task(task: PublicTask) -> DatabaoTaskArtifacts:
         if use_child_process:

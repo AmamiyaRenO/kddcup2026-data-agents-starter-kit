@@ -24,6 +24,7 @@ The runner currently writes to `artifacts/databao-demo/<run_id>/task_<id>/`, **n
 | `DATABAO_INTERNAL_P0_GATES` | `1` (on) | **Keep on.** Drives empty/blank-display/numeric-id grounding reject paths. |
 | `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY` | `1` (on) | **Keep on.** ⭐ Adds a one-shot retry asking the model to call `submit_result` when it returned a DataFrame but no submit. Cuts no-submit/finality misses on Medium/Hard. Capped by `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES=1`. |
 | `DATABAO_ENABLE_THINKING` | `0` (off) | **⭐ Flip to `1` on submission.** Injects `extra_body={"chat_template_kwargs":{"enable_thinking":True}}` into ChatOpenAI, matching the competition vLLM's `--reasoning-parser qwen3` contract. OpenRouter ignores it locally, so the local sweep won't show timing change — only takes effect on the dedicated vLLM. |
+| `DATABAO_MAX_WORKERS` | unset → `1` | **⭐ Set `4` on submission.** Env-var fallback for parallel dispatch. Reads inside `run_databao_tasks`, so `python main.py` style entrypoints get concurrency without code changes. CLI flag `--max-workers` still wins when both are set. Threading is only activated in child-process mode (default when timeout > 0). |
 | `DATABAO_INTERNAL_SUBMIT_CRITIQUE_MODE` | `shadow` | **Keep.** Diagnostic-only by default. |
 | `DATABAO_EXECUTOR_TYPE` | `lighthouse_salvage` | **Keep.** `separate` and `lighthouse` (non-salvage) are unsupported in this pipeline. |
 | `DATABAO_TASK_TIMEOUT_SECONDS` | unset → uses CLI flag | **Set `600`.** ⭐ Earlier 110s recommendation was wrong: A-board total wall-clock (7200s) is not the bottleneck; per-task partial credit is. 110s killed slow-Hard partial credit (cost ~−0.03 score). With `--max-workers=4`, 600s easily fits. |
@@ -60,10 +61,10 @@ Installed via `uv pip install -e .` (or any equivalent that exposes `[project.sc
    - patch `DATABAO_DEMO_RUNS_DIR` in `src/data_agent_baseline/cli.py` to `/output` and set the run ID to a fixed string (so the path becomes `/output/<run_id>/task_<id>/prediction.csv` — still wrong);
    - or run the demo, then move/symlink `artifacts/databao-demo/<run_id>/task_<id>/prediction.csv → /output/task_<id>/prediction.csv` at the end. **The second is simpler.**
 
-If unsure, the safest end-of-container shell is roughly:
+### Path A — `dabench` CLI (recommended for new images)
 
 ```bash
-# ⭐ env vars for this submission revision
+# ⭐ env vars
 export DATABAO_ENABLE_THINKING=1
 export DATABAO_DATABAO_TIMEOUT_SECONDS=180
 
@@ -80,6 +81,29 @@ for d in artifacts/databao-demo/"$last_run"/task_*; do
   cp "$d/prediction.csv" /output/$tid/
 done
 ```
+
+### Path B — direct `python main.py` (matches v7 image layout)
+
+The v7 image entrypoint runs `python /app/main.py`, which calls
+`run_databao_tasks` directly **without** passing `--max-workers`. To
+turn on concurrency for this entrypoint **without editing main.py**,
+set the env var:
+
+```dockerfile
+ENV DATABAO_ENABLE_THINKING=1
+ENV DATABAO_MAX_WORKERS=4
+ENV DATABAO_TASK_TIMEOUT_SECONDS=600
+ENV DATABAO_DATABAO_TIMEOUT_SECONDS=180
+```
+
+`run_databao_tasks` now reads `DATABAO_MAX_WORKERS` as a fallback when
+the caller did not pass `max_workers` explicitly. main.py needs **no
+changes** — the env var alone activates parallel dispatch.
+
+⚠️ Verify the v7-style image writes predictions to the
+`output_root=/output` argument main.py passes in, **not** to
+`artifacts/databao-demo/<run_id>/`. The post-copy step in Path A is
+unnecessary here because main.py already writes directly to `/output`.
 
 3. **Config file in-image** — the YAML's `agent.model / api_base / api_key` placeholders are **IGNORED** by the Databao demo runner (they're for the ReAct baseline). Do **not** hard-code `MODEL_API_KEY` into the YAML "to fix it"; the Databao runner reads it from the env var. The only field the runner actually uses is `dataset.root_path`.
 
