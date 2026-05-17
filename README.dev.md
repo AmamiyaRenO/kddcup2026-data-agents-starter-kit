@@ -769,3 +769,10 @@ Databao-internal volatility stabilization:
 - Interpretation: this is the right layer for stabilizing no-submit and time-granularity failures.
   It improves/maintains easy and medium in this sweep. Hard still varies because remaining misses are
   mostly Databao grounding/formula choices (`task_344`, `task_355`) rather than finality mechanics.
+- Follow-up rejected experiment: a submit-time numeric scale / multi-level condition critique was
+  tried for `task_344` after observing SQL filters such as `FG < 200 OR FG > 400` against a column
+  whose observed values are roughly tens. Targeted run `20260517T122016Z` showed the critique could
+  push Databao to use observed min/max values as semantic thresholds, still scoring `0.000`; the
+  follow-up run `20260517T122814Z` also stayed `0.000` after removing that path. The lesson is that
+  formula/threshold grounding needs documentation-grounded reasoning inside Databao, not a generic
+  min/max rejection rule.

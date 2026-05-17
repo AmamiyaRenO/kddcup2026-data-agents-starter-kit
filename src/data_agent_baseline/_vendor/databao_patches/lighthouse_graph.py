@@ -105,7 +105,6 @@ P0_REJECT_FLAGS = frozenset(
         "numeric_identifier_filter_needs_grounding",
         "blank_display_needs_join",
         "time_literal_precision_needs_rounding",
-        "numeric_filter_scale_mismatch",
     }
 )
 
@@ -382,98 +381,6 @@ def _build_date_probe_sql(original_sql: str, qualified_col: str) -> str | None:
     if not from_clause:
         return None
     return f"SELECT DISTINCT {qualified_col} FROM {from_clause} LIMIT 5"
-
-
-def _numeric_filter_columns(sql: str | None) -> list[dict[str, Any]]:
-    if not sql:
-        return []
-    text = sql or ""
-    comparisons: dict[str, list[float]] = {}
-    column_pattern = r"(?:[A-Za-z_]\w*\.)?[`\"]?[A-Za-z_]\w*[`\"]?"
-    number_pattern = r"[-+]?\d+(?:\.\d+)?"
-    for match in re.finditer(
-        rf"({column_pattern})\s*(?:<=|>=|<|>|=)\s*({number_pattern})",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        column = match.group(1).strip("`\"")
-        value = float(match.group(2))
-        comparisons.setdefault(column, []).append(value)
-    for match in re.finditer(
-        rf"({column_pattern})\s+between\s+({number_pattern})\s+and\s+({number_pattern})",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        column = match.group(1).strip("`\"")
-        comparisons.setdefault(column, []).extend([float(match.group(2)), float(match.group(3))])
-
-    candidates: list[dict[str, Any]] = []
-    for column, values in comparisons.items():
-        bare_column = column.split(".")[-1].strip("`\"").lower()
-        if re.search(r"(?:^|_)(?:id|year|month|day|date|time)(?:$|_)", bare_column):
-            continue
-        unique_values = sorted(set(values))
-        if len(unique_values) < 2:
-            continue
-        candidates.append({"column": column, "literals": unique_values})
-    return candidates
-
-
-def _build_numeric_range_probe_sql(original_sql: str, qualified_col: str) -> str | None:
-    from_clause = _extract_from_clause(original_sql)
-    if not from_clause:
-        return None
-    return f"SELECT MIN({qualified_col}) AS min_value, MAX({qualified_col}) AS max_value FROM {from_clause}"
-
-
-def _numeric_filter_scale_flags(
-    question: str,
-    sql: str | None,
-    probe_ranges: list[dict[str, Any]],
-) -> tuple[list[str], list[str], list[dict[str, Any]]]:
-    flags: list[str] = []
-    suggestions: list[str] = []
-    evidence: list[dict[str, Any]] = []
-    if not question or not sql or not probe_ranges:
-        return flags, suggestions, evidence
-    lowered = question.lower()
-    if not re.search(r"\b(?:normal|abnormal|range|level|threshold|between|outside|within)\b", lowered):
-        return flags, suggestions, evidence
-    for item in probe_ranges:
-        literals = [float(value) for value in item.get("literals", [])]
-        min_value = item.get("min_value")
-        max_value = item.get("max_value")
-        if min_value is None or max_value is None or not literals:
-            continue
-        try:
-            observed_min = float(min_value)
-            observed_max = float(max_value)
-        except (TypeError, ValueError):
-            continue
-        if observed_min == observed_max:
-            continue
-        literal_min = min(literals)
-        literal_max = max(literals)
-        observed_abs_max = max(abs(observed_min), abs(observed_max), 1.0)
-        thresholds_above_scale = literal_min > observed_max and literal_min > observed_abs_max * 1.5
-        thresholds_below_scale = literal_max < observed_min and abs(literal_max) * 1.5 < max(abs(observed_min), 1.0)
-        if not thresholds_above_scale and not thresholds_below_scale:
-            continue
-        flags.append("numeric_filter_scale_mismatch")
-        suggestions.append(
-            "The SQL uses numeric filter thresholds that appear outside the observed scale of the filtered column. "
-            "Probe the column min/max or documentation, then adjust the threshold scale before submitting."
-        )
-        evidence.append(
-            {
-                "kind": "numeric_filter_scale",
-                "column": item.get("column"),
-                "sql_literals": literals[:6],
-                "observed_min": observed_min,
-                "observed_max": observed_max,
-            }
-        )
-    return list(dict.fromkeys(flags)), list(dict.fromkeys(suggestions)), evidence
 
 
 def _empty_date_filter_hint(sql: str | None) -> str | None:
