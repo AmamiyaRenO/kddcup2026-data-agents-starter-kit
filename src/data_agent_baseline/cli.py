@@ -278,6 +278,11 @@ def run_databao_demo_command(
         min=1,
         help="Override run.task_timeout_seconds for the Databao demo runner.",
     ),
+    max_workers: int | None = typer.Option(
+        None,
+        min=1,
+        help="Override run.max_workers (parallel task dispatch). Default 1 = sequential.",
+    ),
 ) -> None:
     """Run the Databao-backed demo runner on local public tasks."""
     app_config = load_app_config(config)
@@ -296,11 +301,13 @@ def run_databao_demo_command(
 
     logs_dir = run_output_dir / "logs"
     effective_task_timeout_seconds = task_timeout_seconds or app_config.run.task_timeout_seconds
+    effective_max_workers = max_workers if max_workers is not None else app_config.run.max_workers
     console.print(f"Databao demo run: {run_id}")
     console.print(f"Input root: {app_config.dataset.root_path}")
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Logs: {logs_dir}")
     console.print(f"Task timeout: {effective_task_timeout_seconds}s")
+    console.print(f"Max workers: {effective_max_workers}")
     console.print(f"Difficulty: {difficulty or 'all'}")
 
     artifacts = run_databao_tasks(
@@ -311,6 +318,7 @@ def run_databao_demo_command(
         task_ids=[task_id] if task_id else None,
         difficulty=difficulty,
         task_timeout_seconds=effective_task_timeout_seconds,
+        max_workers=effective_max_workers,
         databao_env=databao_env,
     )
     succeeded_count = sum(1 for artifact in artifacts if artifact.succeeded)

@@ -7,6 +7,7 @@ import queue
 import re
 import sqlite3
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -34,6 +35,7 @@ DATABAO_DATABAO_TIMEOUT_SECONDS_ENV = "DATABAO_DATABAO_TIMEOUT_SECONDS"
 DATABAO_HEURISTIC_LEVEL_ENV = "DATABAO_HEURISTIC_LEVEL"
 DATABAO_EXECUTOR_TYPE_ENV = "DATABAO_EXECUTOR_TYPE"
 DATABAO_ASK_STAGE_TIMEOUT_SECONDS_ENV = "DATABAO_ASK_STAGE_TIMEOUT_SECONDS"
+DATABAO_ENABLE_THINKING_ENV = "DATABAO_ENABLE_THINKING"
 
 SOURCE_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_]+")
 MAX_DESCRIPTION_CHARS = 20000
@@ -668,6 +670,17 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name, "").strip().lower()
+    if not raw_value:
+        return default
+    if raw_value in {"1", "true", "yes", "on"}:
+        return True
+    if raw_value in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _deadline_from_start(started_at: float) -> float | None:
@@ -6919,6 +6932,16 @@ def build_databao_agent(task: PublicTask, databao_env: DatabaoEnvironment) -> An
     if diagnostics is not None:
         model_kwargs["callbacks"] = [DatabaoLangChainCallback(diagnostics)]
     model_kwargs["max_retries"] = 0
+    if _env_bool(DATABAO_ENABLE_THINKING_ENV, False):
+        # Qwen3-family thinking mode via vLLM reasoning-parser. Off by default
+        # because OpenRouter-hosted Qwen may ignore or reject the parameter;
+        # competition's dedicated vLLM deployment (--reasoning-parser qwen3)
+        # honors it as documented in the task rules.
+        existing_extra = model_kwargs.get("extra_body") or {}
+        existing_template = existing_extra.get("chat_template_kwargs") or {}
+        existing_template["enable_thinking"] = True
+        existing_extra["chat_template_kwargs"] = existing_template
+        model_kwargs["extra_body"] = existing_extra
     temperature_override = _CURRENT_RETRY_TEMPERATURE.get()
     effective_temperature = (
         float(temperature_override) if temperature_override is not None else 0.0
@@ -8478,6 +8501,7 @@ def run_databao_tasks(
     task_ids: list[str] | None = None,
     difficulty: str | None = None,
     task_timeout_seconds: int | None = None,
+    max_workers: int = 1,
     databao_env: DatabaoEnvironment | None = None,
     agent_builder: AgentBuilder = build_databao_agent,
     answer_postprocessor: AnswerPostprocessor = postprocess_answer_table,
@@ -8498,26 +8522,42 @@ def run_databao_tasks(
         answer_postprocessor=answer_postprocessor,
     )
 
-    artifacts: list[DatabaoTaskArtifacts] = []
-    for task in tasks:
+    def _run_one_task(task: PublicTask) -> DatabaoTaskArtifacts:
         if use_child_process:
-            artifact = _run_databao_task_with_timeout(
+            return _run_databao_task_with_timeout(
                 task=task,
                 output_root=output_root,
                 logs_dir=logs_dir,
                 databao_env=effective_env,
                 timeout_seconds=timeout_seconds,
             )
-        else:
-            artifact = run_databao_task(
-                task=task,
-                output_root=output_root,
-                logs_dir=logs_dir,
-                databao_env=effective_env,
-                agent_builder=agent_builder,
-                answer_postprocessor=answer_postprocessor,
-            )
-        artifacts.append(artifact)
+        return run_databao_task(
+            task=task,
+            output_root=output_root,
+            logs_dir=logs_dir,
+            databao_env=effective_env,
+            agent_builder=agent_builder,
+            answer_postprocessor=answer_postprocessor,
+        )
+
+    # Threading is only safe in child-process mode, where every task runs in an
+    # isolated subprocess. In-process mode shares ContextVar diagnostics and
+    # mutable vendor-patch state across threads, so we serialize that case.
+    if max_workers > 1 and len(tasks) > 1 and use_child_process:
+        artifacts: list[DatabaoTaskArtifacts | None] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(_run_one_task, task): idx
+                for idx, task in enumerate(tasks)
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                artifacts[idx] = future.result()
+        artifacts = [artifact for artifact in artifacts if artifact is not None]
+    else:
+        artifacts = []
+        for task in tasks:
+            artifacts.append(_run_one_task(task))
 
     summary_path = output_root / "summary.json"
     attempted_task_count = len(artifacts)
