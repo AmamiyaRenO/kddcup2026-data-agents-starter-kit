@@ -1,6 +1,6 @@
 # Submission Handoff — What the Docker Packager Needs to Know
 
-Last verified commit: `f7208cf` on `origin/master`.
+Last verified commit: `e5c5cd8` on `origin/master`.
 
 ## TL;DR
 
@@ -22,11 +22,13 @@ The runner currently writes to `artifacts/databao-demo/<run_id>/task_<id>/`, **n
 | `MODEL_API_URL` / `MODEL_API_KEY` / `MODEL_NAME` | (unset locally) | **Injected by competition. Do not hard-code.** |
 | `DATABAO_APPLY_VENDOR_PATCHES` | `1` (on) | **Keep on.** Without this, P0 gates / date probe / shape repairs silently disappear and score drops ~8-14 tasks per 49 sweep. |
 | `DATABAO_INTERNAL_P0_GATES` | `1` (on) | **Keep on.** Drives empty/blank-display/numeric-id grounding reject paths. |
+| `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY` | `1` (on) | **Keep on.** ⭐ Adds a one-shot retry asking the model to call `submit_result` when it returned a DataFrame but no submit. Cuts no-submit/finality misses on Medium/Hard. Capped by `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES=1`. |
+| `DATABAO_ENABLE_THINKING` | `0` (off) | **⭐ Flip to `1` on submission.** Injects `extra_body={"chat_template_kwargs":{"enable_thinking":True}}` into ChatOpenAI, matching the competition vLLM's `--reasoning-parser qwen3` contract. OpenRouter ignores it locally, so the local sweep won't show timing change — only takes effect on the dedicated vLLM. |
 | `DATABAO_INTERNAL_SUBMIT_CRITIQUE_MODE` | `shadow` | **Keep.** Diagnostic-only by default. |
 | `DATABAO_EXECUTOR_TYPE` | `lighthouse_salvage` | **Keep.** `separate` and `lighthouse` (non-salvage) are unsupported in this pipeline. |
-| `DATABAO_TASK_TIMEOUT_SECONDS` | unset → uses CLI flag | Set per A-board / B-board budget (~110s for A-board). |
-| `DATABAO_DATABAO_TIMEOUT_SECONDS` | `100` | Inner Databao timeout (capped by task budget). |
-| `DATABAO_CONDITIONAL_RETRY` | `0` (off) | **Leave off for safe submission.** Opt-in experimental retry; on local single-sweep it gave +0.67 mean but adds ~50 s/Hard-task elapsed time which can blow the A-board 120 s/task budget. If A-board total has headroom, can flip to `1` for an ablation. |
+| `DATABAO_TASK_TIMEOUT_SECONDS` | unset → uses CLI flag | **Set `600`.** ⭐ Earlier 110s recommendation was wrong: A-board total wall-clock (7200s) is not the bottleneck; per-task partial credit is. 110s killed slow-Hard partial credit (cost ~−0.03 score). With `--max-workers=4`, 600s easily fits. |
+| `DATABAO_DATABAO_TIMEOUT_SECONDS` | `100` | **Set `180`.** ⭐ Inner LLM-call timeout. With thinking on, reasoning tokens lengthen each call; 100s can clip a complex Hard call. 180s leaves headroom; still capped at `task_timeout - 20s`. |
+| `DATABAO_CONDITIONAL_RETRY` | `0` (off) | **Leave off.** Stacks badly with thinking + concurrency; budget gets tight under combined load. Re-enable only after an ablation that shows headroom. |
 | `DATABAO_RETRY_MAX_ATTEMPTS` | `2` | Only used when retry is on. |
 | `DATABAO_RETRY_ONLY_ON_BAD_SIGNAL` | `1` | Only used when retry is on. |
 | `DATABAO_RETRY_TEMPERATURES` | `0.0,0.35` | Only used when retry is on. |
@@ -35,9 +37,20 @@ The runner currently writes to `artifacts/databao-demo/<run_id>/task_<id>/`, **n
 | `DATABAO_INTERNAL_GROUNDING_PROBE` | `0` (off) | **Leave off.** Caused Stage 3 timeout regression. |
 | `DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE` | `0` (off) | **Leave off.** Net-negative in 3-run variance ablation. |
 
+⭐ = new since the prior submission attempt that scored 0.30 / 0.33.
+
+## CLI / config knobs (not env vars)
+
+These are set via CLI flags **or** the YAML config — not env vars.
+
+| Knob | YAML key | CLI flag | Default | Action |
+| --- | --- | --- | --- | --- |
+| Parallel task dispatch | `run.max_workers` | `--max-workers` | `4` | **⭐ Pass `--max-workers 4` explicitly.** Rule docs recommend multi-threading; `run_databao_tasks` now uses `ThreadPoolExecutor` when `max_workers > 1`. Each task still runs in its own subprocess via `multiprocessing.spawn`, so thread layer is safe. Local sweep: 22.5 min → 9 min wall-clock with workers=4. |
+| Per-task wall-clock | `run.task_timeout_seconds` | `--task-timeout-seconds` | `600` | **Pass `--task-timeout-seconds 600`** unless env var already pinned it. CLI wins if both set. |
+
 ## CLI entry point
 
-Console script: `dabench run-databao-demo --config <path> --task-timeout-seconds <N>`.
+Console script: `dabench run-databao-demo --config <path> --task-timeout-seconds <N> --max-workers <K>`.
 Installed via `uv pip install -e .` (or any equivalent that exposes `[project.scripts]` from `pyproject.toml`).
 
 ## Paths the packager must wire
@@ -50,16 +63,22 @@ Installed via `uv pip install -e .` (or any equivalent that exposes `[project.sc
 If unsure, the safest end-of-container shell is roughly:
 
 ```bash
-dabench run-databao-demo --config configs/react_baseline.local.yaml --task-timeout-seconds 110
+# ⭐ env vars for this submission revision
+export DATABAO_ENABLE_THINKING=1
+export DATABAO_DATABAO_TIMEOUT_SECONDS=180
+
+dabench run-databao-demo \
+  --config configs/react_baseline.local.yaml \
+  --task-timeout-seconds 600 \
+  --max-workers 4
+
 last_run=$(ls -t artifacts/databao-demo | head -1)
 mkdir -p /output
-cp -r artifacts/databao-demo/"$last_run"/task_*/. /output/
-# OR per-task:
-# for d in artifacts/databao-demo/"$last_run"/task_*; do
-#   tid=$(basename "$d")
-#   mkdir -p /output/$tid
-#   cp "$d/prediction.csv" /output/$tid/
-# done
+for d in artifacts/databao-demo/"$last_run"/task_*; do
+  tid=$(basename "$d")
+  mkdir -p /output/$tid
+  cp "$d/prediction.csv" /output/$tid/
+done
 ```
 
 3. **Config file in-image** — the YAML's `agent.model / api_base / api_key` placeholders are **IGNORED** by the Databao demo runner (they're for the ReAct baseline). Do **not** hard-code `MODEL_API_KEY` into the YAML "to fix it"; the Databao runner reads it from the env var. The only field the runner actually uses is `dataset.root_path`.
@@ -73,9 +92,20 @@ cp -r artifacts/databao-demo/"$last_run"/task_*/. /output/
 
 ## Resource budget to target
 
-A-board: ~60 tasks / 2 h = ~120 s/task. Hard tasks today average ~70 s without retry, ~118 s with retry. Run with retry **off** unless dry-run shows you have ≥30 % headroom on the total wall clock.
+Per the published rules (`dataagent.top/rules`):
 
-B-board: ~320 tasks / 12 h = ~135 s/task. More room, but retry still adds variance.
+| Board | Tasks | Wall-clock | Per-task average | Hard share |
+| --- | ---: | ---: | ---: | ---: |
+| **A-board** | 57 | 2 h (7200 s) | ~126 s | **52.6 %** (Hard + 3.5 % Extreme) |
+| **B-board** | ~320 | 12 h | ~135 s | varies |
+
+Concurrency-corrected budget for A-board with `--max-workers 4`:
+
+- Expected wall-clock ≈ `57 tasks × ~120 s × thinking_penalty(~2×) / 4 workers ≈ 3400 s` — leaves ~3800 s headroom inside the 7200 s cap.
+- The previous "120 s/task" framing assumed sequential dispatch. With workers=4 the **per-task** budget is effectively `4 × wall-clock / 57 ≈ 500 s/task` of compute. Setting `--task-timeout-seconds 600` is conservative.
+
+Rule excerpt:
+> "we recommend participants use multi-threading/multi-processing for batch parallel acceleration of different input samples (refer to the max_workers setting in the Starter Kit code)"
 
 ## Sanity check before submitting
 
@@ -83,6 +113,8 @@ B-board: ~320 tasks / 12 h = ~135 s/task. More room, but retry still adds varian
 2. `dabench run-databao-demo --config configs/react_baseline.local.yaml --task-id task_25 --task-timeout-seconds 60` succeeds with `MODEL_API_URL` etc. injected. Verify a `prediction.csv` lands somewhere.
 3. Confirm `/output/task_25/prediction.csv` exists after your post-copy step.
 4. Vendor patches loaded — search the run's log JSON for `vendor_patch_status="updated"` or `"already_current"` (we log this in the initial diagnostic block).
+5. ⭐ With `DATABAO_ENABLE_THINKING=1` on the A-board endpoint, a Hard sample task should show noticeably longer `databao_ask` elapsed (~2-4× vs OFF). If timing is identical, the vLLM is silently dropping the `chat_template_kwargs` and thinking is **not** active — open a question with the organizers.
+6. ⭐ Stdout should show `Max workers: 4` near the run banner, confirming the CLI flag landed.
 
 ## Things to leave alone
 
