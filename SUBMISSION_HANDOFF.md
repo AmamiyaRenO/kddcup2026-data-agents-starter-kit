@@ -29,12 +29,8 @@ The runner currently writes to `artifacts/databao-demo/<run_id>/task_<id>/`, **n
 | `DATABAO_EXECUTOR_TYPE` | `lighthouse_salvage` | **Keep.** `separate` and `lighthouse` (non-salvage) are unsupported in this pipeline. |
 | `DATABAO_TASK_TIMEOUT_SECONDS` | unset → uses CLI flag | **Set `600`.** ⭐ Earlier 110s recommendation was wrong: A-board total wall-clock (7200s) is not the bottleneck; per-task partial credit is. 110s killed slow-Hard partial credit (cost ~−0.03 score). With `--max-workers=4`, 600s easily fits. |
 | `DATABAO_DATABAO_TIMEOUT_SECONDS` | `100` | **Keep default `100`.** Inner LLM-call timeout. Capped dynamically at `task_timeout - 20s`. Earlier guidance suggested 180s as buffer for thinking-mode reasoning tokens, but the dedicated vLLM is fast enough that 100s is comfortable; raising it only adds risk of compounding into the outer task timeout. |
-| `DATABAO_CONDITIONAL_RETRY` | `0` (off) | **Leave off.** Stacks badly with thinking + concurrency; budget gets tight under combined load. Re-enable only after an ablation that shows headroom. |
-| `DATABAO_RETRY_MAX_ATTEMPTS` | `2` | Only used when retry is on. |
-| `DATABAO_RETRY_ONLY_ON_BAD_SIGNAL` | `1` | Only used when retry is on. |
-| `DATABAO_RETRY_TEMPERATURES` | `0.0,0.35` | Only used when retry is on. |
 | `DATABAO_INTERNAL_GROUNDING_REJECT` | `0` (off) | **Leave off.** Ablation showed regression. |
-| `DATABAO_INTERNAL_P0_RATIO_REJECT` | `0` (off) | **Leave off.** Adapter's aggregate verifier already handles ratio; ablation showed this destroys the rescue input. |
+| `DATABAO_INTERNAL_P0_RATIO_REJECT` | `0` (off) | **Leave off.** Ablation showed this over-rejects and regresses otherwise useful Databao outputs. |
 | `DATABAO_INTERNAL_GROUNDING_PROBE` | `0` (off) | **Leave off.** Caused Stage 3 timeout regression. |
 | `DATABAO_INTERNAL_SCHEMA_GRAPH_PROBE` | `0` (off) | **Leave off.** Net-negative in 3-run variance ablation. |
 

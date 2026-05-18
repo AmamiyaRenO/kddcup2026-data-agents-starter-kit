@@ -41,8 +41,9 @@ The current execution flow is:
 5. Infer an `AnswerContract` from the question and schema.
 6. Run Databao first. As soon as Databao returns any DataFrame, write a raw provisional
    `prediction.csv` before postprocess, ranking, verifier, or final guard work can fail.
-7. Generate additional candidates from cheap repair/verifiers. LLM planner rescue and extra
-   generator experiments are not connected to the active runner.
+7. Generate only low-risk adapter candidates: deterministic postprocess and row-preserving
+   column-only compaction. Semantic verifier/repair candidates are not connected to the active
+   runner.
 8. Validate and rank candidates with a generic evaluator.
 9. Apply `final_answer_shape_guard()` again before the final CSV write.
 10. Write diagnostics, candidate scores, selected route, scorable status, timings, and safe ablation
@@ -82,11 +83,11 @@ validation, fallback, ranking, and output shape:
   failure when the question explicitly asks for plain row/record/entry count and a single
   high-confidence table can be selected. It is skipped for unexecuted filters, grouping, distinct,
   per/by/for clauses, temporal constraints, or other conditions.
-- verifier candidates: generic superlative, context superlative, and aggregate/ratio checks. These
-  are ranked like any other candidate and no longer directly override Databao.
-- `ratio_scale_compaction`: a narrow ratio/percentage candidate when Databao already returned
-  explicit numerator, denominator, and a result column whose scale can be verified. It does not infer
-  numerator/denominator from context and does not override Databao without ranking evidence.
+- semantic verifier/repair candidates: generic superlative, context superlative, aggregate/ratio
+  checks, ratio-scale compaction, and salvaged percentage/ratio repairs are disconnected from the
+  active runner. This is a deliberate de-overfitting move: those candidates can boost known public
+  failures but can also act like public-shape repair on hidden hard tasks. Future semantic repairs
+  should be implemented inside Databao's tool/result loop when they are genuinely generic.
 
 `succeeded` means the internal pipeline completed; `scorable` means a `prediction.csv` exists for
 the evaluator. These are intentionally separate. Timeout and exception artifacts now inspect the
@@ -124,7 +125,8 @@ invalid frames, raw-table explosions, and weak verifier candidates without clear
 questions penalize non-count-like output columns. Ratio/percentage verifier candidates require
 explicit numerator and denominator components and are not emitted for zero/undefined percentages.
 High-risk verifier candidates are deliberately discounted and no longer get a generic aggregation
-bonus.
+bonus. In the current default path they are not generated at all; the scoring logic is retained only
+for old-run diagnostics and explicit semantic-candidate ablations.
 
 Questions that ask for an entity plus a metric, such as a display/name answer with a total, cost,
 average, count, score, or value, use a multi-attribute contract. The final guard preserves display
@@ -748,6 +750,10 @@ Databao-internal volatility stabilization:
 - Internal feedback messages are ignored by `_latest_user_question()` so submit critiques continue to
   use the original benchmark question, not the retry instruction. The feedback also avoids replaying
   potentially misleading critique suggestions such as count hints.
+- The no-submit feedback now includes generic execution evidence: latest result shape, column names,
+  SQL text, and up to two sample rows. This keeps the repair inside Databao's tool loop and helps the
+  model choose between submitting the current query and running one corrected SELECT without adding
+  adapter-side semantic candidates.
 - Added a narrow P0 submit critique for time precision mismatch: when the question gives a time only
   to whole-second precision but SQL uses equality against a fractional-second literal, Databao rejects
   the submit once and asks for a prefix/range/truncation match that includes all rows in that second.

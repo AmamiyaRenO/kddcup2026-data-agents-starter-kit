@@ -105,6 +105,7 @@ P0_REJECT_FLAGS = frozenset(
         "numeric_identifier_filter_needs_grounding",
         "blank_display_needs_join",
         "time_literal_precision_needs_rounding",
+        "whole_second_time_limit_may_drop_matches",
     }
 )
 
@@ -553,6 +554,16 @@ def _unit_time_granularity_critique(
         r"(?:=|in\s*\()\s*['\"]((?:\d{1,2}:)?\d{1,2}:\d{2}\.\d+)['\"]",
         lowered_sql,
     )
+    sql_has_limit = bool(re.search(r"\blimit\s+\d+\b", lowered_sql))
+    sql_has_time_prefix_filter = bool(
+        re.search(r"\b(?:like|ilike)\s*['\"][^'\"]*(?:\d{1,2}:)?\d{1,2}:\d{2}%['\"]", lowered_sql)
+    )
+    question_asks_single_ordered_row = bool(
+        re.search(
+            r"\b(?:first|last|top\s+1|highest|lowest|min(?:imum)?|max(?:imum)?|fastest|slowest|earliest|latest|ranked)\b",
+            lowered_q,
+        )
+    )
 
     if asks_monthly and sql_year_field and not sql_month_field and not sql_divide_12:
         flags.append("unit_time_granularity_mismatch")
@@ -580,6 +591,19 @@ def _unit_time_granularity_critique(
                 "kind": "whole_second_question_vs_fractional_sql_equality",
                 "question_times": question_whole_second_times[:5],
                 "sql_times": sql_fractional_equality_times[:5],
+            }
+        )
+    if question_whole_second_times and sql_has_time_prefix_filter and sql_has_limit and not question_asks_single_ordered_row:
+        flags.append("whole_second_time_limit_may_drop_matches")
+        suggestions.append(
+            "The question gives a time only to whole-second precision and the SQL matches that whole second, "
+            "but LIMIT may drop other rows in the same second. Remove the LIMIT unless the question explicitly "
+            "asks for a first/top/ranked row."
+        )
+        evidence.append(
+            {
+                "kind": "whole_second_prefix_filter_with_limit",
+                "question_times": question_whole_second_times[:5],
             }
         )
     return flags, suggestions, evidence
@@ -623,6 +647,28 @@ def _filter_audit_critique(
             }
         )
     return flags, suggestions, evidence
+
+
+def _critique_sample_rows(df: pd.DataFrame | None, *, max_rows: int = 2, max_cell_chars: int = 80) -> list[dict[str, Any]]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    samples: list[dict[str, Any]] = []
+    for record in df.head(max_rows).to_dict(orient="records"):
+        cleaned: dict[str, Any] = {}
+        for key, value in record.items():
+            try:
+                is_missing = bool(pd.isna(value))
+            except (TypeError, ValueError):
+                is_missing = False
+            if is_missing:
+                cleaned[str(key)] = None
+                continue
+            text = str(value)
+            if len(text) > max_cell_chars:
+                text = text[: max_cell_chars - 1] + "…"
+            cleaned[str(key)] = text
+        samples.append(cleaned)
+    return samples
 
 
 def _critique_submit_result(
@@ -745,6 +791,7 @@ def _critique_submit_result(
         "row_count": row_count,
         "column_count": column_count,
         "columns": columns[:20],
+        "sample_rows": _critique_sample_rows(df),
         "sql_operations": operations,
         "sql_text": (sql or "")[:1000],
         "question_text": question[:300],
@@ -763,13 +810,40 @@ def _submit_critique_message(critique: dict[str, Any]) -> str:
     return "Submit critique: " + " ".join(str(item) for item in suggestions)
 
 
+def _no_submit_result_context(critique: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if critique.get("salvaged_previous_non_empty_result"):
+        parts.append("The latest non-empty query result is being used because the most recent result was empty.")
+    row_count = int(critique.get("row_count") or 0)
+    column_count = int(critique.get("column_count") or 0)
+    parts.append(f"Latest result shape: {row_count} rows x {column_count} columns.")
+    columns = [str(column) for column in (critique.get("columns") or [])[:12]]
+    if columns:
+        parts.append("Latest result columns: " + ", ".join(f"`{column}`" for column in columns) + ".")
+    sql_text = " ".join(str(critique.get("sql_text") or "").split())
+    if sql_text:
+        if len(sql_text) > 500:
+            sql_text = sql_text[:499] + "…"
+        parts.append(f"Latest SQL: {sql_text}")
+    sample_rows = critique.get("sample_rows") or []
+    if sample_rows:
+        sample_text = json.dumps(sample_rows, ensure_ascii=False)
+        if len(sample_text) > 500:
+            sample_text = sample_text[:499] + "…"
+        parts.append(f"Sample rows: {sample_text}")
+        parts.append("Sample rows are only a preview; submit_result returns the full query result.")
+    return " ".join(parts)
+
+
 def _no_submit_finality_feedback_message(critique: dict[str, Any]) -> str:
     query_id = str(critique.get("query_id") or "latest")
     flags = ", ".join(str(flag) for flag in critique.get("flags", [])[:8])
+    result_context = _no_submit_result_context(critique)
     return (
         "You ended without calling submit_result. "
         f"Latest query_id is `{query_id}`. "
         f"Diagnostic flags: {flags or 'no_submit_result'}. "
+        f"{result_context} "
         "If the latest query already answers the question, call submit_result with that query_id now. "
         "Otherwise run one corrected SELECT query, then call submit_result. Do not answer in prose."
     )

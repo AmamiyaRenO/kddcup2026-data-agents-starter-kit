@@ -322,11 +322,21 @@ class DatabaoDemoTests(unittest.TestCase):
                 "query_id": "3-0",
                 "flags": ["no_submit_result", "count_question_without_count_result"],
                 "suggestions": ["The question asks for a count; submit a count result."],
+                "row_count": 2,
+                "column_count": 1,
+                "columns": ["answer"],
+                "sql_text": "SELECT COUNT(*) AS answer FROM records",
+                "sample_rows": [{"answer": "2"}],
             }
         )
 
         self.assertIn("submit_result", message)
         self.assertIn("3-0", message)
+        self.assertIn("Latest result shape: 2 rows x 1 columns", message)
+        self.assertIn("`answer`", message)
+        self.assertIn("SELECT COUNT(*) AS answer FROM records", message)
+        self.assertIn('"answer": "2"', message)
+        self.assertIn("Sample rows are only a preview", message)
         self.assertIn("Do not answer in prose", message)
         self.assertNotIn("The question asks for a count", message)
         self.assertEqual(
@@ -339,6 +349,22 @@ class DatabaoDemoTests(unittest.TestCase):
             "What is the original question?",
         )
 
+    def test_vendor_submit_critique_records_sample_rows_for_no_submit_feedback(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        critique = graph._critique_submit_result(
+            [HumanMessage(content="Question: What is the answer?")],
+            "latest",
+            "SELECT answer FROM table",
+            pd.DataFrame({"answer": ["short", "x" * 120], "note": [None, ["nested"]]}),
+        )
+
+        self.assertEqual(critique["sample_rows"][0], {"answer": "short", "note": None})
+        self.assertTrue(str(critique["sample_rows"][1]["answer"]).endswith("…"))
+        self.assertIn("nested", str(critique["sample_rows"][1]["note"]))
+
     def test_vendor_time_granularity_critique_rejects_fractional_equality_for_whole_second_question(self) -> None:
         from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
 
@@ -350,6 +376,31 @@ class DatabaoDemoTests(unittest.TestCase):
         self.assertIn("time_literal_precision_needs_rounding", flags)
         self.assertTrue(any("whole-second precision" in suggestion for suggestion in suggestions))
         self.assertEqual(evidence[0]["kind"], "whole_second_question_vs_fractional_sql_equality")
+
+    def test_vendor_time_granularity_critique_rejects_limited_whole_second_prefix_match(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        flags, suggestions, evidence = graph._unit_time_granularity_critique(
+            "Which rows finished 0:01:54?",
+            "SELECT number FROM qualifying WHERE q3 LIKE '1:54%' ORDER BY q3 ASC LIMIT 1",
+        )
+
+        self.assertIn("whole_second_time_limit_may_drop_matches", flags)
+        self.assertTrue(any("Remove the LIMIT" in suggestion for suggestion in suggestions))
+        self.assertIn(
+            "whole_second_prefix_filter_with_limit",
+            {item["kind"] for item in evidence},
+        )
+
+    def test_vendor_time_granularity_critique_allows_ranked_limited_whole_second_prefix_match(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        flags, _, _ = graph._unit_time_granularity_critique(
+            "Which row ranked first among those who finished 0:01:54?",
+            "SELECT number FROM qualifying WHERE q3 LIKE '1:54%' ORDER BY q3 ASC LIMIT 1",
+        )
+
+        self.assertNotIn("whole_second_time_limit_may_drop_matches", flags)
 
     def test_vendor_blank_display_critique_does_not_reject_requested_attribute_column(self) -> None:
         from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
