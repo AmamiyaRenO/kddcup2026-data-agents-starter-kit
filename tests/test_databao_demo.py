@@ -306,10 +306,30 @@ class DatabaoDemoTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY", None)
             os.environ.pop("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES", None)
+            os.environ.pop("DATABAO_FINALITY_SALVAGE_PROFILE", None)
+            os.environ.pop("DATABAO_SOFT_P0_PROFILE", None)
             self.assertTrue(graph._should_attempt_no_submit_finality_retry(state))
             self.assertFalse(graph._should_attempt_no_submit_finality_retry({**state, "no_submit_retry_count": 1}))
 
         with patch.dict(os.environ, {"DATABAO_INTERNAL_NO_SUBMIT_FINALITY_RETRY": "0"}):
+            self.assertFalse(graph._should_attempt_no_submit_finality_retry(state))
+
+    def test_vendor_finality_salvage_profile_extends_retry_budget(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        state = {
+            "df": pd.DataFrame({"answer": [1]}),
+            "no_submit_retry_count": 1,
+        }
+        with patch.dict(os.environ, {"DATABAO_FINALITY_SALVAGE_PROFILE": "1"}, clear=False):
+            os.environ.pop("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES", None)
+            self.assertTrue(graph._should_attempt_no_submit_finality_retry(state))
+            self.assertFalse(graph._should_attempt_no_submit_finality_retry({**state, "no_submit_retry_count": 2}))
+
+        with patch.dict(
+            os.environ,
+            {"DATABAO_FINALITY_SALVAGE_PROFILE": "1", "DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES": "1"},
+        ):
             self.assertFalse(graph._should_attempt_no_submit_finality_retry(state))
 
     def test_vendor_no_submit_finality_feedback_requires_submit(self) -> None:
@@ -317,18 +337,21 @@ class DatabaoDemoTests(unittest.TestCase):
 
         from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
 
-        message = graph._no_submit_finality_feedback_message(
-            {
-                "query_id": "3-0",
-                "flags": ["no_submit_result", "count_question_without_count_result"],
-                "suggestions": ["The question asks for a count; submit a count result."],
-                "row_count": 2,
-                "column_count": 1,
-                "columns": ["answer"],
-                "sql_text": "SELECT COUNT(*) AS answer FROM records",
-                "sample_rows": [{"answer": "2"}],
-            }
-        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DATABAO_FINALITY_SALVAGE_PROFILE", None)
+            os.environ.pop("DATABAO_SOFT_P0_PROFILE", None)
+            message = graph._no_submit_finality_feedback_message(
+                {
+                    "query_id": "3-0",
+                    "flags": ["no_submit_result", "count_question_without_count_result"],
+                    "suggestions": ["The question asks for a count; submit a count result."],
+                    "row_count": 2,
+                    "column_count": 1,
+                    "columns": ["answer"],
+                    "sql_text": "SELECT COUNT(*) AS answer FROM records",
+                    "sample_rows": [{"answer": "2"}],
+                }
+            )
 
         self.assertIn("submit_result", message)
         self.assertIn("3-0", message)
@@ -348,6 +371,68 @@ class DatabaoDemoTests(unittest.TestCase):
             ),
             "What is the original question?",
         )
+
+    def test_vendor_finality_salvage_profile_feedback_prefers_submit(self) -> None:
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        with patch.dict(os.environ, {"DATABAO_FINALITY_SALVAGE_PROFILE": "1"}):
+            message = graph._no_submit_finality_feedback_message(
+                {
+                    "query_id": "4-0",
+                    "flags": ["no_submit_result"],
+                    "row_count": 4,
+                    "column_count": 2,
+                    "columns": ["name", "value"],
+                }
+            )
+
+        self.assertIn("prefer submitting it now", message)
+        self.assertIn("rather than restarting broad exploration", message)
+        self.assertIn("Only run one corrected SELECT query", message)
+        self.assertIn("submit_result", message)
+
+    def test_vendor_finality_salvage_profile_does_not_narrow_p0_submit_reject_flags(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        args = (
+            [HumanMessage(content="Question: Which row finished 0:01:54?")],
+            "latest",
+            "SELECT number FROM qualifying WHERE q3 = '1:54.455'",
+            pd.DataFrame({"number": [1]}),
+        )
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DATABAO_FINALITY_SALVAGE_PROFILE", None)
+            os.environ.pop("DATABAO_SOFT_P0_PROFILE", None)
+            baseline = graph._critique_submit_result(*args)
+        with patch.dict(os.environ, {"DATABAO_FINALITY_SALVAGE_PROFILE": "1"}):
+            profile = graph._critique_submit_result(*args)
+
+        self.assertIn("time_literal_precision_needs_rounding", baseline["p0_flags"])
+        self.assertIn("time_literal_precision_needs_rounding", profile["p0_flags"])
+        self.assertTrue(profile["p0_should_reject"])
+        self.assertTrue(profile["finality_salvage_profile_enabled"])
+        self.assertFalse(profile["soft_p0_profile_enabled"])
+
+    def test_vendor_soft_p0_profile_narrows_p0_submit_reject_flags(self) -> None:
+        from langchain_core.messages import HumanMessage
+
+        from data_agent_baseline._vendor.databao_patches import lighthouse_graph as graph
+
+        args = (
+            [HumanMessage(content="Question: Which row finished 0:01:54?")],
+            "latest",
+            "SELECT number FROM qualifying WHERE q3 = '1:54.455'",
+            pd.DataFrame({"number": [1]}),
+        )
+        with patch.dict(os.environ, {"DATABAO_SOFT_P0_PROFILE": "1"}):
+            profile = graph._critique_submit_result(*args)
+
+        self.assertEqual(profile["p0_reject_flags"], ["empty_submit_result"])
+        self.assertNotIn("time_literal_precision_needs_rounding", profile["p0_flags"])
+        self.assertFalse(profile["p0_should_reject"])
+        self.assertTrue(profile["soft_p0_profile_enabled"])
 
     def test_vendor_submit_critique_records_sample_rows_for_no_submit_feedback(self) -> None:
         from langchain_core.messages import HumanMessage

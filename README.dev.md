@@ -132,6 +132,54 @@ Questions that ask for an entity plus a metric, such as a display/name answer wi
 average, count, score, or value, use a multi-attribute contract. The final guard preserves display
 and metric columns for these answers instead of shrinking them to a single scalar column.
 
+## Submission Profiles
+
+The default profile remains the local public high-score path. A separate hidden-set generalization
+profile can be enabled with `DATABAO_GENERALIZATION_PROFILE=1`. It deliberately changes only three
+high-risk public-fit surfaces:
+
+- Prompt policy: keep the output contract, but remove proactive documentation-mapping and
+  ratio/percentage query-shaping bullets.
+- Databao internal P0 gates: keep only `empty_submit_result` as a forced reject; numeric grounding,
+  blank-display, and time-granularity critiques remain diagnostic/shadow signals.
+- Adapter answer-column verifier: prune columns only when the selected column(s) have strong
+  question/column evidence. The final guard is otherwise unchanged.
+
+This profile is for online A/B submission when local public accuracy appears overfit to the 49 known
+tasks. It is not enabled by default and should be evaluated separately from the public high-score
+profile.
+
+Local public ablation on 2026-05-18 with `DATABAO_GENERALIZATION_PROFILE=1`,
+`--task-timeout-seconds 600`, and `--max-workers 4`:
+
+- easy `20260518T125747Z`: avg `0.733`, exact `11/15`, prediction `15/15`.
+- medium `20260518T125944Z`: avg `0.558`, exact `12/23`, prediction `23/23`.
+- hard `20260518T130233Z`: avg `0.379`, exact `3/11`, prediction `11/11`.
+
+Interpretation: this is not a public-score replacement for the default path. It trades away known
+easy/medium shape wins while improving hard prediction stability and local hard average, so it is
+useful only as a hidden-set A/B profile.
+
+### Finality Salvage Profile
+
+`DATABAO_FINALITY_SALVAGE_PROFILE=1` is a smaller Databao-internal A/B profile for the remaining
+submission attempts. It does not change the adapter, prompt, ranking, or final guard. Instead it
+keeps the normal no-submit finality retry but makes the Databao feedback more conservative:
+
+- no-submit finality retry defaults to two attempts unless
+  `DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES` is explicitly set;
+- feedback tells Databao to prefer submitting a plausible latest non-empty query result rather than
+  restarting broad exploration.
+
+It intentionally does not soften P0 submit rejection. That behavior is split into
+`DATABAO_SOFT_P0_PROFILE=1`, which narrows forced P0 rejection to `empty_submit_result`. Keep the
+soft-P0 profile off unless intentionally running a high-risk generalization submission; local
+ablation showed that softening P0 fixed missing predictions but also allowed too many wrong
+intermediate submits through.
+
+This is meant to test whether hidden hard tasks benefit from “submit the useful intermediate result”
+behavior without reintroducing adapter-side public-shape repair.
+
 ## Context And Documents
 
 The document ingestion layer is split:
@@ -665,8 +713,8 @@ Anchored lookup critique experiment:
 
 - The local Databao clone now records generic anchored-lookup submit critique flags:
   `disjunctive_text_filter_needs_anchored_match` and `linked_identifier_needs_display_lookup`.
-- `DATABAO_INTERNAL_ANCHORED_LOOKUP_REJECT=1` can reject one such submit and ask Databao to anchor on
-  rows matching all requested text terms and resolve `link_to_*` values to display/name fields.
+- The former anchored-lookup reject switch was removed. Anchored lookup now stays diagnostics-only,
+  so it cannot accidentally reject a hidden-set partial answer.
 - Targeted `task_355` runs were mixed:
   - `20260514T100545Z`: score `0.250`; correct expense/cost row, but still missing the member name.
   - `20260514T101239Z`: score `0.000`; two rejections pushed Databao to a bad document-record row,

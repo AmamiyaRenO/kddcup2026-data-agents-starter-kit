@@ -64,6 +64,24 @@ def _anchored_lookup_reject_enabled() -> bool:
     }
 
 
+def _finality_salvage_profile_enabled() -> bool:
+    return os.environ.get("DATABAO_FINALITY_SALVAGE_PROFILE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _soft_p0_profile_enabled() -> bool:
+    return os.environ.get("DATABAO_SOFT_P0_PROFILE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _p0_gates_enabled() -> bool:
     value = os.environ.get("DATABAO_INTERNAL_P0_GATES", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
@@ -84,11 +102,14 @@ def _no_submit_finality_retry_enabled() -> bool:
 
 
 def _no_submit_finality_max_retries() -> int:
-    raw = os.environ.get("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES", "1").strip()
+    default = 2 if _finality_salvage_profile_enabled() else 1
+    raw = os.environ.get("DATABAO_INTERNAL_NO_SUBMIT_FINALITY_MAX_RETRIES")
+    if raw is None:
+        return default
     try:
-        value = int(raw)
+        value = int(raw.strip())
     except ValueError:
-        return 1
+        return default
     return max(0, value)
 
 
@@ -101,6 +122,12 @@ P0_REJECT_FLAGS = frozenset(
         "whole_second_time_limit_may_drop_matches",
     }
 )
+
+
+def _p0_reject_flags() -> frozenset[str]:
+    if _soft_p0_profile_enabled():
+        return frozenset({"empty_submit_result"})
+    return P0_REJECT_FLAGS
 
 
 def _latest_user_question(messages: list[BaseMessage]) -> str:
@@ -758,7 +785,8 @@ def _critique_submit_result(
     ):
         should_reject = True
 
-    p0_flags = [flag for flag in flags if flag in P0_REJECT_FLAGS]
+    active_p0_reject_flags = _p0_reject_flags()
+    p0_flags = [flag for flag in flags if flag in active_p0_reject_flags]
     p0_should_reject = bool(p0_flags) and _p0_gates_enabled()
 
     return {
@@ -769,7 +797,10 @@ def _critique_submit_result(
         "should_reject": should_reject,
         "p0_flags": p0_flags,
         "p0_should_reject": p0_should_reject,
+        "p0_reject_flags": sorted(active_p0_reject_flags),
         "p0_gates_enabled": _p0_gates_enabled(),
+        "finality_salvage_profile_enabled": _finality_salvage_profile_enabled(),
+        "soft_p0_profile_enabled": _soft_p0_profile_enabled(),
         "row_count": row_count,
         "column_count": column_count,
         "columns": columns[:20],
@@ -821,13 +852,23 @@ def _no_submit_finality_feedback_message(critique: dict[str, Any]) -> str:
     query_id = str(critique.get("query_id") or "latest")
     flags = ", ".join(str(flag) for flag in critique.get("flags", [])[:8])
     result_context = _no_submit_result_context(critique)
+    if _finality_salvage_profile_enabled():
+        instruction = (
+            "If the latest non-empty query result plausibly answers the question, prefer submitting it now "
+            "rather than restarting broad exploration. Only run one corrected SELECT query if the latest result "
+            "is empty or clearly the wrong table or shape. Then call submit_result. Do not answer in prose."
+        )
+    else:
+        instruction = (
+            "If the latest query already answers the question, call submit_result with that query_id now. "
+            "Otherwise run one corrected SELECT query, then call submit_result. Do not answer in prose."
+        )
     return (
         "You ended without calling submit_result. "
         f"Latest query_id is `{query_id}`. "
         f"Diagnostic flags: {flags or 'no_submit_result'}. "
         f"{result_context} "
-        "If the latest query already answers the question, call submit_result with that query_id now. "
-        "Otherwise run one corrected SELECT query, then call submit_result. Do not answer in prose."
+        f"{instruction}"
     )
 
 
