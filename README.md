@@ -1,8 +1,40 @@
-<div align="center">
+# KDD Cup 2026 DataAgent-Bench: Databao adapter pipeline
 
-# Databao 链路运行说明
+An LLM data agent for KDD Cup 2026 DataAgent-Bench. Each task gives a natural-language question plus a folder of mixed context (CSV, JSON, SQLite, Markdown); the agent must return the exact answer table as `prediction.csv`. This repo builds on the official starter kit and the Databao library, and adds an adapter layer around Databao for retrieval, answer-shape reasoning, candidate ranking and failure recovery.
 
-</div>
+## Results (local evaluation, public demo set, 49 tasks)
+
+| Difficulty | Avg score | Exact match | Predictions written |
+|---|---:|---:|---:|
+| Easy | 0.800 | 12 / 15 | 15 / 15 |
+| Medium | 0.739 | 17 / 23 | 23 / 23 |
+| Hard | 0.545 | 6 / 11 | 11 / 11 |
+
+Details and per-task error analysis: [`README.error-analysis.md`](README.error-analysis.md).
+
+## How it works
+
+1. Load every context source into uniform tables and build a **schema graph** (table profiles, column samples, candidate joins).
+2. Score relevant tables, columns, snippets and join paths with a generic **context retriever**.
+3. Infer an **answer contract** (expected columns, rows, aggregation, ratio/percentage) from question signals backed by schema evidence. A single keyword never fixes the answer shape.
+4. Run Databao, and **write a provisional prediction as soon as any result exists**, so a later failure or timeout still leaves a scorable answer.
+5. Generate low-risk candidates (deterministic post-processing, column compaction), **rank them** with a generic evaluator, and apply a final shape guard that strips debug and metadata columns.
+6. Log candidate scores, the selected route, timings and ablation metadata for every task.
+
+Heuristics are kept generic: no task-ID branches and no public-set domain memory. Each feature flag was kept or dropped based on ablation runs ([`SUBMISSION_HANDOFF.md`](SUBMISSION_HANDOFF.md)).
+
+## Quick start
+
+```bash
+uv sync --extra dev
+export MODEL_API_URL=... MODEL_API_KEY=... MODEL_NAME=qwen3.5-35b-a3b
+uv run dabench run-databao-demo --config configs/react_baseline.local.yaml --difficulty easy
+uv run dabench evaluate-public-run artifacts/databao-demo/<run_id>
+```
+
+---
+
+## 运行说明（中文）
 
 > 本仓库当前主要维护 `src/data_agent_baseline/run/databao_demo.py` 这一条 Databao-backed demo 链路。它读取 DataAgent-Bench public demo 输入，调用 Databao 生成候选答案表，再经过通用后处理、答案形状约束和本地 evaluator 产出可检查的运行结果。
 
